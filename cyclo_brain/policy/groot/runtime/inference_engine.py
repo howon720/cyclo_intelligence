@@ -16,7 +16,7 @@
 #
 # Author: Dongyun Kim
 
-"""GR00T N1.6 inference engine.
+"""GR00T inference engine.
 
 Encapsulates Gr00tPolicy loading, RobotClient setup, observation preprocessing,
 and action chunk postprocessing. Imported by ``groot_engine`` and hosted by the
@@ -62,11 +62,20 @@ else:
 if _groot_path and _groot_path not in sys.path:
     sys.path.insert(0, _groot_path)
 
-# TensorRT DiT optimization - reuse existing GR00T deployment code
+# TensorRT DiT optimization - reuse existing GR00T deployment code.
 from scripts.deployment.standalone_inference_script import (  # noqa: E402
     replace_dit_with_tensorrt,
 )
-from scripts.deployment.export_onnx_n1d6 import DiTInputCapture, export_dit_to_onnx  # noqa: E402
+try:  # GR00T N1.7
+    from scripts.deployment.export_onnx_n1d7 import (  # noqa: E402
+        DiTInputCapture,
+        export_dit_to_onnx,
+    )
+except ImportError:  # GR00T N1.6 / N1.6.1
+    from scripts.deployment.export_onnx_n1d6 import (  # noqa: E402
+        DiTInputCapture,
+        export_dit_to_onnx,
+    )
 
 
 def build_trt_engine(policy: Gr00tPolicy, observation: dict, engine_path: str):
@@ -192,6 +201,13 @@ class TensorRTOptimizer:
         Returns the TRT path on success. Returns None when TensorRT is
         unavailable so inference can continue with PyTorch eager.
         """
+        trt_enabled = os.environ.get("GROOT_TRT_ENABLED", "true").lower()
+        if trt_enabled in {"0", "false", "no", "off"}:
+            self.logger.info(
+                "TensorRT optimization disabled by GROOT_TRT_ENABLED=%s", trt_enabled
+            )
+            return None
+
         trt_path = self.engine_path(model_path)
         try:
             if not os.path.exists(trt_path):
@@ -244,6 +260,11 @@ class GR00TInference:
     def load_policy(self, request) -> dict:
         """Load GR00T policy and create RobotClient for sensor data."""
         model_path = request.model_path
+        embodiment_tag = (
+            str(getattr(request, "embodiment_tag", "") or "").strip()
+            or os.environ.get("GROOT_EMBODIMENT_TAG", "").strip()
+            or self.DEFAULT_EMBODIMENT_TAG
+        )
         robot_type = request.robot_type
 
         try:
@@ -264,9 +285,10 @@ class GR00TInference:
                 }
 
             self.logger.info("Loading GR00T policy from: %s", model_path)
+            self.logger.info("Using GR00T embodiment tag: %s", embodiment_tag)
 
             self.policy = Gr00tPolicy(
-                embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+                embodiment_tag=EmbodimentTag.resolve(embodiment_tag),
                 model_path=model_path,
                 device="cuda",
             )

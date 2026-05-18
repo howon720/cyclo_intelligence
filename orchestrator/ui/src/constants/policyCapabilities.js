@@ -21,7 +21,7 @@
 //   'lerobot:xvla':    true,
 //   'lerobot:diffusion': false,  // already implicit but explicit is fine
 export const POLICY_REQUIRES_INSTRUCTION = {
-  'groot:n16': true,
+  'groot:n17': true,
   'lerobot:act': false,
 };
 

@@ -245,14 +245,14 @@ services:
               capabilities: [gpu]
 
   # ============================================================
-  # GR00T N1.6 two-process policy container.
+  # GR00T N1.7 two-process policy container.
   # Mirrors lerobot's s6-overlay layout (main-runtime + engine-process).
   # Pulled / started on demand by the UI
   # via supervisor_api (PLAN §4.8).
   # ============================================================
   groot:
     container_name: groot_server
-    image: robotis/groot-zenoh:1.1.0-${ARCH:-arm64}
+    image: robotis/groot-zenoh:1.2.0-${ARCH:-arm64}
     build:
       context: ../cyclo_brain/policy/groot
       dockerfile: Dockerfile.${ARCH:-arm64}
@@ -287,6 +287,9 @@ services:
       - ACTION_CHUNK_PROCESSING_SDK_PATH=/action_chunk_processing_sdk
       - POLICY_BACKEND=groot
       - POLICY_ENGINE_MODULE=groot_engine
+      # Start N1.7 in PyTorch eager mode. Enable after model-load/action
+      # smoke tests pass on the target robot.
+      - GROOT_TRT_ENABLED=false
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
       - PYTHONUNBUFFERED=1

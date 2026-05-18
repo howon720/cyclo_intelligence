@@ -22,10 +22,9 @@ import { setTaskInfo } from '../features/tasks/taskSlice';
 // Examples for follow-up PRs:
 //   { value: 'lerobot:smolvla', label: 'LeRobot (SmolVLA)', serviceType: 'lerobot', policyType: 'smolvla' },
 //   { value: 'lerobot:pi0',     label: 'LeRobot (Pi0)',     serviceType: 'lerobot', policyType: 'pi0' },
-//   { value: 'groot:n17',       label: 'GR00T N1.7',        serviceType: 'groot',   policyType: 'n17' },
 export const MODEL_OPTIONS = [
   { value: 'lerobot:act', label: 'LeRobot (ACT)', serviceType: 'lerobot', policyType: 'act' },
-  { value: 'groot:n16',   label: 'GR00T N1.6',    serviceType: 'groot',   policyType: 'n16' },
+  { value: 'groot:n17',   label: 'GR00T N1.7',    serviceType: 'groot',   policyType: 'n17' },
 ];
 
 const DEFAULT = MODEL_OPTIONS[0];

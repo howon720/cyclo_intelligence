@@ -96,7 +96,7 @@ LeRobot policy container:
   enter-lerobot    Open an interactive bash in lerobot_server
 
 GR00T policy container:
-  start-groot      Build + start groot (N1.6 baseline). Same boot-idle
+  start-groot      Build + start groot (N1.7 baseline). Same boot-idle
                    + LOAD-time configure pattern as lerobot.
   enter-groot      Open an interactive bash in groot_server
 
