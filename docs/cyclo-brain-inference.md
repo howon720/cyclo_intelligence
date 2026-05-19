@@ -88,6 +88,7 @@ The selector is grouped by backend.
 ### LeRobot Policies
 
 All LeRobot entries use the same `lerobot_server` backend. The selected `Policy Path` must point to a checkpoint that matches the chosen policy family.
+If the dataset was recorded with matching camera keys, state dimensions, and processor statistics, the same backend flow can run different LeRobot policy families without changing the Docker runtime.
 
 | Model | Backend | Description |
 | --- | --- | --- |
@@ -174,6 +175,7 @@ ACT example local checkpoint path:
 12. Press `Clear` to fully stop inference and clear the model/session/buffer state.
 
 ACT and Diffusion do not use task instructions, so the `Task Instruction` input is hidden for those policy families. SmolVLA, XVLA, Pi0, and Pi0.5 use task instructions.
+For every LeRobot policy, the checkpoint's `config.json` and saved processors define the expected observation schema. If a model was trained from correctly recorded Cyclo data, camera mapping and normalization are loaded from the checkpoint at runtime.
 
 ![Inference LeRobot Instruction](./assets/cyclo-brain-inference/06-inference-lerobot-smolvla-instruction.png)
 
