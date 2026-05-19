@@ -115,11 +115,6 @@ function App() {
     window.location.href = 'http://localhost:3000/app';
   };
 
-  const handleManagerNavigation = () => {
-    if (typeof window === 'undefined') return;
-    window.open(`http://${window.location.hostname}:3000/home`, '_blank', 'noopener,noreferrer');
-  };
-
   // Check conditions for Record page navigation
   const handleRecordPageNavigation = () => {
     if (process.env.REACT_APP_DEBUG === 'true') {
@@ -294,6 +289,11 @@ function App() {
     'dark:hover:text-blue-300'
   );
 
+  const managerHref =
+    typeof window === 'undefined'
+      ? 'http://localhost:3000/home'
+      : `http://${window.location.hostname}:3000/home`;
+
   return (
     <div className="flex min-h-screen w-screen bg-white text-gray-900 dark:bg-slate-950 dark:text-slate-100">
       <aside className="w-30 min-w-28 bg-gray-100 dark:bg-slate-900 min-h-screen flex flex-col items-center gap-4 shadow-[inset_0_0_2px_rgba(0,0,0,0.1)] dark:shadow-[inset_0_0_0_1px_rgba(148,163,184,0.12)]">
@@ -312,15 +312,14 @@ function App() {
               >
                 Home
               </button>
-              <button
-                type="button"
-                className={clsx(classShortcutButton, 'w-8 px-0')}
-                onClick={handleManagerNavigation}
+              <a
+                href={managerHref}
+                className={clsx(classShortcutButton, 'w-8 px-0 flex items-center justify-center no-underline')}
                 title="Cyclo Manager"
                 aria-label="Cyclo Manager"
               >
                 M
-              </button>
+              </a>
               <button
                 type="button"
                 className={clsx(classShortcutButton, 'w-8 px-0', {
