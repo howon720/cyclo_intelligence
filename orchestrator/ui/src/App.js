@@ -21,6 +21,7 @@ import { GoGraph } from 'react-icons/go';
 import { Toaster } from 'react-hot-toast';
 import toast from 'react-hot-toast';
 import './App.css';
+import ThemeToggle from './components/ThemeToggle';
 import HomePage from './pages/HomePage';
 import RecordPage from './pages/RecordPage';
 import InferencePage from './pages/InferencePage';
@@ -107,6 +108,16 @@ function App() {
   const handleHomePageNavigation = () => {
     isFirstLoad.current = false;
     dispatch(moveToPage(PageType.HOME));
+  };
+
+  const handleAppHubNavigation = () => {
+    if (typeof window === 'undefined') return;
+    window.location.href = 'http://localhost:3000/app';
+  };
+
+  const handleManagerNavigation = () => {
+    if (typeof window === 'undefined') return;
+    window.open(`http://${window.location.hostname}:3000/home`, '_blank', 'noopener,noreferrer');
   };
 
   // Check conditions for Record page navigation
@@ -252,6 +263,7 @@ function App() {
     'px-4',
     'text-base',
     'text-gray-800',
+    'dark:text-slate-100',
     'cursor-pointer',
     'transition-colors',
     'duration-150',
@@ -259,16 +271,74 @@ function App() {
     'w-24'
   );
 
+  const classShortcutButton = clsx(
+    'h-8',
+    'rounded-full',
+    'border',
+    'border-gray-200',
+    'bg-white',
+    'px-2',
+    'text-xs',
+    'font-semibold',
+    'text-gray-700',
+    'shadow-sm',
+    'transition-all',
+    'duration-150',
+    'hover:border-blue-400',
+    'hover:text-blue-600',
+    'hover:shadow-md',
+    'dark:border-slate-700',
+    'dark:bg-slate-800',
+    'dark:text-slate-100',
+    'dark:hover:border-blue-400',
+    'dark:hover:text-blue-300'
+  );
+
   return (
-    <div className="flex min-h-screen w-screen">
-      <aside className="w-30 min-w-28 bg-gray-100 min-h-screen flex flex-col items-center gap-4 shadow-[inset_0_0_2px_rgba(0,0,0,0.1)]">
+    <div className="flex min-h-screen w-screen bg-white text-gray-900 dark:bg-slate-950 dark:text-slate-100">
+      <aside className="w-30 min-w-28 bg-gray-100 dark:bg-slate-900 min-h-screen flex flex-col items-center gap-4 shadow-[inset_0_0_2px_rgba(0,0,0,0.1)] dark:shadow-[inset_0_0_0_1px_rgba(148,163,184,0.12)]">
         <div className="w-full h-screen flex flex-col gap-2 items-center overflow-y-auto scrollbar-thin">
-          <div className="w-full h-8"></div>
+          <div className="w-full px-2 pt-3 pb-2 flex flex-col gap-2 border-b border-gray-200 dark:border-slate-800">
+            <ThemeToggle />
+            <div className="flex items-center justify-center gap-1.5">
+              <button
+                type="button"
+                className={clsx(classShortcutButton, 'min-w-12', {
+                  'bg-gray-300 text-gray-900 dark:bg-slate-700 dark:text-white': page === PageType.HOME,
+                })}
+                onClick={handleAppHubNavigation}
+                title="Cyclo Apps"
+                aria-label="Cyclo Apps"
+              >
+                Home
+              </button>
+              <button
+                type="button"
+                className={clsx(classShortcutButton, 'w-8 px-0')}
+                onClick={handleManagerNavigation}
+                title="Cyclo Manager"
+                aria-label="Cyclo Manager"
+              >
+                M
+              </button>
+              <button
+                type="button"
+                className={clsx(classShortcutButton, 'w-8 px-0', {
+                  'bg-gray-300 text-gray-900 dark:bg-slate-700 dark:text-white': page === PageType.HOME,
+                })}
+                onClick={handleHomePageNavigation}
+                title="Cyclo Intelligence"
+                aria-label="Cyclo Intelligence"
+              >
+                C
+              </button>
+            </div>
+          </div>
           {/* Home page button */}
           <button
             className={clsx(classPageButton, {
-              'hover:bg-gray-200 active:bg-gray-400': page !== PageType.HOME,
-              'bg-gray-300': page === PageType.HOME,
+              'hover:bg-gray-200 active:bg-gray-400 dark:hover:bg-slate-800 dark:active:bg-slate-700': page !== PageType.HOME,
+              'bg-gray-300 dark:bg-slate-700': page === PageType.HOME,
             })}
             onClick={handleHomePageNavigation}
           >
@@ -279,8 +349,8 @@ function App() {
           {/* Record page button */}
           <button
             className={clsx(classPageButton, {
-              'hover:bg-gray-200 active:bg-gray-400': page !== PageType.RECORD,
-              'bg-gray-300': page === PageType.RECORD,
+              'hover:bg-gray-200 active:bg-gray-400 dark:hover:bg-slate-800 dark:active:bg-slate-700': page !== PageType.RECORD,
+              'bg-gray-300 dark:bg-slate-700': page === PageType.RECORD,
             })}
             onClick={handleRecordPageNavigation}
           >
@@ -290,8 +360,8 @@ function App() {
           {/* Training page button */}
           <button
             className={clsx(classPageButton, {
-              'hover:bg-gray-200 active:bg-gray-400': page !== PageType.TRAINING,
-              'bg-gray-300': page === PageType.TRAINING,
+              'hover:bg-gray-200 active:bg-gray-400 dark:hover:bg-slate-800 dark:active:bg-slate-700': page !== PageType.TRAINING,
+              'bg-gray-300 dark:bg-slate-700': page === PageType.TRAINING,
             })}
             onClick={handleTrainingPageNavigation}
           >
@@ -301,8 +371,8 @@ function App() {
           {/* Inference page button */}
           <button
             className={clsx(classPageButton, {
-              'hover:bg-gray-200 active:bg-gray-400': page !== PageType.INFERENCE,
-              'bg-gray-300': page === PageType.INFERENCE,
+              'hover:bg-gray-200 active:bg-gray-400 dark:hover:bg-slate-800 dark:active:bg-slate-700': page !== PageType.INFERENCE,
+              'bg-gray-300 dark:bg-slate-700': page === PageType.INFERENCE,
             })}
             onClick={handleInferencePageNavigation}
           >
@@ -313,8 +383,8 @@ function App() {
           {/* BT Manager page button */}
           <button
             className={clsx(classPageButton, {
-              'hover:bg-gray-200 active:bg-gray-400': page !== PageType.BT_MANAGER,
-              'bg-gray-300': page === PageType.BT_MANAGER,
+              'hover:bg-gray-200 active:bg-gray-400 dark:hover:bg-slate-800 dark:active:bg-slate-700': page !== PageType.BT_MANAGER,
+              'bg-gray-300 dark:bg-slate-700': page === PageType.BT_MANAGER,
             })}
             onClick={handleBTManagerPageNavigation}
           >
@@ -323,13 +393,13 @@ function App() {
           </button>
 
           {/* Divider line */}
-          <div className="w-24 h-1 border-t-2 rounded-full border-gray-200 mt-3"></div>
+          <div className="w-24 h-1 border-t-2 rounded-full border-gray-200 dark:border-slate-800 mt-3"></div>
 
           {/* Edit dataset page button */}
           <button
             className={clsx(classPageButton, {
-              'hover:bg-gray-200 active:bg-gray-400': page !== PageType.EDIT_DATASET,
-              'bg-gray-300': page === PageType.EDIT_DATASET,
+              'hover:bg-gray-200 active:bg-gray-400 dark:hover:bg-slate-800 dark:active:bg-slate-700': page !== PageType.EDIT_DATASET,
+              'bg-gray-300 dark:bg-slate-700': page === PageType.EDIT_DATASET,
             })}
             onClick={handleEditDatasetPageNavigation}
           >
@@ -340,8 +410,8 @@ function App() {
           {/* Replay page button */}
           <button
             className={clsx(classPageButton, {
-              'hover:bg-gray-200 active:bg-gray-400': page !== PageType.REPLAY,
-              'bg-gray-300': page === PageType.REPLAY,
+              'hover:bg-gray-200 active:bg-gray-400 dark:hover:bg-slate-800 dark:active:bg-slate-700': page !== PageType.REPLAY,
+              'bg-gray-300 dark:bg-slate-700': page === PageType.REPLAY,
             })}
             onClick={handleReplayPageNavigation}
           >
@@ -351,7 +421,7 @@ function App() {
 
         </div>
       </aside>
-      <main className="flex-1 flex flex-col h-screen">
+      <main className="flex-1 flex flex-col h-screen bg-white dark:bg-slate-950">
         {page === PageType.HOME ? (
           <HomePage />
         ) : page === PageType.RECORD ? (
