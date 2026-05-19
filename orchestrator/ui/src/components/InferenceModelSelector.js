@@ -15,9 +15,10 @@ import { setTaskInfo } from '../features/tasks/taskSlice';
 // via TaskInfo.service_type) with a policy class (drives instruction
 // visibility and future per-model UI knobs).
 //
-// Add a new entry once a policy is validated end-to-end. value is the
+// Add an enabled entry once a policy is validated end-to-end. value is the
 // composite key the dropdown stores; serviceType / policyType are the
-// fields that get written into taskInfo on selection.
+// fields that get written into taskInfo on selection. comingSoon entries are
+// displayed as disabled options only, so they do not affect runtime routing.
 //
 // Examples for follow-up PRs:
 //   { value: 'lerobot:smolvla', label: 'LeRobot (SmolVLA)', serviceType: 'lerobot', policyType: 'smolvla' },
@@ -25,9 +26,32 @@ import { setTaskInfo } from '../features/tasks/taskSlice';
 export const MODEL_OPTIONS = [
   { value: 'lerobot:act', label: 'LeRobot (ACT)', serviceType: 'lerobot', policyType: 'act' },
   { value: 'groot:n17',   label: 'GR00T N1.7',    serviceType: 'groot',   policyType: 'n17' },
+  {
+    value: 'lerobot:greenvla',
+    label: 'GreenVLA',
+    serviceType: 'lerobot',
+    policyType: 'greenvla',
+    comingSoon: true,
+  },
+  {
+    value: 'lerobot:openpi',
+    label: 'OpenPI',
+    serviceType: 'lerobot',
+    policyType: 'openpi',
+    comingSoon: true,
+  },
+  {
+    value: 'lerobot:rldx1',
+    label: 'RLDX-1',
+    serviceType: 'lerobot',
+    policyType: 'rldx1',
+    comingSoon: true,
+  },
 ];
 
-const DEFAULT = MODEL_OPTIONS[0];
+const AVAILABLE_MODEL_OPTIONS = MODEL_OPTIONS.filter((opt) => !opt.comingSoon);
+const COMING_SOON_MODEL_OPTIONS = MODEL_OPTIONS.filter((opt) => opt.comingSoon);
+const DEFAULT = AVAILABLE_MODEL_OPTIONS[0];
 
 const classLabel = clsx(
   'text-sm', 'text-gray-600', 'w-28', 'flex-shrink-0', 'font-medium'
@@ -41,7 +65,7 @@ const InferenceModelSelector = ({ readonly = false }) => {
   const value = `${serviceType}:${policyType}`;
 
   const handleChange = (e) => {
-    const sel = MODEL_OPTIONS.find((o) => o.value === e.target.value);
+    const sel = AVAILABLE_MODEL_OPTIONS.find((o) => o.value === e.target.value);
     if (!sel) return;
     dispatch(
       setTaskInfo({
@@ -76,11 +100,20 @@ const InferenceModelSelector = ({ readonly = false }) => {
         onChange={handleChange}
         disabled={readonly}
       >
-        {MODEL_OPTIONS.map((opt) => (
+        {AVAILABLE_MODEL_OPTIONS.map((opt) => (
           <option key={opt.value} value={opt.value}>
             {opt.label}
           </option>
         ))}
+        {COMING_SOON_MODEL_OPTIONS.length > 0 && (
+          <optgroup label="Coming Soon">
+            {COMING_SOON_MODEL_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value} disabled>
+                {opt.label}
+              </option>
+            ))}
+          </optgroup>
+        )}
       </select>
     </div>
   );
