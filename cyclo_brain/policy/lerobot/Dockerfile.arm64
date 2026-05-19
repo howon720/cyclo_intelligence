@@ -142,8 +142,10 @@ WORKDIR /lerobot
 
 # Healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD s6-svstat /run/service/inference-server 2>&1 | grep -q "up" \
-     && s6-svstat /run/service/control-publisher 2>&1 | grep -q "up" \
+    CMD S6_SVSTAT="$(ls /package/admin/s6-*/command/s6-svstat 2>/dev/null | head -1)" \
+     && [ -n "$S6_SVSTAT" ] \
+     && "$S6_SVSTAT" /run/service/inference-server 2>&1 | grep -q "up" \
+     && "$S6_SVSTAT" /run/service/control-publisher 2>&1 | grep -q "up" \
      || exit 1
 
 # s6-overlay init — launches both supervised services in parallel

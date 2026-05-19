@@ -23,9 +23,9 @@ COMPOSE="docker compose -f ${SCRIPT_DIR}/docker-compose.yml"
 MAIN_SERVICE="cyclo_intelligence"
 MAIN_CONTAINER="cyclo_intelligence"
 LEROBOT_SERVICE="lerobot"
-LEROBOT_CONTAINER="lerobot_server"
+LEROBOT_CONTAINER="${LEROBOT_CONTAINER_NAME:-lerobot_server}"
 GROOT_SERVICE="groot"
-GROOT_CONTAINER="groot_server"
+GROOT_CONTAINER="${GROOT_CONTAINER_NAME:-groot_server}"
 
 # Auto-detect host architecture for Dockerfile / image tag selection
 MACHINE_ARCH=$(uname -m)

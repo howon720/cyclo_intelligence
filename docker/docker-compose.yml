@@ -75,6 +75,7 @@ services:
       - ZENOH_ROUTER_IP=127.0.0.1
       - ZENOH_ROUTER_PORT=7447
       - ZENOH_CONFIG_OVERRIDE=transport/shared_memory/enabled=true
+      - CYCLO_UI_PORT=${CYCLO_UI_PORT:-80}
       - PYTHONUNBUFFERED=1
 
     volumes:
@@ -124,7 +125,7 @@ services:
   # on demand.
   # ============================================================
   lerobot:
-    container_name: lerobot_server
+    container_name: ${LEROBOT_CONTAINER_NAME:-lerobot_server}
     image: robotis/lerobot-zenoh:1.0.0-${ARCH:-arm64}
     build:
       context: ../cyclo_brain/policy/lerobot
@@ -214,7 +215,7 @@ services:
   # via supervisor_api (PLAN §4.8).
   # ============================================================
   groot:
-    container_name: groot_server
+    container_name: ${GROOT_CONTAINER_NAME:-groot_server}
     image: robotis/groot-zenoh:1.1.0-${ARCH:-arm64}
     build:
       context: ../cyclo_brain/policy/groot
