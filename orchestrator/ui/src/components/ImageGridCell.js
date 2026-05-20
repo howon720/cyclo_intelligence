@@ -225,7 +225,7 @@ export default function ImageGridCell({
             type="button"
             className={classRotateBtn}
             onClick={(e) => { e.stopPropagation(); onRotateClick?.(idx); }}
-            title={rotate ? '가로로 보기' : '세로로 보기'}
+            title={rotate ? 'View horizontally' : 'View vertically'}
           >
             <MdScreenRotation size={20} />
           </button>

@@ -31,6 +31,9 @@ import Tooltip from './Tooltip';
 import { InferencePhase } from '../constants/taskPhases';
 import { setInferenceStatus } from '../features/tasks/taskSlice';
 import { requiresInstruction } from '../constants/policyCapabilities';
+import usePolicyBackendStatus, {
+  getPolicyBackendReadiness,
+} from '../hooks/usePolicyBackendStatus';
 
 const phaseGuideMessages = {
   [InferencePhase.READY]: 'Ready to start',
@@ -74,6 +77,19 @@ export default function InferenceControlPanel() {
   const isInferencing = phase === InferencePhase.INFERENCING;
   const isPaused = phase === InferencePhase.PAUSED;
   const isModelLoaded = isInferencing || isPaused;
+  const shouldCheckBackend = isIdle || isPaused;
+
+  const {
+    readiness: backendReadiness,
+    refreshStatus: refreshBackendStatus,
+  } = usePolicyBackendStatus(taskInfo.serviceType, {
+    enabled: shouldCheckBackend,
+    intervalMs: 2000,
+  });
+
+  const isBackendStartBlocked = shouldCheckBackend && !backendReadiness.ready;
+  const isBackendWarming = isBackendStartBlocked &&
+    (backendReadiness.state === 'checking' || backendReadiness.state === 'warming');
 
   useEffect(() => {
     isRecordingRef.current = isRecording;
@@ -93,12 +109,12 @@ export default function InferenceControlPanel() {
   // sat frozen between transitions. setInterval gives a steady visual
   // beat while either banner is on screen.
   useEffect(() => {
-    if (!isLoading && !isInferencing) return undefined;
+    if (!isLoading && !isInferencing && !isBackendWarming) return undefined;
     const id = setInterval(() => {
       setSpinnerIndex((prev) => (prev + 1) % spinnerFrames.length);
     }, 100);
     return () => clearInterval(id);
-  }, [isLoading, isInferencing]);
+  }, [isLoading, isInferencing, isBackendWarming]);
 
   useEffect(() => {
     if (isIdle && isRecordingRef.current) {
@@ -163,6 +179,21 @@ export default function InferenceControlPanel() {
   );
 
   const handleStart = useCallback(async () => {
+    let readiness = backendReadiness;
+    if (!readiness.ready) {
+      const refreshedStatus = await refreshBackendStatus({ quiet: true });
+      readiness = getPolicyBackendReadiness(refreshedStatus);
+    }
+    if (!readiness.ready) {
+      const message = readiness.message || 'Policy backend is not ready yet';
+      if (readiness.state === 'warming' || readiness.state === 'checking') {
+        toast(message);
+      } else {
+        toast.error(message);
+      }
+      return;
+    }
+
     if (isPaused && taskInfo.policyPath === lastPolicyPath) {
       await executeCommand('Resume', 'resume_inference');
     } else {
@@ -174,7 +205,15 @@ export default function InferenceControlPanel() {
       setLastPolicyPath(taskInfo.policyPath);
       await executeCommand('Start Inference', 'start_inference');
     }
-  }, [isPaused, taskInfo.policyPath, lastPolicyPath, executeCommand, validateTaskInfo]);
+  }, [
+    backendReadiness,
+    refreshBackendStatus,
+    isPaused,
+    taskInfo.policyPath,
+    lastPolicyPath,
+    executeCommand,
+    validateTaskInfo,
+  ]);
 
   const handleStop = useCallback(async () => {
     await executeCommand('Stop', 'stop_inference');
@@ -210,10 +249,19 @@ export default function InferenceControlPanel() {
     }
   }, [executeCommand]);
 
-  const startEnabled = isIdle || isPaused;
+  const startEnabled = shouldCheckBackend && backendReadiness.ready;
   const stopEnabled = isInferencing;
   const clearEnabled = isModelLoaded;
   const recordEnabled = isModelLoaded && !isRecording && !!taskInfo.recordInferenceMode;
+  const startDescription = isBackendStartBlocked
+    ? backendReadiness.message
+    : isPaused
+      ? 'Resume inference'
+      : 'Start inference';
+  const guideMessage = isBackendStartBlocked
+    ? backendReadiness.message
+    : phaseGuideMessages[phase] || '';
+  const showGuideSpinner = isInferencing || isLoading || isBackendWarming;
 
   const handleKeyAction = useCallback(
     (e) => {
@@ -348,7 +396,7 @@ export default function InferenceControlPanel() {
       color: '#1976d2',
       enabled: startEnabled,
       handler: handleStart,
-      description: isPaused ? 'Resume inference' : 'Start inference',
+      description: startDescription,
       shortcut: 'Space',
     },
     {
@@ -488,14 +536,14 @@ export default function InferenceControlPanel() {
         </>
       )}
 
-      {(phaseGuideMessages[phase] || isInferencing || isLoading) && (
+      {(guideMessage || showGuideSpinner) && (
         <>
           <div className="w-px h-2/3 bg-gray-400 shrink-0"></div>
           <div className="flex items-center gap-1 shrink-0">
             <span className="text-gray-600 font-semibold text-lg whitespace-nowrap">
-              {phaseGuideMessages[phase] || ''}
+              {guideMessage}
             </span>
-            {(isInferencing || isLoading) && (
+            {showGuideSpinner && (
               <span className="font-mono text-blue-500 text-sm">
                 {spinnerFrames[spinnerIndex]}
               </span>

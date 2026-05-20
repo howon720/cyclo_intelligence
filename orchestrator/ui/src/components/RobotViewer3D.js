@@ -305,7 +305,7 @@ function CameraPresetButtons({ onPreset, activePreset }) {
 function TrajectoryLegend({ visible }) {
   if (!visible) return null;
   return (
-    <div className="absolute bottom-2 left-2 z-10 flex gap-3 bg-black/50 rounded px-2 py-1">
+    <div className="absolute bottom-12 left-2 z-10 flex gap-3 bg-black/50 rounded px-2 py-1">
       <div className="flex items-center gap-1">
         <div className="w-4 h-1 rounded bg-sky-400" />
         <span className="text-xs text-white/70">Left</span>
@@ -318,12 +318,38 @@ function TrajectoryLegend({ visible }) {
   );
 }
 
+function SourceSelector({ visible, value, onChange }) {
+  if (!visible) return null;
+
+  return (
+    <div className="absolute bottom-2 left-2 z-10 flex overflow-hidden rounded bg-black/50">
+      {[
+        ['state', 'State'],
+        ['action', 'Action'],
+      ].map(([key, label]) => (
+        <button
+          key={key}
+          onClick={() => onChange(key)}
+          className={`px-3 py-2 text-xs font-medium transition-colors ${
+            value === key
+              ? 'bg-emerald-500 text-white'
+              : 'text-white/80 hover:bg-black/70'
+          }`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export default function RobotViewer3D({
   mode = 'live',
   jointData = null,
   currentTime = 0,
   showGrid = true,
   className = '',
+  showSourceSelector = false,
 }) {
   const robotType = useSelector((state) => state.tasks.robotType);
   const { getRobotInfo } = useRosServiceCaller();
@@ -356,6 +382,7 @@ export default function RobotViewer3D({
   const { robot, loading, error, setJointValues, computeTrajectoryPaths, reload } = useUrdfRobot(urdfPath);
   const cameraRef = useRef();
   const [activePreset, setActivePreset] = useState('perspective');
+  const [visualizationSource, setVisualizationSource] = useState('state');
   const [trajectoryPaths, setTrajectoryPaths] = useState(null);
   const [hasTrajectory, setHasTrajectory] = useState(false);
 
@@ -373,7 +400,12 @@ export default function RobotViewer3D({
     }
   }, [computeTrajectoryPaths]);
 
-  useJointStateSubscription(handleJointState, handleActionChunk, mode === 'live' && !!robot);
+  useJointStateSubscription(
+    handleJointState,
+    handleActionChunk,
+    mode === 'live' && !!robot,
+    { visualizationSource },
+  );
 
   const handlePreset = useCallback((presetName) => {
     setActivePreset(presetName);
@@ -402,6 +434,11 @@ export default function RobotViewer3D({
       {error && <ErrorOverlay message={error} onRetry={reload} />}
       <CameraPresetButtons onPreset={handlePreset} activePreset={activePreset} />
       <TrajectoryLegend visible={hasTrajectory} />
+      <SourceSelector
+        visible={mode === 'live' && showSourceSelector}
+        value={visualizationSource}
+        onChange={setVisualizationSource}
+      />
       <Canvas
         camera={{ position: [1.5, 1.5, 1.5], fov: 50, near: 0.01, far: 100 }}
         style={canvasStyle}

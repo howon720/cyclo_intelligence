@@ -14,15 +14,14 @@
 // Exact key beats wildcard.
 //
 // Grow this map one line at a time as policies are validated end-to-end.
-// Examples for follow-up PRs:
-//   'lerobot:smolvla': true,
-//   'lerobot:pi0':     true,
-//   'lerobot:pi05':    true,
-//   'lerobot:xvla':    true,
-//   'lerobot:diffusion': false,  // already implicit but explicit is fine
 export const POLICY_REQUIRES_INSTRUCTION = {
-  'groot:n16': true,
+  'groot:n17': true,
   'lerobot:act': false,
+  'lerobot:smolvla': true,
+  'lerobot:xvla': true,
+  'lerobot:pi0': true,
+  'lerobot:pi05': true,
+  'lerobot:diffusion': false,
 };
 
 export const DEFAULT_REQUIRES_INSTRUCTION = false;

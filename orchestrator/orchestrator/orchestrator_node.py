@@ -382,9 +382,9 @@ class OrchestratorNode(Node):
         self.get_logger().info('ROS services initialized successfully')
 
     def _setup_timer_callbacks(self):
-        # Step 4 §5.5: inference no longer needs an orchestrator-side 100 Hz
-        # timer — the policy container (runtime/control_publisher.py) owns
-        # the control loop. orchestrator publishes InferenceStatus on
+        # Inference no longer needs an orchestrator-side 100 Hz timer.
+        # The policy main_runtime owns the control loop. orchestrator publishes
+        # InferenceStatus on
         # command transitions (LOAD / START / PAUSE / RESUME / STOP)
         # instead of from a polling timer.
         self.timer_callback_dict = {
@@ -1048,13 +1048,16 @@ class OrchestratorNode(Node):
                 service_prefix = self._determine_service_prefix(task_info)
 
                 # If a policy is already loaded on this container, treat
-                # START_INFERENCE as RESUME (the container's Process A is
-                # either paused or idle — RESUME covers both by just
-                # clearing the pause flag and re-conditioning).
+                # START_INFERENCE as RESUME. The policy container may have
+                # been restarted outside orchestrator, though; in that case
+                # the cached client is stale and the container replies with
+                # "not running" or "LOAD first". Fall back to a fresh
+                # LOAD -> START instead of surfacing that confusing error.
                 # Snapshot the client so a concurrent _teardown_inference_client
                 # cannot null it between the prefix check and the call.
                 with self._state_lock:
                     existing_client = self.container_service_client
+                start_handled = False
                 if (
                     existing_client is not None
                     and existing_client._service_prefix == service_prefix
@@ -1071,13 +1074,24 @@ class OrchestratorNode(Node):
                         self._publish_inference_phase(InferenceStatus.INFERENCING)
                         response.success = True
                         response.message = 'Inference resumed (model already loaded)'
+                        start_handled = True
                     else:
-                        response.success = False
-                        response.message = resume_result.message
+                        resume_message = resume_result.message or ''
+                        if resume_message in ('not running', 'LOAD first'):
+                            self.get_logger().warning(
+                                'Cached inference client for '
+                                f'{service_prefix} is stale '
+                                f'({resume_message}); reloading policy'
+                            )
+                            self._teardown_inference_client()
+                        else:
+                            response.success = False
+                            response.message = resume_message
+                            start_handled = True
                     self.get_logger().info(
-                        f'RESUME inference result: {response.message}'
+                        f'RESUME inference result: {resume_result.message}'
                     )
-                else:
+                if not start_handled:
                     # Fresh start. LOAD on the policy container can take 10+
                     # minutes the first time (model load to GPU + on-disk
                     # TRT engine build), which would block the SendCommand

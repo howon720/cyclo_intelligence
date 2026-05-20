@@ -13,22 +13,64 @@ import { setTaskInfo } from '../features/tasks/taskSlice';
 
 // Inference models. Each option pairs a backend (orchestrator routing
 // via TaskInfo.service_type) with a policy class (drives instruction
-// visibility and future per-model UI knobs).
+// visibility and future per-model UI knobs). LeRobot is the backend;
+// ACT, SmolVLA, XVLA, Pi0, Pi0.5, and Diffusion are policy families that
+// can be loaded by that backend when the selected checkpoint is compatible.
 //
-// Add a new entry once a policy is validated end-to-end. value is the
+// Add an enabled entry once a policy is validated end-to-end. value is the
 // composite key the dropdown stores; serviceType / policyType are the
-// fields that get written into taskInfo on selection.
+// fields that get written into taskInfo on selection. comingSoon entries are
+// displayed as disabled options only, so they do not affect runtime routing.
 //
-// Examples for follow-up PRs:
-//   { value: 'lerobot:smolvla', label: 'LeRobot (SmolVLA)', serviceType: 'lerobot', policyType: 'smolvla' },
-//   { value: 'lerobot:pi0',     label: 'LeRobot (Pi0)',     serviceType: 'lerobot', policyType: 'pi0' },
-//   { value: 'groot:n17',       label: 'GR00T N1.7',        serviceType: 'groot',   policyType: 'n17' },
-export const MODEL_OPTIONS = [
-  { value: 'lerobot:act', label: 'LeRobot (ACT)', serviceType: 'lerobot', policyType: 'act' },
-  { value: 'groot:n16',   label: 'GR00T N1.6',    serviceType: 'groot',   policyType: 'n16' },
+const MODEL_GROUPS = [
+  {
+    label: 'LeRobot',
+    options: [
+      { value: 'lerobot:act', label: 'ACT', serviceType: 'lerobot', policyType: 'act' },
+      { value: 'lerobot:smolvla', label: 'SmolVLA', serviceType: 'lerobot', policyType: 'smolvla' },
+      { value: 'lerobot:xvla', label: 'XVLA', serviceType: 'lerobot', policyType: 'xvla' },
+      { value: 'lerobot:pi0', label: 'Pi0', serviceType: 'lerobot', policyType: 'pi0' },
+      { value: 'lerobot:pi05', label: 'Pi0.5', serviceType: 'lerobot', policyType: 'pi05' },
+      { value: 'lerobot:diffusion', label: 'Diffusion', serviceType: 'lerobot', policyType: 'diffusion' },
+    ],
+  },
+  {
+    label: 'GR00T',
+    options: [
+      { value: 'groot:n17', label: 'N1.7', serviceType: 'groot', policyType: 'n17' },
+    ],
+  },
+  {
+    label: 'Coming Soon',
+    options: [
+      {
+        value: 'future:greenvla',
+        label: 'GreenVLA',
+        serviceType: 'future',
+        policyType: 'greenvla',
+        comingSoon: true,
+      },
+      {
+        value: 'future:openpi',
+        label: 'OpenPI',
+        serviceType: 'future',
+        policyType: 'openpi',
+        comingSoon: true,
+      },
+      {
+        value: 'future:rldx1',
+        label: 'RLDX-1',
+        serviceType: 'future',
+        policyType: 'rldx1',
+        comingSoon: true,
+      },
+    ],
+  },
 ];
 
-const DEFAULT = MODEL_OPTIONS[0];
+export const MODEL_OPTIONS = MODEL_GROUPS.flatMap((group) => group.options);
+const AVAILABLE_MODEL_OPTIONS = MODEL_OPTIONS.filter((opt) => !opt.comingSoon);
+const DEFAULT = AVAILABLE_MODEL_OPTIONS[0];
 
 const classLabel = clsx(
   'text-sm', 'text-gray-600', 'w-28', 'flex-shrink-0', 'font-medium'
@@ -42,7 +84,7 @@ const InferenceModelSelector = ({ readonly = false }) => {
   const value = `${serviceType}:${policyType}`;
 
   const handleChange = (e) => {
-    const sel = MODEL_OPTIONS.find((o) => o.value === e.target.value);
+    const sel = AVAILABLE_MODEL_OPTIONS.find((o) => o.value === e.target.value);
     if (!sel) return;
     dispatch(
       setTaskInfo({
@@ -77,10 +119,18 @@ const InferenceModelSelector = ({ readonly = false }) => {
         onChange={handleChange}
         disabled={readonly}
       >
-        {MODEL_OPTIONS.map((opt) => (
-          <option key={opt.value} value={opt.value}>
-            {opt.label}
-          </option>
+        {MODEL_GROUPS.map((group) => (
+          <optgroup key={group.label} label={group.label}>
+            {group.options.map((opt) => (
+              <option
+                key={opt.value}
+                value={opt.value}
+                disabled={Boolean(opt.comingSoon)}
+              >
+                {opt.label}
+              </option>
+            ))}
+          </optgroup>
         ))}
       </select>
     </div>

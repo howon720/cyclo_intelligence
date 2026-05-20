@@ -19,6 +19,13 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE="docker compose -f ${SCRIPT_DIR}/docker-compose.yml"
+# Standard docker-compose override convention. Auto-discovery is
+# disabled when -f is passed explicitly (above), so we re-enable it
+# manually: if a sibling docker-compose.override.yml exists, layer it
+# on top. Lets developers shadow image tags / mounts locally without
+# editing the canonical compose file.
+[ -f "${SCRIPT_DIR}/docker-compose.override.yml" ] \
+    && COMPOSE="${COMPOSE} -f ${SCRIPT_DIR}/docker-compose.override.yml"
 
 MAIN_SERVICE="cyclo_intelligence"
 MAIN_CONTAINER="cyclo_intelligence"
@@ -89,7 +96,7 @@ LeRobot policy container:
   enter-lerobot    Open an interactive bash in lerobot_server
 
 GR00T policy container:
-  start-groot      Build + start groot (N1.6 baseline). Same boot-idle
+  start-groot      Build + start groot (N1.7 baseline). Same boot-idle
                    + LOAD-time configure pattern as lerobot.
   enter-groot      Open an interactive bash in groot_server
 
@@ -106,7 +113,7 @@ Flags (any start* command):
 
 Environment:
   GPU_ARCH         default | blackwell   (optional, amd64 only)
-  VERSION          image tag version (default: 0.1.1 for cyclo)
+  VERSION          image tag version (default: 0.1.2 for cyclo)
   ROS_DOMAIN_ID    default 30
 EOF
 }

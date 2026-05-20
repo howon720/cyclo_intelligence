@@ -187,7 +187,7 @@ export default function InferencePage({ isActive = true }) {
           <div className="flex-[4] min-h-[120px] flex flex-row items-center justify-center mx-1 gap-2 h-full relative">
             {show3DViewer && (
               <div className="h-[85%] rounded-2xl overflow-hidden relative" style={{ aspectRatio: '4/3' }}>
-                <RobotViewer3D mode="live" />
+                <RobotViewer3D mode="live" showSourceSelector />
               </div>
             )}
             <div className="h-[85%]" style={{ aspectRatio: '4/3' }}>

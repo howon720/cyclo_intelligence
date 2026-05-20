@@ -233,7 +233,12 @@ class ContainerServiceClient:
     # --- Core service call ---
 
     def _call_service(
-        self, client, request, service_name: str, timeout_sec: float = None
+        self,
+        client,
+        request,
+        service_name: str,
+        timeout_sec: float = None,
+        availability_timeout_sec: float = 5.0,
     ) -> ServiceResponse:
         """Call a ROS2 service and return ServiceResponse."""
         if not self._connected:
@@ -255,10 +260,13 @@ class ContainerServiceClient:
         timeout = timeout_sec or self.timeout_sec
 
         try:
-            if not client.wait_for_service(timeout_sec=5.0):
+            if not client.wait_for_service(timeout_sec=availability_timeout_sec):
                 return ServiceResponse(
                     success=False,
-                    message=f"Service not available: {service_name}",
+                    message=(
+                        f"Service not available after "
+                        f"{availability_timeout_sec:.1f}s: {service_name}"
+                    ),
                     data={},
                     request_id="",
                 )
@@ -342,12 +350,14 @@ class ContainerServiceClient:
 
         if timeout_sec is None:
             timeout_sec = 600.0 if command == self.CMD_LOAD else 10.0
+        availability_timeout_sec = 90.0 if command == self.CMD_LOAD else 10.0
 
         return self._call_service(
             self._inference_command_client,
             request,
             self.service_inference_command,
             timeout_sec=timeout_sec,
+            availability_timeout_sec=availability_timeout_sec,
         )
 
     # --- Training services ---

@@ -21,6 +21,7 @@ import toast from 'react-hot-toast';
 import { MdFolderOpen, MdInfoOutline } from 'react-icons/md';
 import FileBrowserModal from './FileBrowserModal';
 import InferenceModelSelector from './InferenceModelSelector';
+import PolicyBackendControl from './PolicyBackendControl';
 import Tooltip from './Tooltip';
 import { InferencePhase } from '../constants/taskPhases';
 import { DEFAULT_PATHS } from '../constants/paths';
@@ -94,6 +95,11 @@ const InferencePanel = () => {
     }
     setShowPolicyBrowser(false);
   }, [isEditable, info, dispatch]);
+
+  const policyBrowserPath =
+    info.serviceType === 'groot'
+      ? DEFAULT_PATHS.GROOT_CHECKPOINTS_PATH
+      : DEFAULT_PATHS.LEROBOT_CHECKPOINTS_PATH;
 
   // Update isEditable state when the disabled prop changes
   useEffect(() => {
@@ -223,6 +229,10 @@ const InferencePanel = () => {
       </div>
 
       <InferenceModelSelector readonly={!isEditable} />
+
+      <PolicyBackendControl
+        serviceType={info.serviceType}
+      />
 
       {/* Edit mode indicator */}
       <div
@@ -429,9 +439,9 @@ const InferencePanel = () => {
         selectButtonText="Select"
         allowDirectorySelect={true}
         allowFileSelect={false}
-        initialPath={DEFAULT_PATHS.HF_MODEL_DOWNLOAD_PATH}
-        defaultPath={DEFAULT_PATHS.HF_MODEL_DOWNLOAD_PATH}
-        homePath=""
+        initialPath={policyBrowserPath}
+        defaultPath={policyBrowserPath}
+        homePath={DEFAULT_PATHS.POLICY_CHECKPOINTS_PATH}
       />
     </div>
   );
