@@ -75,27 +75,18 @@ def _resolve_queue_max() -> int:
 # ffmpeg's mjpeg demuxer doesn't desync.
 _JPEG_SOI = b"\xff\xd8"
 
-# Minimal valid 1x1 grayscale JPEG, written into ffmpeg's stdin right
-# before close() so the demuxer can finalise the last real frame.
+# Non-decodable trailer written into ffmpeg's stdin right before close()
+# so the demuxer can finalise the last real frame without emitting an
+# extra fake image.
 #
 # Why: ffmpeg's image2pipe+mjpeg demuxer only commits frame N to the
 # muxer when it sees frame N+1's SOI marker — it uses the next SOI as
 # the byte-boundary for the previous frame. On EOF the last buffered
 # frame is dropped, which makes mp4 frame_count = sidecar rows - 1.
-# Feeding one extra full JPEG before close lets that real last frame
-# get demuxed; this sentinel itself has no next-SOI so the demuxer
-# drops it. Verified empirically (synthetic N=5/10/50/100 all recover
-# to exactly N frames with this trailer).
-_JPEG_SENTINEL = bytes.fromhex(
-    "ffd8"                                                          # SOI
-    "ffe000104a46494600010100000100010000"                          # APP0 (JFIF)
-    "ffdb004300" + "01" * 64                                        # DQT
-    + "ffc0000b08000100010101110000"                                # SOF0 (1x1)
-    + "ffc4001f0000010501010101010100000000000000000102030405060708090a0b"  # DHT (DC)
-    + "ffc40014100100000000000000000000000000000000"                # DHT (AC)
-    + "ffda0008010100003f00" + "00"                                 # SOS + 1 byte ECS
-    + "ffd9"                                                        # EOI
-)
+# Feeding one extra SOI marker before close lets the real last frame
+# get demuxed. A complete JPEG here is unsafe: ffmpeg can mux it as a
+# visible gray final frame with no matching timestamp row.
+_JPEG_SENTINEL = _JPEG_SOI
 
 _TIMESTAMP_SCHEMA = pa.schema([
     ("frame_index", pa.int32()),
@@ -249,11 +240,10 @@ class VideoRecorder:
             # block forever waiting for EOF, exceeding the ~30s service
             # deadline.
             #
-            # Trail one sentinel JPEG into each ffmpeg before close so
+            # Trail one SOI marker into each ffmpeg before close so
             # the mjpeg image2pipe demuxer can finalise the real last
             # frame (see _JPEG_SENTINEL docstring for the demuxer quirk
-            # this avoids). The sentinel itself is dropped because no
-            # further SOI follows it.
+            # this avoids) without muxing a fake final image.
             for stream in streams:
                 self._write_ffmpeg_sentinel(stream)
             for stream in streams:
@@ -425,9 +415,11 @@ class VideoRecorder:
             # Skip the long input-probing phase: we know the stream is
             # MJPEG, one frame per packet, so feed the demuxer minimum
             # bytes / zero analyzeduration for near-zero startup latency.
+            # Do not use ``-fflags +nobuffer`` here: with image2pipe+mjpeg
+            # it can drop the final packet at close, leaving sidecar rows
+            # one larger than the MP4 frame count.
             "-probesize", "32",
             "-analyzeduration", "0",
-            "-fflags", "+nobuffer",
             # Use the time at which each packet arrives on the pipe as
             # its PTS. ROS image topics are variable-rate (camera FPS
             # drifts, missed publications), so any fixed ``-framerate``
