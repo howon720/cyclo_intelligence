@@ -1,0 +1,494 @@
+// Copyright 2025 ROBOTIS CO., LTD.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useSelector, useDispatch } from 'react-redux';
+import clsx from 'clsx';
+import toast from 'react-hot-toast';
+import {
+  MdArrowDropDown,
+  MdArrowDropUp,
+  MdDelete,
+  MdDeleteSweep,
+  MdDone,
+  MdFiberManualRecord,
+  MdSave,
+} from 'react-icons/md';
+
+import { RecordPhase } from '../constants/taskPhases';
+import {
+  resetSegmentPlan,
+  resetSegmentProgress,
+  setActiveSlotIndex,
+  setPlannedCount,
+  setPlannedSubTaskAt,
+  setPlannedSubTasks,
+  setSlotToServerIdx,
+} from '../features/tasks/taskSlice';
+import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
+import InfoPanel from './InfoPanel';
+import Tooltip from './Tooltip';
+
+const MAX_PLANNED_SLOTS = 50;
+
+const isInputFocused = () => {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName.toLowerCase();
+  return tag === 'input' || tag === 'textarea' || tag === 'select' || el.contentEditable === 'true';
+};
+
+export default function SegmentPanel() {
+  const dispatch = useDispatch();
+  const { sendRecordCommand } = useRosServiceCaller();
+
+  const taskInfo = useSelector((state) => state.tasks.taskInfo);
+  const recordStatus = useSelector((state) => state.tasks.recordStatus);
+  const plannedCount = useSelector((state) => state.tasks.plannedCount);
+  const plannedSubTasks = useSelector((state) => state.tasks.plannedSubTasks);
+  const slotToServerIdx = useSelector((state) => state.tasks.slotToServerIdx);
+  const activeSlotIndex = useSelector((state) => state.tasks.activeSlotIndex);
+
+  const [optimisticRecording, setOptimisticRecording] = useState(false);
+  const [savingInProgress, setSavingInProgress] = useState(false);
+
+  const serverRecording = recordStatus.recordPhase === RecordPhase.RECORDING;
+  const isRecording = serverRecording || optimisticRecording;
+  const isPlanMode = plannedCount > 0;
+  const firstPendingSlot = useMemo(
+    () => slotToServerIdx.findIndex((v) => v === -1),
+    [slotToServerIdx]
+  );
+  const planComplete = isPlanMode && firstPendingSlot === -1;
+  const savedCount = useMemo(
+    () => slotToServerIdx.filter((v) => v >= 0).length,
+    [slotToServerIdx]
+  );
+  const taskInfoComplete = Boolean(
+    (taskInfo.taskNum || '').trim() &&
+      (taskInfo.taskName || '').trim() &&
+      (taskInfo.taskInstruction?.[0] || '').trim()
+  );
+  const allSubTasksFilled = useMemo(
+    () =>
+      isPlanMode &&
+      plannedSubTasks.length === plannedCount &&
+      plannedSubTasks.every((s) => !!(s || '').trim()),
+    [isPlanMode, plannedSubTasks, plannedCount]
+  );
+
+  useEffect(() => {
+    setOptimisticRecording(serverRecording);
+  }, [serverRecording]);
+
+  const minAllowedCount = useMemo(() => {
+    let highest = -1;
+    for (let i = 0; i < slotToServerIdx.length; i += 1) {
+      if (slotToServerIdx[i] >= 0) highest = i;
+    }
+    return highest + 1;
+  }, [slotToServerIdx]);
+
+  const applyPlanCount = useCallback(
+    (n) => {
+      const bounded = Math.max(0, Math.min(MAX_PLANNED_SLOTS, n));
+      if (bounded === plannedCount) return;
+      let nextSubTasks;
+      let nextSlotMap;
+      if (bounded > plannedCount) {
+        const add = bounded - plannedCount;
+        nextSubTasks = [...plannedSubTasks, ...Array(add).fill('')];
+        nextSlotMap = [...slotToServerIdx, ...Array(add).fill(-1)];
+      } else {
+        nextSubTasks = plannedSubTasks.slice(0, bounded);
+        nextSlotMap = slotToServerIdx.slice(0, bounded);
+      }
+      dispatch(setPlannedCount(bounded));
+      dispatch(setPlannedSubTasks(nextSubTasks));
+      dispatch(setSlotToServerIdx(nextSlotMap));
+      const nextPending = nextSlotMap.findIndex((v) => v === -1);
+      dispatch(setActiveSlotIndex(nextPending >= 0 ? nextPending : Math.max(0, bounded - 1)));
+    },
+    [dispatch, plannedCount, plannedSubTasks, slotToServerIdx]
+  );
+
+  const handlePlanCountInput = useCallback(
+    (rawValue) => {
+      if (isRecording || savingInProgress) return;
+      const n = parseInt(rawValue, 10);
+      if (!Number.isFinite(n) || n < 0) return;
+      if (n < minAllowedCount) {
+        toast.error(`Cannot reduce below ${minAllowedCount}; subtasks are already saved`);
+        applyPlanCount(minAllowedCount);
+        return;
+      }
+      if (n > MAX_PLANNED_SLOTS) {
+        toast.error(`Max ${MAX_PLANNED_SLOTS} subtasks per episode`);
+      }
+      applyPlanCount(n);
+    },
+    [applyPlanCount, isRecording, minAllowedCount, savingInProgress]
+  );
+
+  const runCommand = useCallback(
+    async (label, command, opts = {}) => {
+      try {
+        const result = await sendRecordCommand(command, {
+          subtaskInstruction: plannedSubTasks,
+          ...opts,
+        });
+        if (result && result.success) {
+          toast.success(`${label}: ${result.message || 'OK'}`);
+        } else {
+          toast.error(`${label} failed: ${result?.message || 'Unknown error'}`);
+        }
+        return result;
+      } catch (error) {
+        toast.error(`${label} failed: ${error.message || error}`);
+        return null;
+      }
+    },
+    [plannedSubTasks, sendRecordCommand]
+  );
+
+  const canStartRecord =
+    isPlanMode &&
+    !isRecording &&
+    !savingInProgress &&
+    !planComplete &&
+    allSubTasksFilled &&
+    taskInfoComplete;
+
+  const startRecordingSlot = useCallback(
+    async (slotIdx) => {
+      const subTask = (plannedSubTasks[slotIdx] || '').trim();
+      if (!subTask) return null;
+      dispatch(setActiveSlotIndex(slotIdx));
+      setOptimisticRecording(true);
+      const result = await runCommand('Record', 'start_segment', {
+        segmentIndex: slotIdx,
+      });
+      if (!result || result.success === false) {
+        setOptimisticRecording(false);
+      }
+      return result;
+    },
+    [dispatch, plannedSubTasks, runCommand]
+  );
+
+  const handleRecordStart = useCallback(async () => {
+    if (!canStartRecord) return;
+    await startRecordingSlot(activeSlotIndex);
+  }, [activeSlotIndex, canStartRecord, startRecordingSlot]);
+
+  const handleSlotSave = useCallback(
+    async (slotIdx) => {
+      if (slotIdx !== activeSlotIndex || !isRecording || savingInProgress) return;
+      setSavingInProgress(true);
+      setOptimisticRecording(false);
+      const isLastSlot = slotIdx >= plannedCount - 1;
+      const result = await runCommand('Save', 'stop_segment', {
+        segmentIndex: slotIdx,
+      });
+      if (!result || result.success === false) {
+        setSavingInProgress(false);
+        return;
+      }
+
+      const assignedServerIdx = slotToServerIdx.filter((v) => v >= 0).length;
+      const updatedSlotMap = slotToServerIdx.map((v, i) =>
+        i === slotIdx ? assignedServerIdx : v
+      );
+      dispatch(setSlotToServerIdx(updatedSlotMap));
+
+      if (isLastSlot) {
+        const finishResult = await runCommand('Finish episode', 'finish_episode');
+        if (finishResult && finishResult.success) {
+          dispatch(resetSegmentProgress());
+        }
+        setSavingInProgress(false);
+        return;
+      }
+
+      const nextPending = updatedSlotMap.findIndex((v) => v === -1);
+      if (nextPending >= 0) {
+        dispatch(setActiveSlotIndex(nextPending));
+        await startRecordingSlot(nextPending);
+      }
+      setSavingInProgress(false);
+    },
+    [
+      activeSlotIndex,
+      dispatch,
+      isRecording,
+      plannedCount,
+      runCommand,
+      savingInProgress,
+      slotToServerIdx,
+      startRecordingSlot,
+    ]
+  );
+
+  const handleSlotTrash = useCallback(
+    async (slotIdx) => {
+      if (savingInProgress) return;
+      const isActiveRecording = slotIdx === activeSlotIndex && isRecording;
+      const serverIdx = slotToServerIdx[slotIdx];
+
+      if (isActiveRecording) {
+        setOptimisticRecording(false);
+        await runCommand('Discard', 'cancel_segment', { segmentIndex: slotIdx });
+        return;
+      }
+      if (serverIdx < 0) return;
+      if (!window.confirm(`Discard subtask ${slotIdx + 1}?`)) return;
+      const result = await runCommand(`Discard #${slotIdx + 1}`, 'discard_segment', {
+        segmentIndex: slotIdx,
+      });
+      if (!result || result.success === false) return;
+      const updated = slotToServerIdx.map((v, i) => (i === slotIdx ? -1 : v));
+      dispatch(setSlotToServerIdx(updated));
+      dispatch(setActiveSlotIndex(slotIdx));
+    },
+    [activeSlotIndex, dispatch, isRecording, runCommand, savingInProgress, slotToServerIdx]
+  );
+
+  const handleDiscardEpisode = useCallback(async () => {
+    if (isRecording || savedCount <= 0) return;
+    if (!window.confirm('Discard ALL saved subtasks for this episode?')) return;
+    const result = await runCommand('Discard episode', 'discard_episode');
+    if (result && result.success) {
+      dispatch(resetSegmentProgress());
+    }
+  }, [dispatch, isRecording, runCommand, savedCount]);
+
+  useEffect(() => {
+    const onKeyUp = (e) => {
+      if (isInputFocused()) return;
+      if (e.key === ' ' || e.code === 'Space') {
+        if (canStartRecord) handleRecordStart();
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'x' || e.key === 'X')) {
+        if (isRecording && !savingInProgress) handleSlotSave(activeSlotIndex);
+      } else if (e.key === 'Escape') {
+        if (isRecording && !savingInProgress) handleSlotTrash(activeSlotIndex);
+      }
+    };
+    window.addEventListener('keyup', onKeyUp);
+    return () => window.removeEventListener('keyup', onKeyUp);
+  }, [
+    activeSlotIndex,
+    canStartRecord,
+    handleRecordStart,
+    handleSlotSave,
+    handleSlotTrash,
+    isRecording,
+    savingInProgress,
+  ]);
+
+  const canResetPlan = isPlanMode && !isRecording && !savingInProgress && savedCount === 0;
+
+  const secondaryBtn = (enabled, color) =>
+    clsx(
+      'px-2.5 py-1.5 rounded-md text-sm font-semibold transition-colors',
+      'flex items-center justify-center gap-1',
+      enabled
+        ? color === 'red'
+          ? 'bg-red-500 text-white hover:bg-red-600'
+          : 'bg-indigo-500 text-white hover:bg-indigo-600'
+        : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+    );
+
+  const renderSlotRow = (i) => {
+    const isSaved = slotToServerIdx[i] >= 0;
+    const isActive = i === activeSlotIndex && !planComplete;
+    const isCurrentlyRecording = isActive && isRecording;
+    const inputDisabled = isSaved || isRecording || savingInProgress;
+    const saveEnabled = isCurrentlyRecording && !savingInProgress;
+    const trashEnabled = !savingInProgress && (isCurrentlyRecording || (isSaved && !isRecording));
+
+    return (
+      <div
+        key={`slot-${i}`}
+        className={clsx('flex items-center gap-2 px-2 py-1.5 rounded-md border', {
+          'border-gray-100 opacity-70 bg-gray-50': isSaved,
+          'border-red-300 bg-red-50': isCurrentlyRecording,
+          'border-blue-200 bg-blue-50': isActive && !isCurrentlyRecording,
+          'border-gray-100': !isSaved && !isActive,
+        })}
+      >
+        <span
+          className={clsx('text-xs font-mono w-6 shrink-0 text-center rounded flex items-center justify-center', {
+            'bg-green-100 text-green-700': isSaved,
+            'text-blue-700 font-bold': isActive && !isSaved,
+            'text-gray-500': !isSaved && !isActive,
+          })}
+        >
+          {isSaved ? <MdDone size={14} /> : `#${i + 1}`}
+        </span>
+        <input
+          type="text"
+          lang="ko"
+          className={clsx(
+            'flex-1 text-sm p-1 border border-gray-300 rounded-md min-w-0',
+            'focus:outline-none focus:ring-2 focus:ring-blue-500',
+            { 'bg-gray-100 cursor-not-allowed text-gray-500': inputDisabled }
+          )}
+          value={plannedSubTasks[i] || ''}
+          placeholder="sub_task 입력"
+          onChange={(e) => dispatch(setPlannedSubTaskAt({ index: i, value: e.target.value }))}
+          disabled={inputDisabled}
+        />
+        <button
+          onClick={() => handleSlotSave(i)}
+          disabled={!saveEnabled}
+          className={clsx(
+            'px-2 py-1 rounded-md text-xs font-semibold flex items-center gap-1',
+            saveEnabled
+              ? 'bg-green-500 text-white hover:bg-green-600'
+              : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+          )}
+          aria-label={`Save subtask ${i + 1}`}
+          title="Save this subtask"
+        >
+          <MdSave size={14} />
+          Save
+        </button>
+        <button
+          onClick={() => handleSlotTrash(i)}
+          disabled={!trashEnabled}
+          className={clsx(
+            'p-1 rounded',
+            trashEnabled ? 'hover:bg-red-50 text-red-500' : 'text-gray-300 cursor-not-allowed'
+          )}
+          aria-label={`Discard subtask ${i + 1}`}
+          title={isCurrentlyRecording ? 'Cancel current recording' : 'Discard saved subtask'}
+        >
+          <MdDelete size={16} />
+        </button>
+      </div>
+    );
+  };
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-2xl shadow-md p-4 w-full max-w-[350px] mt-3">
+      <div className="mb-3 text-lg font-semibold text-gray-800">Rosbag Recorder</div>
+
+      <div className="mb-3">
+        <div className="text-sm font-semibold text-gray-700 mb-2">
+          Task Information
+          <span className="ml-1 text-xs font-normal text-gray-400">(required)</span>
+        </div>
+        <InfoPanel variant="embedded" />
+      </div>
+
+      <Tooltip
+        position="top"
+        content={
+          <div className="text-center">
+            <div className="font-semibold">
+              {isPlanMode ? 'Start recording the active subtask' : 'Set the number of subtasks below first'}
+            </div>
+            {canStartRecord && (
+              <div className="text-sm mt-1 text-gray-300">
+                <span className="font-mono bg-gray-700 px-1 rounded">Space</span>
+              </div>
+            )}
+          </div>
+        }
+        className="block w-full"
+      >
+        <button
+          onClick={handleRecordStart}
+          disabled={!canStartRecord}
+          className={clsx(
+            'w-full mb-3 px-3 py-2.5 rounded-lg font-semibold text-sm',
+            'flex items-center justify-center gap-2 transition-colors',
+            canStartRecord
+              ? 'bg-red-500 text-white hover:bg-red-600'
+              : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+          )}
+        >
+          <MdFiberManualRecord size={18} />
+          Record Start
+        </button>
+      </Tooltip>
+
+      <div className="mb-3">
+        <div className="text-sm font-semibold text-gray-700 mb-2">
+          Number of SubTasks
+          <span className="ml-1 text-xs font-normal text-gray-400">(plan before recording)</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex flex-1 items-stretch border border-gray-300 rounded-md overflow-hidden">
+            <input
+              type="number"
+              min={minAllowedCount}
+              max={MAX_PLANNED_SLOTS}
+              value={plannedCount}
+              onChange={(e) => handlePlanCountInput(e.target.value)}
+              disabled={isRecording || savingInProgress}
+              className="flex-1 text-sm p-1.5 outline-none focus:ring-2 focus:ring-blue-500 [appearance:textfield]"
+            />
+            <div className="flex flex-col border-l border-gray-300">
+              <button
+                type="button"
+                onClick={() => handlePlanCountInput(plannedCount + 1)}
+                disabled={isRecording || savingInProgress || plannedCount >= MAX_PLANNED_SLOTS}
+                className="flex-1 px-1 border-b border-gray-300 text-gray-600 hover:bg-gray-100 disabled:text-gray-300"
+              >
+                <MdArrowDropUp size={18} />
+              </button>
+              <button
+                type="button"
+                onClick={() => handlePlanCountInput(plannedCount - 1)}
+                disabled={isRecording || savingInProgress || plannedCount <= minAllowedCount}
+                className="flex-1 px-1 text-gray-600 hover:bg-gray-100 disabled:text-gray-300"
+              >
+                <MdArrowDropDown size={18} />
+              </button>
+            </div>
+          </div>
+          <button
+            onClick={() => dispatch(resetSegmentPlan())}
+            disabled={!canResetPlan}
+            className={clsx(
+              'px-3 py-1.5 rounded-md text-sm font-semibold transition-colors',
+              canResetPlan
+                ? 'bg-gray-300 text-gray-800 hover:bg-gray-400'
+                : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+            )}
+          >
+            Reset
+          </button>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-1.5 mb-3">
+        {Array.from({ length: plannedCount }, (_, i) => renderSlotRow(i))}
+        {isRecording && activeSlotIndex < plannedCount && (
+          <div className="text-xs text-red-600 font-mono px-2">
+            Recording slot #{activeSlotIndex + 1}: {plannedSubTasks[activeSlotIndex] || '-'} ({recordStatus.proceedTime}s)
+          </div>
+        )}
+        {savingInProgress && (
+          <div className="text-xs text-amber-700 font-mono px-2">Saving / advancing...</div>
+        )}
+        {!isPlanMode && (
+          <div className="text-xs text-gray-400 italic px-2">
+            Set a subtask count to start planning the episode.
+          </div>
+        )}
+      </div>
+
+      <button
+        onClick={handleDiscardEpisode}
+        disabled={isRecording || savedCount <= 0}
+        className={secondaryBtn(!isRecording && savedCount > 0, 'red')}
+      >
+        <MdDeleteSweep size={16} />
+        Discard Episode
+      </button>
+    </div>
+  );
+}

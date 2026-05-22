@@ -17,6 +17,7 @@ Recording task configuration information.
 | `user_id` | string | HuggingFace user ID |
 | `task_name` | string | Task name |
 | `task_instruction` | string[] | Task instruction list |
+| `subtask_instruction` | string[] | Subtask instruction list |
 | `num_episodes` | uint16 | Total episode count |
 | `warmup_time_s` | uint16 | Warmup time (seconds) |
 | `episode_time_s` | uint16 | Episode time (seconds) |
@@ -52,6 +53,10 @@ Record-side status (cyclo_data → UI direct on `/data/recording/status`).
 | `current_episode_number` | uint16 | Current episode number |
 | `current_scenario_number` | uint16 | Current scenario number |
 | `current_task_instruction` | string | Current task instruction |
+| `current_subtask_index` | uint16 | Current subtask index |
+| `subtask_count` | uint16 | Subtask count |
+| `current_subtask_instruction` | string | Current subtask instruction |
+| `subtask_instructions` | string[] | Subtask instruction list |
 | `encoding_progress` | float32 | Encoding/conversion progress (%) |
 | `used_storage_size` | float32 | Used storage (GB) |
 | `total_storage_size` | float32 | Total storage (GB) |
@@ -181,12 +186,20 @@ Recording/inference control commands.
 | `RERECORD` | 5 | Re-record |
 | `FINISH` | 6 | Finish |
 | `SKIP_TASK` | 7 | Skip task |
+| `START_SEGMENT` | 18 | Start planned subtask segment |
+| `STOP_SEGMENT` | 19 | Stop/save current subtask segment |
+| `DISCARD_SEGMENT` | 20 | Discard a saved subtask segment |
+| `FINISH_EPISODE` | 21 | Finish current full episode after subtasks |
+| `DISCARD_EPISODE` | 22 | Discard saved subtasks for current full episode |
+| `SET_TASK_INFO` | 23 | Cache/update task information |
+| `CANCEL_SEGMENT` | 24 | Cancel active subtask recording |
 
 **Request**
 | Field | Type | Description |
 |-------|------|-------------|
 | `command` | uint8 | Command code |
 | `task_info` | TaskInfo | Task configuration |
+| `segment_index` | uint16 | Planned subtask/segment index |
 
 **Response**
 | Field | Type | Description |

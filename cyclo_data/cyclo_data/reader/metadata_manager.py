@@ -243,17 +243,12 @@ class MetadataManager:
             if end < start:
                 continue
 
-            normalized = dict(segment)
-            normalized["sub_task_index"] = self._coerce_int(
-                normalized.get("sub_task_index"), idx
-            )
-            normalized["sub_task_description"] = str(
-                normalized.get("sub_task_description", "") or ""
-            )
-            normalized["sub_task_instruction"] = str(
-                normalized.get("sub_task_instruction", "") or ""
-            )
-            normalized["frame_duration"] = [float(start), float(end)]
+            normalized = {
+                "sub_task_instruction": str(
+                    segment.get("sub_task_instruction", "") or ""
+                ),
+                "frame_duration": [float(start), float(end)],
+            }
             segments.append(normalized)
 
         segments.sort(key=lambda s: s["frame_duration"][0])
@@ -280,12 +275,6 @@ class MetadataManager:
             if start is None or end is None or end < start:
                 continue
             normalized.append({
-                "sub_task_index": self._coerce_int(
-                    segment.get("sub_task_index"), idx
-                ),
-                "sub_task_description": str(
-                    segment.get("sub_task_description", "") or ""
-                ),
                 "sub_task_instruction": str(
                     segment.get("sub_task_instruction", "") or ""
                 ),
@@ -293,8 +282,6 @@ class MetadataManager:
             })
 
         normalized.sort(key=lambda s: s["frame_duration"][0])
-        for idx, segment in enumerate(normalized):
-            segment["sub_task_index"] = idx
 
         info["segments"] = normalized
         info["segment_time_unit"] = "seconds"

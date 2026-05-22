@@ -119,6 +119,8 @@ class TestEpisodeData(unittest.TestCase):
         self.assertEqual(episode.video_files, {})
         self.assertEqual(episode.tasks, [])
         self.assertEqual(episode.length, 0)
+        self.assertEqual(episode.recording_mode, "single")
+        self.assertEqual(episode.subtask_instructions, [])
 
     def test_with_data(self):
         episode = EpisodeData(
@@ -140,6 +142,72 @@ class TestEpisodeData(unittest.TestCase):
         self.assertEqual(episode.episode_index, 5)
         self.assertEqual(len(episode.timestamps), 3)
         self.assertEqual(episode.length, 3)
+
+
+class TestSubtaskStitching(unittest.TestCase):
+    """Tests for recording-time subtask episodes stitched at conversion time."""
+
+    def _make_subtask_episode(self, raw_idx, full_idx, sub_idx, total, values):
+        return EpisodeData(
+            episode_index=raw_idx,
+            timestamps=[0.0, 0.1],
+            observation_state=[
+                np.array([values[0]], dtype=np.float32),
+                np.array([values[1]], dtype=np.float32),
+            ],
+            action=[
+                np.array([values[0] + 10], dtype=np.float32),
+                np.array([values[1] + 10], dtype=np.float32),
+            ],
+            tasks=["main task"],
+            length=2,
+            recording_mode="subtask",
+            full_episode_index=full_idx,
+            subtask_index=sub_idx,
+            subtask_total=total,
+            subtask_instruction=f"subtask {sub_idx}",
+        )
+
+    def test_complete_subtasks_stitch_into_one_episode(self):
+        converter = RosbagToLerobotConverter(
+            ConversionConfig(repo_id="test", output_dir=Path("/tmp/out"), fps=10)
+        )
+        episodes = [
+            self._make_subtask_episode(0, 0, 0, 3, [1, 2]),
+            self._make_subtask_episode(1, 0, 1, 3, [3, 4]),
+            self._make_subtask_episode(2, 0, 2, 3, [5, 6]),
+        ]
+
+        stitched = converter.prepare_episodes_for_writing(episodes)
+
+        self.assertEqual(len(stitched), 1)
+        self.assertEqual(stitched[0].episode_index, 0)
+        self.assertEqual(stitched[0].recording_mode, "stitched_subtask")
+        self.assertEqual(stitched[0].tasks, ["main task"])
+        self.assertEqual(stitched[0].subtask_instructions, [
+            "subtask 0", "subtask 1", "subtask 2",
+        ])
+        self.assertEqual(stitched[0].length, 6)
+        self.assertEqual([round(t, 3) for t in stitched[0].timestamps], [
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5,
+        ])
+        self.assertEqual(
+            [float(state[0]) for state in stitched[0].observation_state],
+            [1, 2, 3, 4, 5, 6],
+        )
+
+    def test_incomplete_subtask_group_is_skipped(self):
+        converter = RosbagToLerobotConverter(
+            ConversionConfig(repo_id="test", output_dir=Path("/tmp/out"), fps=10)
+        )
+        episodes = [
+            self._make_subtask_episode(0, 0, 0, 3, [1, 2]),
+            self._make_subtask_episode(1, 0, 2, 3, [5, 6]),
+        ]
+
+        stitched = converter.prepare_episodes_for_writing(episodes)
+
+        self.assertEqual(stitched, [])
 
 
 class TestRosbagToLerobotConverter(unittest.TestCase):

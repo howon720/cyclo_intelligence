@@ -30,6 +30,8 @@ import hashlib
 import json
 import os
 import shutil  # noqa: F401  (re-exported transitively for legacy callers)
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -218,6 +220,16 @@ class EpisodeData:
     video_files: Dict[str, Path] = field(default_factory=dict)
     tasks: List[str] = field(default_factory=list)
     length: int = 0
+    source_path: Optional[Path] = None
+    recording_mode: str = "single"
+    full_episode_index: Optional[int] = None
+    subtask_index: int = 0
+    subtask_total: int = 0
+    subtask_instruction: str = ""
+    subtask_instructions: List[str] = field(default_factory=list)
+    subtask_segments: List[Dict[str, Any]] = field(default_factory=list)
+    subtask_indices: List[int] = field(default_factory=list)
+    task_name: str = ""
     # Absolute MCAP log_time (seconds since epoch) for each row of
     # ``timestamps``. Populated by ``_resample_to_fps`` so the video
     # sync step can map per-camera MP4 frames onto the same grid.
@@ -586,51 +598,63 @@ class RosbagToLerobotConverterBase:
         if self.config.apply_exclude_regions:
             exclude_regions = self._metadata_manager.get_exclude_regions(bag_path)
 
-        episode_data = self._extract_joint_data(
-            bag_path, episode_index, trim_points, exclude_regions
-        )
+        episode_info = self._metadata_manager.load_episode_info(bag_path)
+        if self._is_archived_segment_episode(bag_path, episode_info):
+            episode_data = self._convert_archived_segment_episode(
+                bag_path, episode_index, episode_info
+            )
+        else:
+            episode_data = self._extract_joint_data(
+                bag_path, episode_index, trim_points, exclude_regions
+            )
         if episode_data is None:
             return None
+        episode_data.source_path = bag_path
 
-        video_files = self._find_video_files(bag_path)
-        episode_data.video_files = video_files
+        self._apply_episode_info(episode_data, episode_info)
 
-        # Recording format v2 path: every camera has a sidecar parquet
-        # under ``videos/<cam>_timestamps.parquet``. Build a synced MP4
-        # per camera so that frame N == grid step N (LeRobot's video
-        # reader assumes 1:1 with the parquet rows). For each grid
-        # step we pick the most recent MP4 frame with ``recv_ns`` <=
-        # ``grid_log_time``; both are subscriber-side clocks so they
-        # share an origin.
-        episode_data = self._sync_videos_to_grid(bag_path, episode_data)
+        if not self._is_archived_segment_episode(bag_path, episode_info):
+            video_files = self._find_video_files(bag_path)
+            episode_data.video_files = video_files
 
-        # Legacy fallback: when no sidecars exist (recordings made by
-        # the v1 pipeline that called rosbag2mp4 before this rewrite)
-        # the synced MP4 step is a no-op and the parquet rows still
-        # need a 1:1 trim against the raw MP4 frame count.
-        if video_files and not self._episode_has_sidecars(bag_path):
-            video_frame_counts = {}
-            for cam_name, vpath in video_files.items():
-                fc = self._get_video_frame_count(vpath)
-                if fc is not None:
-                    video_frame_counts[cam_name] = fc
+            # Recording format v2 path: every camera has a sidecar parquet
+            # under ``videos/<cam>_timestamps.parquet``. Build a synced MP4
+            # per camera so that frame N == grid step N (LeRobot's video
+            # reader assumes 1:1 with the parquet rows). For each grid
+            # step we pick the most recent MP4 frame with ``recv_ns`` <=
+            # ``grid_log_time``; both are subscriber-side clocks so they
+            # share an origin.
+            episode_data = self._sync_videos_to_grid(bag_path, episode_data)
 
-            if video_frame_counts:
-                target_frames = min(video_frame_counts.values())
-                if episode_data.length > target_frames:
-                    excess = episode_data.length - target_frames
-                    self._log_info(
-                        f"Trimming parquet from {episode_data.length} to "
-                        f"{target_frames} rows to match video frames "
-                        f"(removing {excess} from end)"
-                    )
-                    episode_data.timestamps = episode_data.timestamps[:target_frames]
-                    episode_data.observation_state = episode_data.observation_state[:target_frames]
-                    episode_data.action = episode_data.action[:target_frames]
-                    episode_data.grid_log_times_sec = (
-                        episode_data.grid_log_times_sec[:target_frames]
-                    )
-                    episode_data.length = target_frames
+            # Legacy fallback: when no sidecars exist (recordings made by
+            # the v1 pipeline that called rosbag2mp4 before this rewrite)
+            # the synced MP4 step is a no-op and the parquet rows still
+            # need a 1:1 trim against the raw MP4 frame count.
+            if video_files and not self._episode_has_sidecars(bag_path):
+                video_frame_counts = {}
+                for cam_name, vpath in video_files.items():
+                    fc = self._get_video_frame_count(vpath)
+                    if fc is not None:
+                        video_frame_counts[cam_name] = fc
+
+                if video_frame_counts:
+                    target_frames = min(video_frame_counts.values())
+                    if episode_data.length > target_frames:
+                        excess = episode_data.length - target_frames
+                        self._log_info(
+                            f"Trimming parquet from {episode_data.length} to "
+                            f"{target_frames} rows to match video frames "
+                            f"(removing {excess} from end)"
+                        )
+                        episode_data.timestamps = episode_data.timestamps[:target_frames]
+                        episode_data.observation_state = episode_data.observation_state[:target_frames]
+                        episode_data.action = episode_data.action[:target_frames]
+                        episode_data.grid_log_times_sec = (
+                            episode_data.grid_log_times_sec[:target_frames]
+                        )
+                        episode_data.length = target_frames
+
+        self._assign_subtask_indices(episode_data)
 
         task_markers = self._metadata_manager.get_task_markers(bag_path)
         if task_markers:
@@ -640,19 +664,647 @@ class RosbagToLerobotConverterBase:
         else:
             # Fall back to episode_info.json which records the
             # task_instruction from the recording session.
-            episode_info_path = bag_path / "episode_info.json"
-            instruction = ""
-            if episode_info_path.exists():
-                try:
-                    import json as _json
-                    with open(episode_info_path) as f:
-                        info = _json.load(f)
-                    instruction = str(info.get("task_instruction", "") or "")
-                except Exception as e:
-                    self._log_warning(f"Failed to read {episode_info_path}: {e}")
+            instruction = str(episode_info.get("task_instruction", "") or "")
             episode_data.tasks = [instruction or "default_task"]
 
         return episode_data
+
+    def _apply_episode_info(self, episode_data: EpisodeData, info: Dict[str, Any]) -> None:
+        if not info:
+            return
+        episode_data.task_name = str(info.get("task_name", "") or "")
+        episode_data.recording_mode = str(info.get("recording_mode", "single") or "single")
+        try:
+            episode_data.full_episode_index = int(
+                info.get("full_episode_index", episode_data.episode_index)
+            )
+        except (TypeError, ValueError):
+            episode_data.full_episode_index = episode_data.episode_index
+        try:
+            episode_data.subtask_index = int(info.get("subtask_index", 0) or 0)
+        except (TypeError, ValueError):
+            episode_data.subtask_index = 0
+        try:
+            episode_data.subtask_total = int(info.get("subtask_total", 0) or 0)
+        except (TypeError, ValueError):
+            episode_data.subtask_total = 0
+        episode_data.subtask_instruction = str(
+            info.get("subtask_instruction", "") or ""
+        )
+        raw_subtasks = info.get("subtask_instructions", []) or []
+        if isinstance(raw_subtasks, list):
+            episode_data.subtask_instructions = [
+                str(item or "").strip()
+                for item in raw_subtasks
+                if str(item or "").strip()
+            ]
+        segments = info.get("segments")
+        if not episode_data.subtask_instructions and isinstance(segments, list):
+            episode_data.subtask_instructions = [
+                str(segment.get("sub_task_instruction", "") or "").strip()
+                for segment in segments
+                if isinstance(segment, dict)
+                and str(segment.get("sub_task_instruction", "") or "").strip()
+            ]
+        if isinstance(segments, list) and not episode_data.subtask_segments:
+            normalized_segments: List[Dict[str, Any]] = []
+            for idx, segment in enumerate(segments):
+                if not isinstance(segment, dict):
+                    continue
+                duration = segment.get("frame_duration")
+                if not isinstance(duration, list) or len(duration) != 2:
+                    continue
+                try:
+                    start = float(duration[0])
+                    end = float(duration[1])
+                except (TypeError, ValueError):
+                    continue
+                if end < start:
+                    continue
+                instruction = str(segment.get("sub_task_instruction", "") or "")
+                normalized_segments.append({
+                    "subtask_index": idx,
+                    "sub_task_instruction": instruction,
+                    "frame_duration": [start, end],
+                })
+            episode_data.subtask_segments = normalized_segments
+
+    def _is_archived_segment_episode(
+        self,
+        bag_path: Path,
+        episode_info: Dict[str, Any],
+    ) -> bool:
+        """Return True for full episodes archived from multiple subtasks."""
+        segments = episode_info.get("segments")
+        if not isinstance(segments, list) or len(segments) <= 1:
+            return False
+        mcap_paths = self._segment_mcap_paths(Path(bag_path), len(segments))
+        return len(mcap_paths) == len(segments)
+
+    def _segment_mcap_paths(self, bag_path: Path, count: int) -> List[Path]:
+        """Find per-subtask MCAP files in archived full-episode order."""
+        bag_path = Path(bag_path)
+        if not bag_path.is_dir():
+            return []
+        try:
+            full_idx = int(bag_path.name)
+        except ValueError:
+            full_idx = None
+
+        expected: List[Path] = []
+        if full_idx is not None:
+            expected = [bag_path / f"{full_idx}_{idx}.mcap" for idx in range(count)]
+            if all(path.exists() for path in expected):
+                return expected
+
+        mcap_paths = sorted(bag_path.glob("*.mcap"))
+        if len(mcap_paths) == count:
+            return mcap_paths
+        return []
+
+    def _find_segment_video_files(
+        self,
+        bag_path: Path,
+        segment_stem: str,
+    ) -> Dict[str, Path]:
+        """Find raw camera MP4 files for one archived subtask segment."""
+        video_dir = Path(bag_path) / "videos" / segment_stem
+        if not video_dir.exists():
+            return {}
+        video_files: Dict[str, Path] = {}
+        for mp4_file in sorted(video_dir.glob("*.mp4")):
+            if mp4_file.stem.endswith("_synced"):
+                continue
+            camera_name = self._get_camera_name_for_video(mp4_file.stem)
+            video_files.setdefault(camera_name, mp4_file)
+        return video_files
+
+    def _convert_archived_segment_episode(
+        self,
+        bag_path: Path,
+        episode_index: int,
+        episode_info: Dict[str, Any],
+    ) -> Optional[EpisodeData]:
+        """Convert a full episode by resampling each subtask independently.
+
+        Archived subtask episodes keep one MCAP/video folder per subtask
+        under a single full-episode folder. Their MCAP log times may have
+        wall-clock gaps when an operator cancelled and re-recorded a later
+        subtask. Reading all MCAP files at once would create a LeRobot
+        grid across those gaps and causal-sync would hold the previous
+        state/image. Instead each segment is converted on its own time
+        base, then rows and synced videos are stitched into a continuous
+        LeRobot episode.
+        """
+        segments = episode_info.get("segments") or []
+        mcap_paths = self._segment_mcap_paths(bag_path, len(segments))
+        if not mcap_paths:
+            return None
+
+        segment_episodes: List[EpisodeData] = []
+        for subtask_idx, mcap_path in enumerate(mcap_paths):
+            segment_episode = self._extract_joint_data(
+                mcap_path,
+                episode_index,
+                trim_points=None,
+                exclude_regions=[],
+            )
+            if segment_episode is None:
+                self._log_warning(
+                    f"{bag_path.name}: subtask {subtask_idx} "
+                    f"({mcap_path.name}) produced no rows"
+                )
+                continue
+            segment_episode.video_files = self._find_segment_video_files(
+                bag_path,
+                mcap_path.stem,
+            )
+            segment_episode = self._sync_videos_to_grid(mcap_path, segment_episode)
+            segment = segments[subtask_idx] if subtask_idx < len(segments) else {}
+            if isinstance(segment, dict):
+                segment_episode.subtask_instruction = str(
+                    segment.get("sub_task_instruction", "") or ""
+                )
+            segment_episodes.append(segment_episode)
+
+        if not segment_episodes:
+            return None
+
+        fps = float(self.config.fps or DEFAULT_FPS)
+        stitched = EpisodeData(
+            episode_index=episode_index,
+            source_path=bag_path,
+            recording_mode="single",
+            full_episode_index=episode_index,
+            task_name=str(episode_info.get("task_name", "") or ""),
+            subtask_instructions=[
+                str(segment.get("sub_task_instruction", "") or "").strip()
+                for segment in segments
+                if isinstance(segment, dict)
+            ],
+        )
+
+        frame_cursor = 0
+        for subtask_idx, segment_episode in enumerate(segment_episodes):
+            length = int(segment_episode.length)
+            if length <= 0:
+                continue
+            stitched.observation_state.extend(segment_episode.observation_state)
+            stitched.action.extend(segment_episode.action)
+            stitched.timestamps.extend(
+                [(frame_cursor + offset) / fps for offset in range(length)]
+            )
+            # ``grid_log_times_sec`` is no longer used after per-segment
+            # video sync, but keep it continuous for diagnostics/stats.
+            stitched.grid_log_times_sec.extend(
+                [(frame_cursor + offset) / fps for offset in range(length)]
+            )
+            stitched.subtask_indices.extend([subtask_idx] * length)
+            instruction = (
+                segment_episode.subtask_instruction
+                or (
+                    stitched.subtask_instructions[subtask_idx]
+                    if subtask_idx < len(stitched.subtask_instructions)
+                    else f"Subtask {subtask_idx + 1}"
+                )
+            )
+            start_frame = frame_cursor
+            end_frame = frame_cursor + length
+            stitched.subtask_segments.append({
+                "subtask_index": subtask_idx,
+                "sub_task_instruction": instruction,
+                "frame_duration": [start_frame / fps, end_frame / fps],
+            })
+            frame_cursor = end_frame
+
+        stitched.length = len(stitched.timestamps)
+        stitched.video_files = self._stitch_subtask_videos(
+            episode_index,
+            segment_episodes,
+        )
+        self._log_info(
+            f"{bag_path.name}: converted {len(segment_episodes)} archived "
+            f"subtask segment(s) into {stitched.length} continuous frames"
+        )
+        return stitched
+
+    def _assign_subtask_indices(self, episode_data: EpisodeData) -> None:
+        """Map each output row timestamp to its source subtask segment."""
+        if not episode_data.subtask_segments or episode_data.length <= 0:
+            episode_data.subtask_indices = []
+            return
+
+        ordered = sorted(
+            episode_data.subtask_segments,
+            key=lambda segment: segment["frame_duration"][0],
+        )
+        last_idx = ordered[-1]["subtask_index"]
+        indices: List[int] = []
+        for ts in episode_data.timestamps[:episode_data.length]:
+            value = last_idx
+            for segment in ordered:
+                start, end = segment["frame_duration"]
+                if start <= float(ts) < end:
+                    value = int(segment["subtask_index"])
+                    break
+            indices.append(value)
+        episode_data.subtask_indices = indices
+
+    def _collect_task_names(self, episodes_data: List[EpisodeData]) -> None:
+        """Keep a lightweight task -> task_name map for writer metadata."""
+        self._task_names_by_task: Dict[str, str] = {}
+        for episode in episodes_data:
+            task = episode.tasks[0] if episode.tasks else "default_task"
+            task_name = episode.task_name or task
+            self._task_names_by_task.setdefault(task, task_name)
+
+    def _subtask_instruction_map(self, episode: EpisodeData) -> Dict[int, str]:
+        """Return subtask index -> instruction for an episode."""
+        mapping: Dict[int, str] = {}
+        for segment in episode.subtask_segments:
+            try:
+                idx = int(segment.get("subtask_index", 0))
+            except (TypeError, ValueError):
+                continue
+            instruction = str(segment.get("sub_task_instruction", "") or "").strip()
+            if instruction:
+                mapping[idx] = instruction
+
+        for idx, instruction in enumerate(episode.subtask_instructions):
+            clean = str(instruction or "").strip()
+            if clean:
+                mapping.setdefault(idx, clean)
+        return mapping
+
+    def _subtask_rows_for_dataset(
+        self,
+        episodes_data: List[EpisodeData],
+    ) -> List[Dict[str, Any]]:
+        """Build rows for meta/subtasks.parquet."""
+        by_index: Dict[int, str] = {}
+        for episode in episodes_data:
+            for idx, instruction in self._subtask_instruction_map(episode).items():
+                by_index.setdefault(idx, instruction)
+        return [
+            {"subtask_index": idx, "subtask": by_index[idx]}
+            for idx in sorted(by_index)
+        ]
+
+    def _subtask_annotations_for_episode(
+        self,
+        episode: EpisodeData,
+    ) -> List[Dict[str, Any]]:
+        """Build time-based subtask annotations for one episode."""
+        if not episode.subtask_segments and not episode.subtask_indices:
+            return []
+
+        instruction_by_index = self._subtask_instruction_map(episode)
+        fps = float(self.config.fps or DEFAULT_FPS)
+        annotations: List[Dict[str, Any]] = []
+
+        if episode.subtask_indices and len(episode.subtask_indices) == episode.length:
+            start_frame = 0
+            current_idx = int(episode.subtask_indices[0])
+            for frame_idx, idx_value in enumerate(episode.subtask_indices[1:], start=1):
+                idx = int(idx_value)
+                if idx == current_idx:
+                    continue
+                annotations.append({
+                    "sub_task_idx": current_idx,
+                    "sub_task_instruction": instruction_by_index.get(
+                        current_idx,
+                        f"Subtask {current_idx + 1}",
+                    ),
+                    "frame_duration": [start_frame / fps, frame_idx / fps],
+                })
+                start_frame = frame_idx
+                current_idx = idx
+            annotations.append({
+                "sub_task_idx": current_idx,
+                "sub_task_instruction": instruction_by_index.get(
+                    current_idx,
+                    f"Subtask {current_idx + 1}",
+                ),
+                "frame_duration": [start_frame / fps, episode.length / fps],
+            })
+            return annotations
+
+        for segment in episode.subtask_segments:
+            try:
+                idx = int(segment.get("subtask_index", 0))
+                start, end = segment.get("frame_duration", [0.0, 0.0])
+                start_f = float(start)
+                end_f = float(end)
+            except (TypeError, ValueError):
+                continue
+            annotations.append({
+                "sub_task_idx": idx,
+                "sub_task_instruction": instruction_by_index.get(
+                    idx,
+                    f"Subtask {idx + 1}",
+                ),
+                "frame_duration": [start_f, end_f],
+            })
+        return annotations
+
+    def _write_subtasks_parquet(
+        self,
+        output_dir: Path,
+        episodes_data: List[EpisodeData],
+    ) -> None:
+        """Write optional LeRobot subtask lookup metadata."""
+        rows = self._subtask_rows_for_dataset(episodes_data)
+        if not rows:
+            return
+        path = Path(output_dir) / "meta" / "subtasks.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        table = pa.table({
+            "subtask_index": pa.array(
+                [int(row["subtask_index"]) for row in rows],
+                type=pa.int64(),
+            ),
+            "subtask": pa.array(
+                [str(row["subtask"]) for row in rows],
+                type=pa.string(),
+            ),
+        })
+        pq.write_table(table, path)
+        self._log_info(f"Wrote subtasks metadata: {path}")
+
+    def _write_subtask_annotations(
+        self,
+        output_dir: Path,
+        episodes_data: List[EpisodeData],
+    ) -> None:
+        """Write per-episode subtask annotations without skill/primitive data."""
+        output_dir = Path(output_dir)
+        wrote_any = False
+        for episode in episodes_data:
+            annotations = self._subtask_annotations_for_episode(episode)
+            if not annotations:
+                continue
+            ep_idx = episode.episode_index
+            chunk_idx = ep_idx // self.config.chunks_size
+            path = (
+                output_dir
+                / "annotations"
+                / f"chunk-{chunk_idx:03d}"
+                / f"episode_{ep_idx:06d}.json"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            task = episode.tasks[0] if episode.tasks else "default_task"
+            payload = {
+                "task_name": episode.task_name or task,
+                "data_folder": "",
+                "meta_data": {
+                    "task_duration": episode.length / float(self.config.fps or DEFAULT_FPS),
+                    "valid_duration": [
+                        0.0,
+                        episode.length / float(self.config.fps or DEFAULT_FPS),
+                    ],
+                },
+                "sub_task_annotation": annotations,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=4, ensure_ascii=False)
+            wrote_any = True
+        if wrote_any:
+            self._log_info(f"Wrote subtask annotations under: {output_dir / 'annotations'}")
+
+    def _cleanup_output_temp_dirs(self) -> int:
+        """Remove converter-local temporary folders from a final dataset."""
+        removed = 0
+        output_dir = Path(self.config.output_dir)
+        for dirname in ("_subtask_video_concat", "_stitched_subtasks"):
+            path = output_dir / dirname
+            if path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        if removed:
+            self._log_info(
+                f"Cleaned up {removed} temporary folder(s) under {output_dir}"
+            )
+        return removed
+
+    def _cleanup_source_synced_cache(self, roots: List[Path]) -> int:
+        """Remove synced-video cache files produced during conversion."""
+        removed = 0
+        for root in roots:
+            root = Path(root)
+            if not root.exists():
+                continue
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if (
+                    (path.suffix == ".mp4" and path.stem.endswith("_synced"))
+                    or path.name.endswith("_synced.cache.json")
+                ):
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        if removed:
+            self._log_info(f"Cleaned up {removed} synced video cache file(s)")
+        return removed
+
+    def prepare_episodes_for_writing(
+        self,
+        episodes_data: List[EpisodeData],
+    ) -> List[EpisodeData]:
+        """Collapse complete recorded subtask groups into long-horizon episodes."""
+        if not any(ep.recording_mode == "subtask" for ep in episodes_data):
+            return episodes_data
+
+        grouped: Dict[int, List[EpisodeData]] = {}
+        ordered_items: List[Tuple[int, EpisodeData | tuple[int, List[EpisodeData]]]] = []
+        for ep in episodes_data:
+            if ep.recording_mode != "subtask":
+                ordered_items.append((ep.episode_index, ep))
+                continue
+            full_idx = (
+                ep.full_episode_index
+                if ep.full_episode_index is not None
+                else ep.episode_index
+            )
+            grouped.setdefault(int(full_idx), []).append(ep)
+
+        for full_idx, group in grouped.items():
+            min_raw_idx = min(ep.episode_index for ep in group)
+            ordered_items.append((min_raw_idx, (full_idx, group)))
+
+        prepared: List[EpisodeData] = []
+        for _, item in sorted(ordered_items, key=lambda pair: pair[0]):
+            if isinstance(item, EpisodeData):
+                prepared.append(item)
+                continue
+            full_idx, group = item
+            stitched = self._stitch_subtask_group(full_idx, group)
+            if stitched is not None:
+                prepared.append(stitched)
+
+        for new_idx, ep in enumerate(prepared):
+            ep.episode_index = new_idx
+        return prepared
+
+    def _stitch_subtask_group(
+        self,
+        full_idx: int,
+        group: List[EpisodeData],
+    ) -> Optional[EpisodeData]:
+        by_subtask = {ep.subtask_index: ep for ep in group}
+        expected_total = max(
+            [ep.subtask_total for ep in group if ep.subtask_total] or [len(group)]
+        )
+        missing = [idx for idx in range(expected_total) if idx not in by_subtask]
+        if missing:
+            self._log_warning(
+                f"Skipping incomplete subtask group full_episode={full_idx}: "
+                f"missing subtask(s) {missing}"
+            )
+            return None
+
+        ordered = [by_subtask[idx] for idx in range(expected_total)]
+        stitched = EpisodeData(
+            episode_index=full_idx,
+            tasks=[ordered[0].tasks[0] if ordered[0].tasks else "default_task"],
+            source_path=ordered[0].source_path,
+            recording_mode="stitched_subtask",
+            full_episode_index=full_idx,
+            subtask_index=0,
+            subtask_total=expected_total,
+            subtask_instructions=[
+                ep.subtask_instruction or f"Subtask {ep.subtask_index + 1}"
+                for ep in ordered
+            ],
+        )
+
+        offset = 0.0
+        step = 1.0 / float(self.config.fps or DEFAULT_FPS)
+        for ep in ordered:
+            if not ep.timestamps:
+                continue
+            base_ts = float(ep.timestamps[0])
+            remapped = [float(ts) - base_ts + offset for ts in ep.timestamps]
+            stitched.timestamps.extend(remapped)
+            stitched.observation_state.extend(ep.observation_state)
+            stitched.action.extend(ep.action)
+            if ep.grid_log_times_sec:
+                base_grid = float(ep.grid_log_times_sec[0])
+                stitched.grid_log_times_sec.extend(
+                    [float(ts) - base_grid + offset for ts in ep.grid_log_times_sec]
+                )
+            offset = (stitched.timestamps[-1] + step) if stitched.timestamps else offset
+
+        stitched.length = len(stitched.timestamps)
+        stitched.subtask_indices = []
+        stitched.subtask_segments = []
+        cursor = 0
+        for idx, ep in enumerate(ordered):
+            length = len(ep.timestamps)
+            if length <= 0:
+                continue
+            start_frame = cursor
+            end_frame = cursor + length
+            stitched.subtask_indices.extend([idx] * length)
+            instruction = (
+                ep.subtask_instruction
+                or (
+                    ep.subtask_instructions[idx]
+                    if idx < len(ep.subtask_instructions)
+                    else f"Subtask {idx + 1}"
+                )
+            )
+            start_s = start_frame / float(self.config.fps or DEFAULT_FPS)
+            end_s = end_frame / float(self.config.fps or DEFAULT_FPS)
+            stitched.subtask_segments.append({
+                "subtask_index": idx,
+                "sub_task_instruction": instruction,
+                "frame_duration": [start_s, end_s],
+            })
+            cursor = end_frame
+        stitched.video_files = self._stitch_subtask_videos(full_idx, ordered)
+        self._log_info(
+            f"Stitched full_episode={full_idx} from {len(ordered)} subtasks "
+            f"({stitched.length} frames)"
+        )
+        return stitched
+
+    def _stitch_subtask_videos(
+        self,
+        full_idx: int,
+        ordered: List[EpisodeData],
+    ) -> Dict[str, Path]:
+        if not ordered or not all(ep.video_files for ep in ordered):
+            return {}
+        common_cameras = set(ordered[0].video_files)
+        for ep in ordered[1:]:
+            common_cameras &= set(ep.video_files)
+        if not common_cameras:
+            return {}
+
+        from cyclo_data.converter.video_sync import (
+            _ffmpeg,
+            _ffmpeg_threads_arg,
+            _h264_encoder,
+        )
+
+        out_dir = Path(self.config.output_dir) / "_stitched_subtasks" / f"full_{full_idx:06d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stitched: Dict[str, Path] = {}
+        for camera_name in sorted(common_cameras):
+            srcs = [Path(ep.video_files[camera_name]) for ep in ordered]
+            out_path = out_dir / f"{camera_name}.mp4"
+            list_path: Optional[Path] = None
+            if out_path.exists():
+                try:
+                    out_mtime = out_path.stat().st_mtime
+                    if all(src.exists() and src.stat().st_mtime <= out_mtime for src in srcs):
+                        stitched[camera_name] = out_path
+                        continue
+                except OSError:
+                    pass
+
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", suffix=".ffconcat", delete=False
+                ) as list_file:
+                    list_path = Path(list_file.name)
+                    for src in srcs:
+                        escaped = str(src.resolve()).replace("'", "'\\''")
+                        list_file.write(f"file '{escaped}'\n")
+                ffmpeg_bin = _ffmpeg()
+                encoder, encoder_opts = _h264_encoder(ffmpeg_bin)
+                cmd = [
+                    ffmpeg_bin, "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(list_path),
+                    "-an",
+                    "-vf", f"fps={int(self.config.fps or DEFAULT_FPS)}",
+                    "-c:v", encoder,
+                    *encoder_opts,
+                    *_ffmpeg_threads_arg(),
+                    "-pix_fmt", "yuv420p",
+                    str(out_path),
+                ]
+                subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, check=True,
+                )
+                stitched[camera_name] = out_path
+            except Exception as exc:  # noqa: BLE001
+                self._log_warning(
+                    f"Failed to stitch videos for full_episode={full_idx} "
+                    f"camera={camera_name}: {exc}"
+                )
+            finally:
+                if list_path is not None:
+                    try:
+                        list_path.unlink()
+                    except Exception:
+                        pass
+        return stitched
 
     def _update_config_from_robot_config(self, robot_config: Dict):
         """Update conversion config from robot_config.yaml."""
@@ -1613,7 +2265,7 @@ class RosbagToLerobotConverterBase:
         videos = bag_path / "videos"
         if not videos.exists():
             return False
-        return any(videos.glob("*_timestamps.parquet"))
+        return any(videos.rglob("*_timestamps.parquet"))
 
     def _sync_videos_to_grid(
         self, bag_path: Path, episode: EpisodeData,
@@ -1630,7 +2282,11 @@ class RosbagToLerobotConverterBase:
         """
         if not episode.video_files or not episode.grid_log_times_sec:
             return episode
-        if not self._episode_has_sidecars(bag_path):
+        has_source_sidecars = any(
+            (Path(src_path).parent / f"{cam_name}_timestamps.parquet").exists()
+            for cam_name, src_path in episode.video_files.items()
+        )
+        if not self._episode_has_sidecars(bag_path) and not has_source_sidecars:
             return episode
         from cyclo_data.converter.video_sync import remux_selected_frames
         from cyclo_data.reader.frame_timestamps import (
@@ -1643,6 +2299,9 @@ class RosbagToLerobotConverterBase:
             dtype=np.int64,
         )
         videos_dir = bag_path / "videos"
+        if not videos_dir.exists():
+            first_video = next(iter(episode.video_files.values()), None)
+            videos_dir = Path(first_video).parent if first_video else videos_dir
         synced: Dict[str, Path] = {}
         # UI-supplied rotation is treated as an *additional* override on
         # top of whatever the recorder/transcoder already baked into the
@@ -1653,6 +2312,8 @@ class RosbagToLerobotConverterBase:
         ui_rotations = self.config.camera_rotations or {}
         for cam_name, src_path in episode.video_files.items():
             sidecar = videos_dir / f"{cam_name}_timestamps.parquet"
+            if not sidecar.exists():
+                sidecar = src_path.parent / f"{cam_name}_timestamps.parquet"
             if not sidecar.exists():
                 self._log_warning(
                     f"{cam_name}: no sidecar {sidecar.name}; leaving raw MP4"
@@ -1909,6 +2570,13 @@ class RosbagToLerobotConverterBase:
         Supports MP4 converter output (cam_*.mp4 in root dir)
         and legacy format (videos/ subdirectory).
         """
+        segment_videos = self._prepare_segment_video_files(bag_path)
+        if segment_videos:
+            self._log_info(
+                f"Prepared segment video files: {list(segment_videos.keys())}"
+            )
+            return segment_videos
+
         video_files = {}
 
         search_paths = [bag_path, bag_path / "videos"]
@@ -1932,6 +2600,152 @@ class RosbagToLerobotConverterBase:
             self._log_info(f"Found video files: {list(video_files.keys())}")
 
         return video_files
+
+    def _prepare_segment_video_files(self, bag_path: Path) -> Dict[str, Path]:
+        info = self._metadata_manager.load_episode_info(bag_path)
+        video_segments = info.get("video_segments") or []
+
+        ordered = []
+        if isinstance(video_segments, list) and video_segments:
+            for segment in video_segments:
+                if not isinstance(segment, dict):
+                    continue
+                video_dir = bag_path / str(segment.get("video_dir", ""))
+                if not video_dir.exists():
+                    continue
+                cameras = [
+                    str(cam)
+                    for cam in (segment.get("cameras") or [])
+                    if str(cam)
+                ]
+                if not cameras:
+                    cameras = [
+                        path.stem
+                        for path in sorted(video_dir.glob("*.mp4"))
+                        if not path.stem.endswith("_synced")
+                    ]
+                ordered.append((video_dir, set(cameras)))
+        else:
+            videos_root = bag_path / "videos"
+            if videos_root.exists():
+                for mcap_path in sorted(bag_path.glob("*.mcap")):
+                    video_dir = videos_root / mcap_path.stem
+                    if not video_dir.exists():
+                        continue
+                    cameras = [
+                        path.stem
+                        for path in sorted(video_dir.glob("*.mp4"))
+                        if not path.stem.endswith("_synced")
+                    ]
+                    if cameras:
+                        ordered.append((video_dir, set(cameras)))
+
+        if not ordered:
+            return {}
+        common_cameras = set.intersection(*(cameras for _, cameras in ordered))
+        if not common_cameras:
+            self._log_warning(
+                f"{bag_path.name}: no camera exists in every video segment"
+            )
+            return {}
+
+        out_root = (
+            Path(self.config.output_dir)
+            / "_subtask_video_concat"
+            / f"{bag_path.parent.name}_{bag_path.name}"
+        )
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        prepared: Dict[str, Path] = {}
+        for camera in sorted(common_cameras):
+            srcs = [video_dir / f"{camera}.mp4" for video_dir, _ in ordered]
+            if not all(src.exists() and src.stat().st_size > 0 for src in srcs):
+                continue
+
+            out_path = out_root / f"{camera}.mp4"
+            sidecar_out = out_root / f"{camera}_timestamps.parquet"
+            source_mtime = max(src.stat().st_mtime for src in srcs)
+            sidecars = [
+                video_dir / f"{camera}_timestamps.parquet"
+                for video_dir, _ in ordered
+            ]
+            sidecar_mtime = max(
+                [p.stat().st_mtime for p in sidecars if p.exists()] or [0]
+            )
+            newest_input = max(source_mtime, sidecar_mtime)
+            if (
+                out_path.exists()
+                and out_path.stat().st_size > 0
+                and out_path.stat().st_mtime >= newest_input
+                and (
+                    sidecar_out.exists()
+                    or not all(p.exists() for p in sidecars)
+                )
+            ):
+                prepared[camera] = out_path
+                continue
+
+            list_path: Optional[Path] = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", suffix=".ffconcat", delete=False
+                ) as list_file:
+                    list_path = Path(list_file.name)
+                    for src in srcs:
+                        escaped = str(src.resolve()).replace("'", "'\\''")
+                        list_file.write(f"file '{escaped}'\n")
+                cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(list_path),
+                    "-an",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    "-fps_mode", "passthrough",
+                    str(out_path),
+                ]
+                subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, check=True,
+                )
+
+                if all(path.exists() for path in sidecars):
+                    tables = self._concat_segment_sidecars(sidecars)
+                    pq.write_table(pa.concat_tables(tables), sidecar_out)
+                prepared[camera] = out_path
+            except Exception as exc:  # noqa: BLE001
+                self._log_warning(
+                    f"{bag_path.name}: failed to prepare segment video "
+                    f"{camera}: {exc!r}"
+                )
+                out_path.unlink(missing_ok=True)
+                sidecar_out.unlink(missing_ok=True)
+            finally:
+                if list_path is not None:
+                    list_path.unlink(missing_ok=True)
+
+        return prepared
+
+    def _concat_segment_sidecars(self, sidecars: List[Path]) -> List[pa.Table]:
+        """Read segment timestamp sidecars and make frame_index continuous."""
+        tables: List[pa.Table] = []
+        frame_offset = 0
+        for sidecar in sidecars:
+            table = pq.read_table(sidecar)
+            if "frame_index" in table.column_names:
+                col_idx = table.column_names.index("frame_index")
+                field = table.schema.field(col_idx)
+                frame_index = pa.array(
+                    range(frame_offset, frame_offset + table.num_rows),
+                    type=field.type,
+                )
+                table = table.set_column(col_idx, field, frame_index)
+            frame_offset += table.num_rows
+            tables.append(table)
+        return tables
 
     def _get_camera_name_for_video(self, filename: str) -> str:
         """Get camera name from video filename.
@@ -2068,6 +2882,12 @@ class RosbagToLerobotConverterBase:
             "index": {"dtype": "int64", "shape": (1,), "names": None},
             "task_index": {"dtype": "int64", "shape": (1,), "names": None},
         }
+        if any(ep.subtask_indices for ep in episodes_data):
+            self._features["subtask_index"] = {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": None,
+            }
 
         # State / action joint names. Prefer per-episode names accumulated
         # by _merge_state_messages / _merge_action_messages, then fall back

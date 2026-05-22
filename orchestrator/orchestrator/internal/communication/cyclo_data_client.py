@@ -109,6 +109,7 @@ class CycloDataClient:
         robot_type: str = '',
         topics=None,
         urdf_path: str = '',
+        segment_index: int = 0,
         timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     ) -> CallResult:
         req = RecordingCommand.Request()
@@ -118,6 +119,7 @@ class CycloDataClient:
         req.robot_type = robot_type
         req.topics = list(topics or [])
         req.urdf_path = urdf_path
+        req.segment_index = int(segment_index)
         return self._call(self._recording, req, timeout_sec, 'recording')
 
     def start_conversion(

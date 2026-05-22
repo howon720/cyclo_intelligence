@@ -137,6 +137,10 @@ class TranscodeResult:
     error: Optional[str] = None
 
 
+class _SkipCamera(Exception):
+    """Camera stream is unusable for this episode but should not fail it."""
+
+
 class TranscodeWorker:
     """Pool that turns per-camera MJPEG MP4s into H.264 in the background.
 
@@ -363,6 +367,7 @@ class TranscodeWorker:
         _patch_status(info_path, STATUS_RUNNING, encoder=encoder_name)
 
         done: list[str] = []
+        skipped: dict[str, str] = {}
         failed: dict[str, str] = {}
         for cam in cameras:
             try:
@@ -374,6 +379,11 @@ class TranscodeWorker:
                     rotation_deg=rotations.get(cam, 0),
                 )
                 done.append(cam)
+            except _SkipCamera as exc:
+                self._log_warn(
+                    f"transcode {episode_dir.name}/{cam}: skipped: {exc}"
+                )
+                skipped[cam] = str(exc)
             except Exception as exc:
                 self._log_error(
                     f"transcode {episode_dir.name}/{cam}: {exc!r}"
@@ -394,6 +404,7 @@ class TranscodeWorker:
             elapsed_sec=elapsed,
             cameras_done=done,
             cameras_failed=failed,
+            cameras_skipped=skipped,
             rotations_applied=applied,
         )
         return TranscodeResult(
@@ -456,7 +467,17 @@ class TranscodeWorker:
                 f"transcode {cam_name}: sidecar has 0 rows; deleting raw"
             )
             raw_mp4.unlink(missing_ok=True)
-            return
+            sidecar.unlink(missing_ok=True)
+            raise _SkipCamera("sidecar has 0 rows; removed camera files")
+
+        width, height = _mp4_dimensions(raw_mp4)
+        if width < 2 or height < 2:
+            raw_mp4.unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
+            raise _SkipCamera(
+                f"degenerate video dimensions {width}x{height}; "
+                "removed camera files for this episode"
+            )
 
         cmd = [
             _FFMPEG, "-hide_banner", "-loglevel", "warning", "-y",
@@ -481,14 +502,19 @@ class TranscodeWorker:
             "-f", "mp4",
             str(tmp_mp4),
         ]
+        filters = []
         rot_filter = self._transpose_filter(rotation_deg)
         if rot_filter is not None:
+            filters.append(rot_filter)
+        if width % 2 or height % 2:
+            filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+        if filters:
             # Insert the -vf right before the output path so it applies
             # to the encoded stream.
-            cmd = cmd[:-1] + ["-vf", rot_filter, cmd[-1]]
+            cmd = cmd[:-1] + ["-vf", ",".join(filters), cmd[-1]]
             self._log_info(
                 f"transcode {cam_name}: applying rotation_deg={rotation_deg} "
-                f"({rot_filter})"
+                f"({','.join(filters)})"
             )
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
@@ -525,6 +551,33 @@ def _sidecar_row_count(sidecar: Path) -> int:
 
 
 _FFPROBE_FRAME_COUNT_TIMEOUT = 30  # seconds
+
+
+def _mp4_dimensions(mp4: Path) -> tuple[int, int]:
+    try:
+        out = subprocess.run(
+            [
+                _FFPROBE, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x", str(mp4),
+            ],
+            capture_output=True, text=True,
+            timeout=_FFPROBE_FRAME_COUNT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"ffprobe dimensions timed out after {_FFPROBE_FRAME_COUNT_TIMEOUT}s "
+            f"for {mp4.name}"
+        ) from exc
+    text = (out.stdout or "").strip().splitlines()[0] if out.stdout else ""
+    try:
+        width, height = text.split("x", 1)
+        return int(width), int(height)
+    except Exception as exc:
+        raise RuntimeError(
+            f"ffprobe could not determine dimensions for {mp4.name}: "
+            f"stdout={out.stdout!r} stderr={out.stderr!r}"
+        ) from exc
 
 
 def _mp4_frame_count(mp4: Path) -> int:
@@ -568,6 +621,7 @@ def _patch_status(
     elapsed_sec: Optional[float] = None,
     cameras_done: Optional[list[str]] = None,
     cameras_failed: Optional[dict[str, str]] = None,
+    cameras_skipped: Optional[dict[str, str]] = None,
     rotations_applied: Optional[dict[str, int]] = None,
 ) -> None:
     """Read-modify-write episode_info.json atomically.
@@ -592,6 +646,8 @@ def _patch_status(
         info["transcoding_cameras_done"] = list(cameras_done)
     if cameras_failed is not None:
         info["transcoding_cameras_failed"] = dict(cameras_failed)
+    if cameras_skipped is not None:
+        info["transcoding_cameras_skipped"] = dict(cameras_skipped)
     if rotations_applied is not None:
         # Merge with any existing applied rotations so a partial re-run
         # doesn't lose history for cameras that already finished.

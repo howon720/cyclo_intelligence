@@ -118,7 +118,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "S6_SVSTAT=$$(ls /package/admin/s6-*/command/s6-svstat 2>/dev/null | head -1); [ -n \"$$S6_SVSTAT\" ] && \"$$S6_SVSTAT\" /run/service/main-runtime | grep -q up && \"$$S6_SVSTAT\" /run/service/engine-process | grep -q up",
+          "S6_SVSTAT=$$(ls /package/admin/s6-*/command/s6-svstat 2>/dev/null | head -1); [ -n \"$$S6_SVSTAT\" ] && \"$$S6_SVSTAT\" /run/service/nginx | grep -q up && \"$$S6_SVSTAT\" /run/service/supervisor_api | grep -q up && \"$$S6_SVSTAT\" /run/service/s6-agent | grep -q up",
         ]
       interval: 30s
       timeout: 10s

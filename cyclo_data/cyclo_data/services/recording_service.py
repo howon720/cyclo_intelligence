@@ -60,6 +60,13 @@ _COMMAND_NAMES = {
     RecordingCommand.Request.SKIP_TASK: 'SKIP_TASK',
     RecordingCommand.Request.CANCEL: 'CANCEL',
     RecordingCommand.Request.REFRESH_TOPICS: 'REFRESH_TOPICS',
+    RecordingCommand.Request.START_SEGMENT: 'START_SEGMENT',
+    RecordingCommand.Request.STOP_SEGMENT: 'STOP_SEGMENT',
+    RecordingCommand.Request.DISCARD_SEGMENT: 'DISCARD_SEGMENT',
+    RecordingCommand.Request.FINISH_EPISODE: 'FINISH_EPISODE',
+    RecordingCommand.Request.DISCARD_EPISODE: 'DISCARD_EPISODE',
+    RecordingCommand.Request.SET_TASK_INFO: 'SET_TASK_INFO',
+    RecordingCommand.Request.CANCEL_SEGMENT: 'CANCEL_SEGMENT',
 }
 
 
@@ -294,11 +301,21 @@ class RecordingService:
         try:
             if cmd == Req.REFRESH_TOPICS:
                 return self._do_refresh_topics(request, response)
-            if cmd == Req.START:
+            if cmd == Req.SET_TASK_INFO:
+                return self._do_set_task_info(request, response)
+            if cmd in (Req.START, Req.START_SEGMENT):
                 return self._do_start(request, response)
-            if cmd in (Req.STOP, Req.FINISH, Req.MOVE_TO_NEXT):
+            if cmd in (Req.STOP, Req.FINISH, Req.MOVE_TO_NEXT, Req.STOP_SEGMENT):
                 return self._do_stop_and_save(
                     request, response, command_name, event='finish')
+            if cmd == Req.CANCEL_SEGMENT:
+                return self._do_cancel(request, response)
+            if cmd == Req.DISCARD_SEGMENT:
+                return self._do_discard_saved_segment(request, response)
+            if cmd == Req.FINISH_EPISODE:
+                return self._do_finish_episode(request, response)
+            if cmd == Req.DISCARD_EPISODE:
+                return self._do_discard_episode(request, response)
             if cmd == Req.RERECORD:
                 return self._do_cancel_with_review(
                     request, response, event='cancel')
@@ -466,8 +483,17 @@ class RecordingService:
             response.success = False
             response.message = 'rosbag_recorder service unavailable'
             return response
+        if (
+            request.command == RecordingCommand.Request.START_SEGMENT
+            and not list(request.task_info.subtask_instruction or [])
+        ):
+            response.success = False
+            response.message = 'START_SEGMENT requires subtask_instruction[]'
+            return response
 
         dm = self._ensure_data_manager(request.task_info, request.robot_type)
+        if request.command == RecordingCommand.Request.START_SEGMENT:
+            dm.set_current_subtask_index(int(request.segment_index))
 
         # rosbag_recorder is normally prepared at REFRESH_TOPICS time
         # (= robot_type selection) — _prepare_rosbag_topics short-circuits
@@ -521,6 +547,16 @@ class RecordingService:
 
         response.success = True
         response.message = 'Recording started'
+        return response
+
+    def _do_set_task_info(self, request, response):
+        if not request.robot_type:
+            response.success = True
+            response.message = 'task_info cached upstream; robot_type not set yet'
+            return response
+        self._ensure_data_manager(request.task_info, request.robot_type)
+        response.success = True
+        response.message = 'task_info cached'
         return response
 
     def _ensure_transcoder(self) -> TranscodeWorker:
@@ -646,13 +682,29 @@ class RecordingService:
                 camera_rotations=self._last_camera_rotations,
             )
 
-        # Fire the H.264 transcode in the background. The episode dir is
-        # captured before stop_recording() bumps the episode counter so
-        # we hand off the right path.
-        if episode_dir.exists() and (episode_dir / 'videos').exists():
+        is_subtask_mode = bool(
+            getattr(self._data_manager, '_subtask_mode', False)
+        )
+        finishes_full_episode = command_name not in (
+            'MOVE_TO_NEXT', 'STOP_SEGMENT',
+        )
+
+        # Fire the H.264 transcode in the background for normal episodes.
+        # Subtask recordings are archived into their full-episode folder
+        # on FINISH, so per-segment video transcodes would race with that
+        # archival cleanup.
+        if (not is_subtask_mode
+                and episode_dir.exists()
+                and (episode_dir / 'videos').exists()):
             self._submit_transcode(episode_dir)
 
-        self._data_manager.stop_recording()
+        self._data_manager.stop_recording(
+            finish_full_episode=(
+                finishes_full_episode and not is_subtask_mode
+            )
+        )
+        if is_subtask_mode and finishes_full_episode:
+            self._data_manager.finish_full_episode()
         self._rosbag.publish_action_event(event)
 
         self._publish_umbrella_status(
@@ -665,7 +717,64 @@ class RecordingService:
             'STOP': 'Recording stopped and saved',
             'FINISH': 'Recording finished and saved',
             'MOVE_TO_NEXT': 'Episode saved',
+            'STOP_SEGMENT': 'Subtask saved',
         }.get(command_name, f'{command_name} completed')
+        return response
+
+    def _do_discard_saved_segment(self, request, response):
+        if self._data_manager is None:
+            response.success = False
+            response.message = 'DISCARD_SEGMENT: no DataManager yet'
+            return response
+        if self._data_manager.is_recording():
+            response.success = False
+            response.message = 'DISCARD_SEGMENT: stop/cancel active recording first'
+            return response
+        segment_index = int(request.segment_index)
+        deleted = self._data_manager.discard_saved_subtask(segment_index)
+        response.success = True
+        response.message = (
+            f'Subtask {segment_index + 1} discarded'
+            if deleted else 'No saved subtask found to discard'
+        )
+        self._publish_umbrella_status(
+            DataOperationStatus.CANCELLED, 'DISCARD_SEGMENT',
+            response.message)
+        return response
+
+    def _do_finish_episode(self, request, response):
+        if self._data_manager is None:
+            response.success = False
+            response.message = 'FINISH_EPISODE: no DataManager yet'
+            return response
+        if self._data_manager.is_recording():
+            response.success = False
+            response.message = 'FINISH_EPISODE: save active subtask first'
+            return response
+        self._data_manager.finish_full_episode()
+        response.success = True
+        response.message = 'Episode finished'
+        self._publish_umbrella_status(
+            DataOperationStatus.COMPLETED, 'FINISH_EPISODE',
+            response.message)
+        return response
+
+    def _do_discard_episode(self, request, response):
+        if self._data_manager is None:
+            response.success = False
+            response.message = 'DISCARD_EPISODE: no DataManager yet'
+            return response
+        if self._data_manager.is_recording():
+            return self._do_discard(request, response, event='cancel')
+        deleted = self._data_manager.discard_current_full_episode()
+        response.success = True
+        response.message = (
+            f'Episode discarded ({deleted} saved subtask(s) removed)'
+            if deleted else 'No saved subtasks found to discard'
+        )
+        self._publish_umbrella_status(
+            DataOperationStatus.CANCELLED, 'DISCARD_EPISODE',
+            response.message)
         return response
 
     def _do_cancel_with_review(self, request, response, event: str):

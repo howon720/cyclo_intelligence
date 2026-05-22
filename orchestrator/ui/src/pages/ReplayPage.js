@@ -506,8 +506,6 @@ function ReplayPage({ isActive }) {
         const next = anchors[index + 1];
         const end = next ? next.time : finalEnd;
         return {
-          sub_task_index: index,
-          sub_task_description: '',
           sub_task_instruction: anchor.instruction,
           frame_duration: [anchor.time, end],
         };

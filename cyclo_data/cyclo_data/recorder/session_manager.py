@@ -22,11 +22,14 @@ from pathlib import Path
 import queue
 import shutil
 import socket
+import subprocess
+import tempfile
 import threading
 import time
 from typing import Optional
 
 from huggingface_hub import HfApi
+import yaml
 from interfaces.msg import RecordingStatus
 from cyclo_data.converter.orchestrator import DataConverter
 from cyclo_data.hub.progress_tracker import (
@@ -181,24 +184,34 @@ class DataManager:
         self._save_repo_name = f'Task_{task_num}_{task_info.task_name}{suffix}'
         self._save_path = save_root_path / self._save_repo_name
         self._save_rosbag_path = '/workspace/rosbag2/' + self._save_repo_name
-        self._single_task = len(task_info.task_instruction) == 1
         self._task_info = task_info
+        self._main_task_instruction = self._get_main_task_instruction(task_info)
+        self._subtask_instructions = self._get_subtask_instructions(task_info)
+        self._subtask_mode = bool(self._subtask_instructions)
+        self._subtask_total = len(self._subtask_instructions)
+        self._single_task = not self._subtask_mode
         # Per-recording opt-in flag from the UI checkbox; getattr guards
         # against TaskInfo messages built before the field was added.
         self._include_robotis_license = bool(
             getattr(task_info, 'include_robotis_license', False)
         )
 
-        # Find next available episode number from existing folders
+        # Find next available raw recording number from existing folders.
+        # In subtask mode this is a raw subtask counter used only for
+        # metadata continuity; the on-disk path is full_episode/subtasks/N.
         self._record_episode_count = self._find_next_episode_number()
+        (
+            self._current_full_episode_index,
+            self._current_subtask_index,
+        ) = self._find_next_subtask_position()
         self._start_time_s = 0
         self._proceed_time = 0
         self._status = 'idle'  # Start in idle state (simplified mode)
         self._cpu_checker = CPUChecker()
         self.data_converter = DataConverter()
-        self.current_instruction = ''
+        self.current_instruction = self._main_task_instruction
         self._init_task_limits()
-        self._current_scenario_number = 0
+        self._current_scenario_number = self._current_subtask_index
         # Last README content written for this task. Cached so the
         # per-episode save path doesn't re-read README.md from disk
         # on every save_robotis_metadata() call.
@@ -211,6 +224,70 @@ class DataManager:
         # can fire concurrently; the lock guarantees the snapshot read
         # in ``get_current_record_status`` is consistent.
         self._state_lock = threading.Lock()
+
+    @staticmethod
+    def _read_episode_info(episode_dir: Path) -> dict:
+        info_path = Path(episode_dir) / 'episode_info.json'
+        if not info_path.exists():
+            return {}
+        try:
+            return json.loads(info_path.read_text(encoding='utf-8'))
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _is_rosbag_leaf(path: Path) -> bool:
+        path = Path(path)
+        return (
+            path.is_dir()
+            and (path / 'metadata.yaml').exists()
+            and any(path.glob('*.mcap'))
+        )
+
+    @staticmethod
+    def _skip_scan_path(path: Path) -> bool:
+        return any(
+            part.endswith('_converted') or part in {
+                '_stitched_subtasks',
+                '.legacy_subtask_migration_tmp',
+                '.subtasks_archive',
+            }
+            for part in path.parts
+        )
+
+    def _iter_subtask_episode_dirs(self) -> list[Path]:
+        """Return all saved subtask rosbag dirs, old flat + new nested."""
+        root = Path(self._save_rosbag_path)
+        if not root.exists():
+            return []
+
+        matches: list[Path] = []
+        for info_path in root.rglob('episode_info.json'):
+            rel_parent = info_path.parent.relative_to(root)
+            if self._skip_scan_path(rel_parent):
+                continue
+            info = self._read_episode_info(info_path.parent)
+            if info.get('recording_mode') != 'subtask':
+                continue
+            matches.append(info_path.parent)
+
+        def sort_key(path: Path):
+            info = self._read_episode_info(path)
+            try:
+                full_idx = int(info.get('full_episode_index', 0))
+            except (TypeError, ValueError):
+                full_idx = 0
+            try:
+                subtask_idx = int(info.get('subtask_index', 0))
+            except (TypeError, ValueError):
+                subtask_idx = 0
+            try:
+                raw_idx = int(info.get('episode_index', 0))
+            except (TypeError, ValueError):
+                raw_idx = 0
+            return (full_idx, subtask_idx, raw_idx, str(path))
+
+        return sorted(matches, key=sort_key)
 
     def _find_next_episode_number(self) -> int:
         """
@@ -228,13 +305,23 @@ class DataManager:
             print(f'[DataManager] No existing folder at {rosbag_dir}, starting from episode 0')
             return 0
 
-        # Find all numeric folder names
+        # Find all numeric folder names and any recursively stored raw
+        # subtask metadata. This preserves legacy flat recordings and the
+        # nested full_episode/subtasks layout used for new subtask data.
         existing_episodes = []
         try:
             for item in os.listdir(rosbag_dir):
                 item_path = os.path.join(rosbag_dir, item)
                 if os.path.isdir(item_path) and item.isdigit():
                     existing_episodes.append(int(item))
+            for info_path in Path(rosbag_dir).rglob('episode_info.json'):
+                if self._skip_scan_path(info_path.parent.relative_to(rosbag_dir)):
+                    continue
+                info = self._read_episode_info(info_path.parent)
+                try:
+                    existing_episodes.append(int(info.get('episode_index')))
+                except (TypeError, ValueError):
+                    pass
         except OSError as e:
             print(f'[DataManager] Error scanning directory: {e}, starting from episode 0')
             return 0
@@ -247,6 +334,91 @@ class DataManager:
         print(f'[DataManager] Found existing episodes {sorted(existing_episodes)}, '
               f'starting from episode {next_episode}')
         return next_episode
+
+    @staticmethod
+    def _get_main_task_instruction(task_info) -> str:
+        instructions = getattr(task_info, 'task_instruction', []) or []
+        for instruction in instructions:
+            text = str(instruction or '').strip()
+            if text:
+                return text
+        return ''
+
+    @staticmethod
+    def _get_subtask_instructions(task_info) -> list:
+        raw = getattr(task_info, 'subtask_instruction', []) or []
+        return [str(item or '').strip() for item in raw if str(item or '').strip()]
+
+    def _find_next_subtask_position(self) -> tuple[int, int]:
+        """Find the next full-episode/subtask cursor from saved metadata."""
+        if not self._subtask_mode:
+            return self._record_episode_count, 0
+
+        groups: dict[int, set[int]] = {}
+        totals: dict[int, int] = {}
+        for episode_dir in self._iter_subtask_episode_dirs():
+            info = self._read_episode_info(episode_dir)
+            try:
+                full_idx = int(info.get('full_episode_index', 0))
+                subtask_idx = int(info.get('subtask_index', 0))
+                total = int(info.get('subtask_total', self._subtask_total))
+            except (TypeError, ValueError):
+                continue
+            groups.setdefault(full_idx, set()).add(subtask_idx)
+            totals[full_idx] = max(1, total)
+
+        root = Path(self._save_rosbag_path)
+        if root.exists():
+            for info_path in root.rglob('episode_info.json'):
+                rel_parent = info_path.parent.relative_to(root)
+                if self._skip_scan_path(rel_parent):
+                    continue
+                info = self._read_episode_info(info_path.parent)
+
+                # New archived full-episode summaries intentionally keep
+                # episode_info.json minimal: episode_index + segments, no
+                # recording_mode/full_episode_index/subtask_total. Treat
+                # that shape as a complete full episode so a recreated
+                # DataManager continues at the next numeric episode folder.
+                segments = info.get('segments')
+                if isinstance(segments, list) and segments:
+                    try:
+                        full_idx = int(info.get('episode_index'))
+                    except (TypeError, ValueError):
+                        continue
+                    total = max(1, len(segments))
+                    groups.setdefault(full_idx, set()).update(range(total))
+                    totals[full_idx] = total
+                    continue
+
+                if info.get('recording_mode') != 'subtask_episode':
+                    continue
+                try:
+                    full_idx = int(info.get('full_episode_index', 0))
+                    total = int(info.get('subtask_total', self._subtask_total))
+                except (TypeError, ValueError):
+                    continue
+                total = max(1, total)
+                groups.setdefault(full_idx, set()).update(range(total))
+                totals[full_idx] = total
+
+        if not groups:
+            return self._record_episode_count, 0
+
+        for full_idx in sorted(groups):
+            total = totals.get(full_idx, self._subtask_total)
+            missing = [idx for idx in range(total) if idx not in groups[full_idx]]
+            if missing:
+                return full_idx, missing[0]
+
+        return max(groups) + 1, 0
+
+    def _current_subtask_instruction(self) -> str:
+        if not self._subtask_mode:
+            return ''
+        if 0 <= self._current_subtask_index < len(self._subtask_instructions):
+            return self._subtask_instructions[self._current_subtask_index]
+        return ''
 
     def get_status(self):
         with self._state_lock:
@@ -264,11 +436,16 @@ class DataManager:
             self._status = 'recording'
             self._start_time_s = time.perf_counter()
             episode = self._record_episode_count
-        self.current_instruction = self._task_info.task_instruction[0] \
-            if self._task_info.task_instruction else ''
-        print(f'[DataManager] Recording started - Episode {episode}')
+            full_episode = self._current_full_episode_index
+            subtask = self._current_subtask_index
+        self.current_instruction = self._main_task_instruction
+        subtask_label = (
+            f' full_episode={full_episode} subtask={subtask}/{self._subtask_total}'
+            if self._subtask_mode else ''
+        )
+        print(f'[DataManager] Recording started - Episode {episode}{subtask_label}')
 
-    def stop_recording(self):
+    def stop_recording(self, finish_full_episode: bool = True):
         """
         Stop recording and save (simplified mode).
 
@@ -277,10 +454,92 @@ class DataManager:
         with self._state_lock:
             self._status = 'idle'
             self._record_episode_count += 1
+            if self._subtask_mode:
+                is_last_subtask = self._current_subtask_index >= self._subtask_total - 1
+                if finish_full_episode:
+                    self._current_full_episode_index += 1
+                    self._current_subtask_index = 0
+                else:
+                    self._current_subtask_index = min(
+                        self._current_subtask_index + 1,
+                        self._subtask_total - 1 if is_last_subtask else self._subtask_total,
+                    )
+                self._current_scenario_number = self._current_subtask_index
             self._start_time_s = 0
             total = self._record_episode_count
         print(f'[DataManager] Recording stopped - Episode saved. '
               f'Total episodes: {total}')
+
+    def set_current_subtask_index(self, index: int):
+        """Select the subtask slot that the next START should record."""
+        if not self._subtask_mode:
+            return
+        with self._state_lock:
+            bounded = max(0, min(int(index), max(0, self._subtask_total - 1)))
+            self._current_subtask_index = bounded
+            self._current_scenario_number = bounded
+
+    def finish_full_episode(self):
+        """Advance the full-episode cursor after all planned subtasks saved."""
+        if not self._subtask_mode:
+            return
+        with self._state_lock:
+            current_full = self._current_full_episode_index
+        self._archive_full_episode(current_full)
+        with self._state_lock:
+            if self._current_full_episode_index != current_full:
+                return
+            self._current_full_episode_index += 1
+            self._current_subtask_index = 0
+            self._current_scenario_number = 0
+
+    def _episode_dirs_for_full_subtask(self, full_idx: int, subtask_idx: int | None = None):
+        matches = []
+        for episode_dir in self._iter_subtask_episode_dirs():
+            info = self._read_episode_info(episode_dir)
+            try:
+                candidate_full = int(info.get('full_episode_index', -1))
+                candidate_subtask = int(info.get('subtask_index', -1))
+            except (TypeError, ValueError):
+                continue
+            if candidate_full != full_idx:
+                continue
+            if subtask_idx is not None and candidate_subtask != subtask_idx:
+                continue
+            matches.append(episode_dir)
+        return matches
+
+    def discard_saved_subtask(self, subtask_idx: int) -> int:
+        """Delete saved raw episode dirs for one subtask in the active full episode."""
+        if not self._subtask_mode:
+            return 0
+        with self._state_lock:
+            full_idx = self._current_full_episode_index
+        deleted = 0
+        for episode_dir in self._episode_dirs_for_full_subtask(full_idx, int(subtask_idx)):
+            shutil.rmtree(episode_dir, ignore_errors=True)
+            deleted += 1
+        with self._state_lock:
+            self._record_episode_count = self._find_next_episode_number()
+            self._current_subtask_index = int(subtask_idx)
+            self._current_scenario_number = self._current_subtask_index
+        return deleted
+
+    def discard_current_full_episode(self) -> int:
+        """Delete all saved raw subtask dirs for the active full episode."""
+        if not self._subtask_mode:
+            return 0
+        with self._state_lock:
+            full_idx = self._current_full_episode_index
+        deleted = 0
+        for episode_dir in self._episode_dirs_for_full_subtask(full_idx):
+            shutil.rmtree(episode_dir, ignore_errors=True)
+            deleted += 1
+        with self._state_lock:
+            self._record_episode_count = self._find_next_episode_number()
+            self._current_subtask_index = 0
+            self._current_scenario_number = 0
+        return deleted
 
     def discard_recording(self):
         """
@@ -312,11 +571,454 @@ class DataManager:
         with self._state_lock:
             status = self._status
             episode = self._record_episode_count
+            full_episode = self._current_full_episode_index
+            subtask = self._current_subtask_index
         if status == 'idle' and not allow_idle:
             return None  # Not recording
         if status == 'warmup':
             return None  # Legacy: Not ready yet
+        if self._subtask_mode:
+            return str(self._subtask_rosbag_dir(full_episode, subtask))
         return self._save_rosbag_path + f'/{episode}'
+
+    def _full_episode_dir(self, full_idx: int) -> Path:
+        """Path for one full episode in subtask mode."""
+        return Path(self._save_rosbag_path) / str(full_idx)
+
+    def _subtask_rosbag_dir(self, full_idx: int, subtask_idx: int) -> Path:
+        full_dir = self._full_episode_dir(full_idx)
+        full_dir.mkdir(parents=True, exist_ok=True)
+        return full_dir / 'segments' / str(subtask_idx)
+
+    def _archive_full_episode(self, full_idx: int) -> None:
+        if not self._subtask_mode:
+            return
+
+        subtask_dirs = self._episode_dirs_for_full_subtask(full_idx)
+        if not subtask_dirs:
+            return
+        subtask_dirs = sorted(
+            subtask_dirs,
+            key=lambda path: int(
+                self._read_episode_info(path).get('subtask_index', 0) or 0
+            ),
+        )
+        by_subtask = {
+            int(self._read_episode_info(path).get('subtask_index', 0) or 0): path
+            for path in subtask_dirs
+        }
+        missing = [
+            idx for idx in range(self._subtask_total)
+            if idx not in by_subtask
+        ]
+        if missing:
+            raise RuntimeError(
+                f'Cannot finish episode {full_idx}: missing subtask(s) {missing}'
+            )
+
+        out_dir = self._full_episode_dir(full_idx)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ordered = [by_subtask[idx] for idx in range(self._subtask_total)]
+
+        for old_mcap in out_dir.glob('*.mcap'):
+            old_mcap.unlink(missing_ok=True)
+        for stale in ('metadata.yaml', 'episode_info.json'):
+            (out_dir / stale).unlink(missing_ok=True)
+
+        output_files = []
+        file_entries = []
+        all_topic_counts = {}
+        global_start = None
+        global_end = None
+        total_messages = 0
+        ros_distro = 'jazzy'
+        segments_meta = []
+        segment_start_s = 0.0
+
+        for subtask_idx, seg_dir in enumerate(ordered):
+            seg_info = self._read_episode_info(seg_dir)
+            mcaps = sorted(seg_dir.glob('*.mcap'))
+            if not mcaps:
+                raise FileNotFoundError(f'No .mcap file in {seg_dir}')
+            meta_path = seg_dir / 'metadata.yaml'
+            if not meta_path.exists():
+                raise FileNotFoundError(f'No metadata.yaml in {seg_dir}')
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                metadata = yaml.safe_load(f) or {}
+            bag_info = metadata.get('rosbag2_bagfile_information', {}) or {}
+            files_info = bag_info.get('files') or []
+            segment_duration_ns = 0
+
+            for split_idx, src_mcap in enumerate(mcaps):
+                dst_name = f'{full_idx}_{subtask_idx}'
+                if len(mcaps) > 1:
+                    dst_name += f'_{split_idx}'
+                dst_name += src_mcap.suffix
+                dst_path = out_dir / dst_name
+                shutil.copy2(src_mcap, dst_path)
+                output_files.append(dst_path)
+
+                file_info = files_info[split_idx] if split_idx < len(files_info) else {}
+                start_ns = int(
+                    (file_info.get('starting_time') or {}).get(
+                        'nanoseconds_since_epoch',
+                        (bag_info.get('starting_time') or {}).get(
+                            'nanoseconds_since_epoch', 0),
+                    ) or 0
+                )
+                dur_ns = int(
+                    (file_info.get('duration') or {}).get(
+                        'nanoseconds',
+                        (bag_info.get('duration') or {}).get('nanoseconds', 0),
+                    ) or 0
+                )
+                msg_count = int(
+                    file_info.get('message_count', bag_info.get('message_count', 0))
+                    or 0
+                )
+                file_entries.append({
+                    'path': dst_name,
+                    'starting_time': {
+                        'nanoseconds_since_epoch': start_ns,
+                    },
+                    'duration': {
+                        'nanoseconds': dur_ns,
+                    },
+                    'message_count': msg_count,
+                })
+                end_ns = start_ns + dur_ns
+                if global_start is None or start_ns < global_start:
+                    global_start = start_ns
+                if global_end is None or end_ns > global_end:
+                    global_end = end_ns
+                total_messages += msg_count
+                segment_duration_ns += dur_ns
+
+            ros_distro = bag_info.get('ros_distro', ros_distro)
+            for entry in bag_info.get('topics_with_message_count', []):
+                tm = entry.get('topic_metadata', {})
+                name = tm.get('name', '')
+                count = int(entry.get('message_count', 0) or 0)
+                if name in all_topic_counts:
+                    all_topic_counts[name]['count'] += count
+                else:
+                    all_topic_counts[name] = {
+                        'meta': tm,
+                        'count': count,
+                    }
+            segment_end_s = segment_start_s + (segment_duration_ns / 1_000_000_000.0)
+            subtask_instruction = seg_info.get('subtask_instruction', '')
+            segments_meta.append({
+                'sub_task_instruction': subtask_instruction,
+                'frame_duration': [segment_start_s, segment_end_s],
+            })
+            segment_start_s = segment_end_s
+
+        topics_with_count = []
+        for name in sorted(all_topic_counts):
+            entry = all_topic_counts[name]
+            topics_with_count.append({
+                'topic_metadata': entry['meta'],
+                'message_count': entry['count'],
+            })
+
+        unified = {
+            'rosbag2_bagfile_information': {
+                'version': 9,
+                'storage_identifier': 'mcap',
+                'duration': {
+                    'nanoseconds': (
+                        global_end - global_start
+                        if global_start is not None and global_end is not None
+                        else 0
+                    ),
+                },
+                'starting_time': {
+                    'nanoseconds_since_epoch': global_start or 0,
+                },
+                'message_count': total_messages,
+                'topics_with_message_count': topics_with_count,
+                'compression_format': '',
+                'compression_mode': '',
+                'relative_file_paths': [entry['path'] for entry in file_entries],
+                'files': file_entries,
+                'custom_data': None,
+                'ros_distro': ros_distro,
+            }
+        }
+        with open(out_dir / 'metadata.yaml', 'w', encoding='utf-8') as f:
+            yaml.safe_dump(unified, f, default_flow_style=False, sort_keys=False)
+
+        self._copy_episode_sidecars(ordered, out_dir)
+        _, video_warnings = self._archive_episode_videos(
+            ordered, out_dir, full_idx,
+        )
+
+        summary = {
+            'task_instruction': self._main_task_instruction,
+            'task_num': getattr(self._task_info, 'task_num', '') or '',
+            'task_name': getattr(self._task_info, 'task_name', '') or '',
+            'robot_type': self._robot_type,
+            'device_serial': socket.gethostname(),
+            'episode_index': full_idx,
+            'segments': segments_meta,
+            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'format_version': 'robotis_v2',
+        }
+        if video_warnings:
+            summary['video_warnings'] = video_warnings
+        try:
+            _atomic_write_json(out_dir / 'episode_info.json', summary)
+        except Exception as e:
+            print(f'[ROBOTIS] Failed to save full episode summary: {e}')
+
+        segments_root = out_dir / 'segments'
+        if segments_root.exists():
+            if video_warnings:
+                archive_root = (
+                    Path(self._save_rosbag_path)
+                    / '.subtasks_archive'
+                    / f'full_{full_idx:06d}'
+                )
+                if archive_root.exists():
+                    shutil.rmtree(archive_root, ignore_errors=True)
+                archive_root.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(segments_root), str(archive_root))
+                print(
+                    f'[ROBOTIS] Preserved raw subtask segments for '
+                    f'full_episode={full_idx} at {archive_root} '
+                    'because video archive had warnings'
+                )
+            else:
+                shutil.rmtree(segments_root, ignore_errors=True)
+        print(
+            f'[ROBOTIS] Archived full episode {full_idx}: '
+            f'{len(ordered)} subtask(s), {len(output_files)} mcap file(s)'
+        )
+
+    @staticmethod
+    def _copy_episode_sidecars(subtask_dirs: list[Path], out_dir: Path) -> None:
+        for name in ('robot.urdf',):
+            for seg_dir in subtask_dirs:
+                src = seg_dir / name
+                if src.exists():
+                    shutil.copy2(src, out_dir / name)
+                    break
+        for seg_dir in subtask_dirs:
+            src_camera_info = seg_dir / 'camera_info'
+            if src_camera_info.exists():
+                dst = out_dir / 'camera_info'
+                if dst.exists():
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(src_camera_info, dst)
+                break
+
+    @staticmethod
+    def _probe_mp4_dimensions(path: Path) -> tuple[int, int]:
+        try:
+            result = subprocess.run(
+                [
+                    'ffprobe', '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'stream=width,height',
+                    '-of', 'json',
+                    str(path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            streams = json.loads(result.stdout or '{}').get('streams') or []
+            if not streams:
+                return 0, 0
+            return (
+                int(streams[0].get('width') or 0),
+                int(streams[0].get('height') or 0),
+            )
+        except Exception:
+            return 0, 0
+
+    @staticmethod
+    def _rotation_filter(rotation_deg: int) -> str | None:
+        deg = int(rotation_deg or 0) % 360
+        if deg == 90:
+            return 'transpose=1'
+        if deg == 180:
+            return 'transpose=2,transpose=2'
+        if deg == 270:
+            return 'transpose=2'
+        return None
+
+    @staticmethod
+    def _transcode_episode_video(
+        src: Path,
+        dst: Path,
+        *,
+        rotation_deg: int = 0,
+        needs_pad: bool = False,
+    ) -> None:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(dst.suffix + '.tmp')
+        filters = []
+        rot_filter = DataManager._rotation_filter(rotation_deg)
+        if rot_filter:
+            filters.append(rot_filter)
+        if needs_pad:
+            filters.append('pad=ceil(iw/2)*2:ceil(ih/2)*2')
+        cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'warning', '-y',
+            '-i', str(src),
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            '-an',
+            '-fps_mode', 'passthrough',
+            '-f', 'mp4',
+            str(tmp),
+        ]
+        if filters:
+            cmd[cmd.index('-c:v'):cmd.index('-c:v')] = ['-vf', ','.join(filters)]
+        try:
+            subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=True,
+            )
+            tmp.replace(dst)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _archive_episode_videos(
+        subtask_dirs: list[Path],
+        out_dir: Path,
+        full_idx: int,
+    ) -> tuple[list[dict], dict[str, dict[str, str]]]:
+        dst_videos = out_dir / 'videos'
+        if dst_videos.exists():
+            shutil.rmtree(dst_videos, ignore_errors=True)
+        dst_videos.mkdir(parents=True, exist_ok=True)
+
+        video_segments = []
+        warnings: dict[str, dict[str, str]] = {}
+        for subtask_idx, seg_dir in enumerate(subtask_dirs):
+            prefix = f'{full_idx}_{subtask_idx}'
+            seg_info = DataManager._read_episode_info(seg_dir)
+            seg_videos = seg_dir / 'videos'
+            expected_cameras = set()
+            if seg_videos.exists():
+                expected_cameras.update(
+                    path.stem for path in seg_videos.glob('*.mp4')
+                    if not path.stem.endswith('_synced')
+                )
+            video_stats = seg_info.get('video_stats') or {}
+            if isinstance(video_stats, dict):
+                expected_cameras.update(str(name) for name in video_stats)
+
+            dst_segment_dir = dst_videos / prefix
+            segment_cameras = []
+            segment_warnings = {}
+            for camera in sorted(expected_cameras):
+                src = seg_videos / f'{camera}.mp4'
+                if not src.exists() or src.stat().st_size <= 0:
+                    segment_warnings[camera] = 'missing video file'
+                    continue
+                width, height = DataManager._probe_mp4_dimensions(src)
+                if width < 2 or height < 2:
+                    segment_warnings[camera] = f'invalid dimensions {width}x{height}'
+                    continue
+                dst = dst_segment_dir / f'{camera}.mp4'
+                try:
+                    DataManager._transcode_episode_video(
+                        src,
+                        dst,
+                        rotation_deg=int(
+                            (seg_info.get('camera_rotations') or {}).get(camera, 0)
+                            or 0
+                        ),
+                        needs_pad=bool(width % 2 or height % 2),
+                    )
+                    sidecar = seg_videos / f'{camera}_timestamps.parquet'
+                    if sidecar.exists():
+                        shutil.copy2(
+                            sidecar,
+                            dst_segment_dir / f'{camera}_timestamps.parquet',
+                        )
+                    segment_cameras.append(camera)
+                except Exception as exc:
+                    segment_warnings[camera] = repr(exc)
+            video_segments.append({
+                'mcap': f'{prefix}.mcap',
+                'video_dir': f'videos/{prefix}',
+                'cameras': segment_cameras,
+            })
+            if segment_warnings:
+                warnings[prefix] = segment_warnings
+
+        return video_segments, warnings
+
+    @staticmethod
+    def _stitch_episode_videos(
+        subtask_dirs: list[Path],
+        out_dir: Path,
+    ) -> tuple[list[str], dict[str, str]]:
+        camera_sets = []
+        for seg_dir in subtask_dirs:
+            videos = seg_dir / 'videos'
+            cams = {
+                path.stem for path in videos.glob('*.mp4')
+                if not path.stem.endswith('_synced')
+            } if videos.exists() else set()
+            camera_sets.append(cams)
+        if not camera_sets:
+            return [], {}
+        common_cameras = set.intersection(*camera_sets)
+        if not common_cameras:
+            return [], {}
+        dst_videos = out_dir / 'videos'
+        if dst_videos.exists():
+            shutil.rmtree(dst_videos, ignore_errors=True)
+        dst_videos.mkdir(parents=True, exist_ok=True)
+
+        stitched = []
+        failures = {}
+        for camera in sorted(common_cameras):
+            srcs = [seg_dir / 'videos' / f'{camera}.mp4' for seg_dir in subtask_dirs]
+            out_path = dst_videos / f'{camera}.mp4'
+            list_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    'w', encoding='utf-8', suffix='.ffconcat', delete=False
+                ) as list_file:
+                    list_path = Path(list_file.name)
+                    for src in srcs:
+                        escaped = str(src.resolve()).replace("'", "'\\''")
+                        list_file.write(f"file '{escaped}'\n")
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-f', 'concat', '-safe', '0',
+                    '-i', str(list_path),
+                    '-an',
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    '-movflags', '+faststart',
+                    str(out_path),
+                ]
+                subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, check=True,
+                )
+                stitched.append(camera)
+            except Exception as exc:
+                failures[camera] = repr(exc)
+                print(f'[ROBOTIS] Failed to stitch {camera}: {exc!r}')
+                out_path.unlink(missing_ok=True)
+            finally:
+                if list_path is not None:
+                    list_path.unlink(missing_ok=True)
+        return stitched, failures
 
     def update_task_info(self, task_info):
         """Refresh per-session config from a new task_info.
@@ -328,9 +1030,22 @@ class DataManager:
         snapshot and the README would never reflect later choices.
         """
         self._task_info = task_info
+        self._main_task_instruction = self._get_main_task_instruction(task_info)
+        self._subtask_instructions = self._get_subtask_instructions(task_info)
+        self._subtask_mode = bool(self._subtask_instructions)
+        self._subtask_total = len(self._subtask_instructions)
+        self._single_task = not self._subtask_mode
         self._include_robotis_license = bool(
             getattr(task_info, 'include_robotis_license', False)
         )
+        with self._state_lock:
+            if self._status == 'idle':
+                (
+                    self._current_full_episode_index,
+                    self._current_subtask_index,
+                ) = self._find_next_subtask_position()
+                self._current_scenario_number = self._current_subtask_index
+                self.current_instruction = self._main_task_instruction
 
     def _ensure_task_readme(self):
         """Write or refresh ``<task_folder>/README.md`` based on the
@@ -451,10 +1166,25 @@ class DataManager:
         # patches this field again once it runs.
         initial_status = 'pending' if has_videos else 'not_required'
 
+        with self._state_lock:
+            raw_episode_index = self._record_episode_count
+            full_episode_index = self._current_full_episode_index
+            subtask_index = self._current_subtask_index
+        current_subtask_instruction = self._current_subtask_instruction()
+
         meta_data = {
-            'task_instruction': self.current_instruction,
+            'task_instruction': self._main_task_instruction,
+            'task_num': getattr(self._task_info, 'task_num', '') or '',
+            'task_name': getattr(self._task_info, 'task_name', '') or '',
+            'recording_mode': 'subtask' if self._subtask_mode else 'single',
+            'subtask_storage_layout': 'nested' if self._subtask_mode else '',
+            'subtask_instruction': current_subtask_instruction,
+            'subtask_instructions': list(self._subtask_instructions),
+            'full_episode_index': full_episode_index if self._subtask_mode else raw_episode_index,
+            'subtask_index': subtask_index if self._subtask_mode else 0,
+            'subtask_total': self._subtask_total if self._subtask_mode else 0,
             'robot_type': self._robot_type,
-            'episode_index': self._record_episode_count,
+            'episode_index': raw_episode_index,
             'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'format_version': 'robotis_v2',
             'device_serial': socket.gethostname(),
@@ -512,9 +1242,17 @@ class DataManager:
             proceed_time = int(getattr(self, '_proceed_time', 0))
             episode_count = int(self._record_episode_count)
             scenario_number = self._current_scenario_number
+            full_episode_index = self._current_full_episode_index
+            subtask_index = self._current_subtask_index
         current_status.current_task_instruction = self.current_instruction
         current_status.proceed_time = proceed_time
-        current_status.current_episode_number = episode_count
+        current_status.current_episode_number = (
+            full_episode_index if self._subtask_mode else episode_count
+        )
+        current_status.current_subtask_index = subtask_index if self._subtask_mode else 0
+        current_status.subtask_count = self._subtask_total if self._subtask_mode else 0
+        current_status.current_subtask_instruction = self._current_subtask_instruction()
+        current_status.subtask_instructions = list(self._subtask_instructions)
 
         total_storage, used_storage = StorageChecker.get_storage_gb('/')
         current_status.used_storage_size = float(used_storage)

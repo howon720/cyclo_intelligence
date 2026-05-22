@@ -186,12 +186,20 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             self._log_error("No episodes were successfully converted")
             return False
 
-        return self.write_from_episodes(episodes_data)
+        success = self.write_from_episodes(episodes_data)
+        if success:
+            self._cleanup_output_temp_dirs()
+            self._cleanup_source_synced_cache([Path(path) for path in bag_paths])
+        return success
 
     def write_from_episodes(self, episodes_data: List[EpisodeData]) -> bool:
         """Write a v2.1 dataset from already parsed episodes."""
         if not episodes_data:
             self._log_error("No episodes were provided for LeRobot v2.1 writing")
+            return False
+        episodes_data = self.prepare_episodes_for_writing(episodes_data)
+        if not episodes_data:
+            self._log_error("No complete episodes remained after subtask stitching")
             return False
 
         self._total_episodes = 0
@@ -222,10 +230,15 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
 
         # Collect tasks in episode-first-appearance order (shared with v3.0).
         self._collect_tasks(episodes_data)
+        self._collect_task_names(episodes_data)
 
         # Write episodes
         for episode_data in episodes_data:
             self._write_episode(episode_data)
+
+        # Optional subtask metadata mirrors the per-frame subtask_index.
+        self._write_subtasks_parquet(output_dir, episodes_data)
+        self._write_subtask_annotations(output_dir, episodes_data)
 
         # Write metadata files
         self._write_info_json()
@@ -277,6 +290,10 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             "tasks": episode.tasks,
             "length": episode.length,
         }
+        if episode.recording_mode == "stitched_subtask":
+            episode_dict["recording_mode"] = episode.recording_mode
+            episode_dict["full_episode_index"] = episode.full_episode_index
+            episode_dict["subtask_instructions"] = episode.subtask_instructions
         self._episodes[ep_idx] = episode_dict
         self._append_jsonl(episode_dict, output_dir / "meta" / "episodes.jsonl")
 
@@ -315,6 +332,9 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             pa.field("index", pa.int64()),
             pa.field("task_index", pa.int64()),
         ]
+        has_subtask_feature = "subtask_index" in self._features
+        if has_subtask_feature:
+            schema_fields.append(pa.field("subtask_index", pa.int64()))
 
         if state_dim > 0:
             schema_fields.append(
@@ -344,6 +364,13 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         task_idx = self._task_to_index.get(default_task, 0)
         arrays.append(pa.array([task_idx] * num_frames, type=pa.int64()))
 
+        if has_subtask_feature:
+            if len(episode.subtask_indices) == num_frames:
+                subtask_values = [int(idx) for idx in episode.subtask_indices]
+            else:
+                subtask_values = [0] * num_frames
+            arrays.append(pa.array(subtask_values, type=pa.int64()))
+
         # Add observation.state as fixed_size_list
         if episode.observation_state:
             state_values = [
@@ -368,6 +395,8 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             "index": {"dtype": "int64", "_type": "Value"},
             "task_index": {"dtype": "int64", "_type": "Value"},
         }
+        if has_subtask_feature:
+            hf_features["subtask_index"] = {"dtype": "int64", "_type": "Value"}
 
         if state_dim > 0:
             hf_features["observation.state"] = {
@@ -419,6 +448,11 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             else None,
             "features": self._features,
         }
+        if "subtask_index" in self._features:
+            info["annotation_path"] = (
+                "annotations/chunk-{episode_chunk:03d}/"
+                "episode_{episode_index:06d}.json"
+            )
 
         info_path = output_dir / "meta" / "info.json"
         with open(info_path, "w", encoding="utf-8") as f:
@@ -433,7 +467,12 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
 
         with open(tasks_path, "w", encoding="utf-8") as f:
             for task_idx, task in self._tasks.items():
-                entry = {"task_index": task_idx, "task": task}
+                task_names = getattr(self, "_task_names_by_task", {})
+                entry = {
+                    "task_index": task_idx,
+                    "task": task,
+                    "task_name": task_names.get(task, task),
+                }
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         self._log_info(f"Wrote tasks.jsonl: {tasks_path}")

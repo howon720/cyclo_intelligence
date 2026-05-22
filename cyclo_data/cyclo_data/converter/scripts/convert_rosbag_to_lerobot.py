@@ -68,6 +68,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -107,20 +108,56 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 def find_rosbags_in_directory(directory: Path) -> list[Path]:
     """Find all rosbag directories in a given directory."""
-    rosbags = []
+    def read_info(path: Path) -> dict:
+        try:
+            info_path = path / "episode_info.json"
+            if info_path.exists():
+                return json.loads(info_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
 
-    for item in sorted(directory.iterdir()):
+    def sort_key(path: Path):
+        info = read_info(path)
+        try:
+            full_idx = int(info.get("full_episode_index"))
+        except (TypeError, ValueError):
+            full_idx = None
+        try:
+            subtask_idx = int(info.get("subtask_index", 0) or 0)
+        except (TypeError, ValueError):
+            subtask_idx = 0
+        try:
+            raw_idx = int(info.get("episode_index"))
+        except (TypeError, ValueError):
+            raw_idx = None
+        if full_idx is not None and info.get("recording_mode") == "subtask":
+            return (full_idx, subtask_idx, raw_idx if raw_idx is not None else 0, str(path))
+        if raw_idx is not None:
+            return (raw_idx, 0, raw_idx, str(path))
+        try:
+            return (int(path.name), 0, int(path.name), str(path))
+        except ValueError:
+            return (10**9, 0, 10**9, str(path))
+
+    rosbags = []
+    for item in directory.rglob("*"):
         if not item.is_dir():
             continue
+        rel = item.relative_to(directory)
+        if any(
+            part.endswith("_converted")
+            or part in {"_stitched_subtasks", "_subtask_video_concat"}
+            for part in rel.parts
+        ):
+            continue
 
-        # Check if it's a rosbag directory (contains .mcap or .db3 files)
-        mcap_files = list(item.glob("*.mcap"))
-        db3_files = list(item.glob("*.db3"))
-
-        if mcap_files or db3_files:
+        if (item / "metadata.yaml").exists() and (
+            any(item.glob("*.mcap")) or any(item.glob("*.db3"))
+        ):
             rosbags.append(item)
 
-    return rosbags
+    return sorted(rosbags, key=sort_key)
 
 
 def main():

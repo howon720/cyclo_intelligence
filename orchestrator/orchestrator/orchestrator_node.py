@@ -267,7 +267,8 @@ class OrchestratorNode(Node):
             response.message = cd_result.message or 'cyclo_data call failed'
 
     def _forward_recording(self, command: int, task_info=None,
-                           include_topics: bool = False):
+                           include_topics: bool = False,
+                           segment_index: int = 0):
         """DRY helper for every recording forwarder site.
 
         Populates topics + urdf_path from orchestrator-owned state
@@ -283,9 +284,10 @@ class OrchestratorNode(Node):
         return self._cyclo_data.send_recording_command(
             command=command,
             task_info=task_info if task_info is not None else self._last_ui_task_info,
-            robot_type=self.robot_type,
+            robot_type=getattr(self, 'robot_type', ''),
             topics=topics,
             urdf_path=urdf_path,
+            segment_index=segment_index,
         )
 
     def _data_operation_status_callback(self, msg: DataOperationStatus):
@@ -1036,6 +1038,91 @@ class OrchestratorNode(Node):
                     response.message = cd_result.response.message or 'Recording started'
                 else:
                     self._apply_cyclo_data_response(cd_result, response)
+
+            elif request.command == SendCommand.Request.START_SEGMENT:
+                task_info = request.task_info
+                self._last_ui_task_info = task_info
+                task_name = f'{self.robot_type}_{task_info.task_name}'
+
+                need_new_config = (
+                    getattr(self, '_current_task_name', None) != task_name
+                )
+                if need_new_config:
+                    self.get_logger().info('Initializing new recording session')
+                    self.init_robot_control_parameters_from_user_task(task_info)
+                    self._current_task_name = task_name
+                if self.timer_manager:
+                    self.timer_manager.start(timer_name='collection')
+
+                if self.communicator is None:
+                    response.success = False
+                    response.message = 'Communicator not initialized'
+                    return response
+                cd_result = self._forward_recording(
+                    RecordingCommand.Request.START_SEGMENT,
+                    task_info=task_info,
+                    include_topics=True,
+                    segment_index=int(request.segment_index),
+                )
+                if (cd_result.success
+                        and cd_result.response is not None
+                        and cd_result.response.success):
+                    self._set_session_active(
+                        on_recording=True,
+                        start_time=time.perf_counter(),
+                    )
+                    response.success = True
+                    response.message = cd_result.response.message or 'Segment started'
+                else:
+                    self._apply_cyclo_data_response(cd_result, response)
+
+            elif request.command == SendCommand.Request.SET_TASK_INFO:
+                self._last_ui_task_info = request.task_info
+                cd_result = self._forward_recording(
+                    RecordingCommand.Request.SET_TASK_INFO,
+                    task_info=request.task_info,
+                )
+                self._apply_cyclo_data_response(cd_result, response)
+
+            elif request.command in (
+                SendCommand.Request.STOP_SEGMENT,
+                SendCommand.Request.CANCEL_SEGMENT,
+            ):
+                recording_command = (
+                    RecordingCommand.Request.STOP_SEGMENT
+                    if request.command == SendCommand.Request.STOP_SEGMENT
+                    else RecordingCommand.Request.CANCEL_SEGMENT
+                )
+                cd_result = self._forward_recording(
+                    recording_command,
+                    task_info=request.task_info,
+                    segment_index=int(request.segment_index),
+                )
+                if (cd_result.success
+                        and cd_result.response is not None
+                        and cd_result.response.success):
+                    self._set_session_active(on_recording=False)
+                self._apply_cyclo_data_response(cd_result, response)
+
+            elif request.command in (
+                SendCommand.Request.DISCARD_SEGMENT,
+                SendCommand.Request.FINISH_EPISODE,
+                SendCommand.Request.DISCARD_EPISODE,
+            ):
+                command_map = {
+                    SendCommand.Request.DISCARD_SEGMENT:
+                        RecordingCommand.Request.DISCARD_SEGMENT,
+                    SendCommand.Request.FINISH_EPISODE:
+                        RecordingCommand.Request.FINISH_EPISODE,
+                    SendCommand.Request.DISCARD_EPISODE:
+                        RecordingCommand.Request.DISCARD_EPISODE,
+                }
+                cd_result = self._forward_recording(
+                    command_map[request.command],
+                    task_info=request.task_info,
+                    segment_index=int(request.segment_index),
+                )
+                self._apply_cyclo_data_response(cd_result, response)
 
             elif request.command == SendCommand.Request.START_INFERENCE:
                 task_info = request.task_info

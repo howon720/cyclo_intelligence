@@ -46,6 +46,7 @@ The LeRobot output root (``/workspace/lerobot/``) is created on demand if
 missing — keeps converted datasets out of the rosbag2 source tree.
 """
 
+import json
 import logging
 import multiprocessing
 import os
@@ -111,9 +112,11 @@ def _convert_single_episode_worker(
     videos_dir = src / 'videos'
     has_sidecars = (
         videos_dir.exists()
-        and any(videos_dir.glob('*_timestamps.parquet'))
+        and any(videos_dir.rglob('*_timestamps.parquet'))
     )
     if has_sidecars:
+        if dst.exists():
+            shutil.rmtree(dst, ignore_errors=True)
         dst.mkdir(parents=True, exist_ok=True)
         for src_file in src.rglob('*'):
             if src_file.is_dir():
@@ -628,7 +631,7 @@ class Mp4ConversionWorker:
                         try:
                             import shutil as _shutil
                             removed = 0
-                            for d in Path(dataset_path).iterdir():
+                            for d in Path(dataset_path).rglob('*'):
                                 if d.is_dir() and d.name.endswith('_converted'):
                                     _shutil.rmtree(str(d))
                                     removed += 1
@@ -640,6 +643,24 @@ class Mp4ConversionWorker:
                         except Exception as cleanup_err:
                             logger.warning(
                                 f'Failed to remove *_converted folders: {cleanup_err}'
+                            )
+
+                        # Cleanup writer-local video stitching caches after
+                        # all requested LeRobot versions have finished. These
+                        # folders only exist to let v2.1/v3.0 share synced
+                        # video work during this conversion run.
+                        try:
+                            removed = Mp4ConversionWorker._cleanup_lerobot_temp_dirs(
+                                Path(dataset_path)
+                            )
+                            if removed:
+                                logger.info(
+                                    f'Cleaned up {removed} LeRobot temporary '
+                                    f'folder(s) for {dataset_path}'
+                                )
+                        except Exception as cleanup_err:
+                            logger.warning(
+                                f'Failed to remove LeRobot temp folders: {cleanup_err}'
                             )
 
                         # Make the lerobot outputs world-readable. The v3.0
@@ -778,11 +799,7 @@ class Mp4ConversionWorker:
             if not dataset_path.exists():
                 return False, f'Dataset path does not exist: {dataset_path}'
 
-            # Find all episode directories (numeric folders)
-            episode_dirs = sorted([
-                d for d in dataset_path.iterdir()
-                if d.is_dir() and d.name.isdigit()
-            ])
+            episode_dirs = Mp4ConversionWorker._collect_raw_bag_paths(dataset_path)
 
             if not episode_dirs:
                 return False, f'No episode directories found in {dataset_path}'
@@ -816,8 +833,10 @@ class Mp4ConversionWorker:
             # Build episode task list
             episode_tasks = []
             for episode_dir in episode_dirs:
-                episode_id = episode_dir.name
-                output_dir = dataset_path / f'{episode_id}_converted'
+                episode_id = Mp4ConversionWorker._episode_display_id(episode_dir)
+                output_dir = dataset_path / (
+                    Mp4ConversionWorker._converted_dir_name(episode_dir)
+                )
                 episode_tasks.append((episode_dir, output_dir, episode_id))
 
             completed_count = 0
@@ -906,13 +925,134 @@ class Mp4ConversionWorker:
             return False, f'Conversion error: {str(e)}'
 
     @staticmethod
+    def _read_episode_info(episode_dir: Path) -> dict:
+        try:
+            info_path = Path(episode_dir) / 'episode_info.json'
+            if info_path.exists():
+                return json.loads(info_path.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _skip_episode_scan_path(path: Path) -> bool:
+        return any(
+            part.endswith('_converted')
+            or part in {'_stitched_subtasks', '_subtask_video_concat'}
+            for part in path.parts
+        )
+
+    @staticmethod
+    def _cleanup_lerobot_temp_dirs(dataset_path: Path) -> int:
+        import shutil
+
+        removed = 0
+        for suffix in ('_lerobot_v21', '_lerobot_v30'):
+            output_dir = LEROBOT_OUTPUT_ROOT / f'{Path(dataset_path).name}{suffix}'
+            for dirname in ('_subtask_video_concat', '_stitched_subtasks'):
+                path = output_dir / dirname
+                if path.exists():
+                    shutil.rmtree(str(path), ignore_errors=True)
+                    removed += 1
+        return removed
+
+    @staticmethod
+    def _is_rosbag_dir(path: Path) -> bool:
+        path = Path(path)
+        return (
+            path.is_dir()
+            and (path / 'metadata.yaml').exists()
+            and (any(path.glob('*.mcap')) or any(path.glob('*.db3')))
+        )
+
+    @staticmethod
+    def _episode_sort_key(path: Path):
+        info = Mp4ConversionWorker._read_episode_info(path)
+        try:
+            full_idx = int(info.get('full_episode_index'))
+        except (TypeError, ValueError):
+            full_idx = None
+        try:
+            subtask_idx = int(info.get('subtask_index', 0) or 0)
+        except (TypeError, ValueError):
+            subtask_idx = 0
+        try:
+            raw_idx = int(info.get('episode_index'))
+        except (TypeError, ValueError):
+            raw_idx = None
+
+        if full_idx is not None and info.get('recording_mode') == 'subtask':
+            return (full_idx, subtask_idx, raw_idx if raw_idx is not None else 0, str(path))
+        if raw_idx is not None:
+            return (raw_idx, 0, raw_idx, str(path))
+        try:
+            return (int(path.name), 0, int(path.name), str(path))
+        except ValueError:
+            return (10**9, 0, 10**9, str(path))
+
+    @staticmethod
+    def _collect_raw_bag_paths(dataset_path: Path) -> List[Path]:
+        dataset_path = Path(dataset_path)
+        candidates: List[Path] = []
+        for child in dataset_path.rglob('*'):
+            if not child.is_dir():
+                continue
+            try:
+                rel = child.relative_to(dataset_path)
+            except ValueError:
+                rel = child
+            if Mp4ConversionWorker._skip_episode_scan_path(rel):
+                continue
+            if Mp4ConversionWorker._is_rosbag_dir(child):
+                candidates.append(child)
+        return sorted(candidates, key=Mp4ConversionWorker._episode_sort_key)
+
+    @staticmethod
+    def _episode_display_id(episode_dir: Path) -> str:
+        info = Mp4ConversionWorker._read_episode_info(episode_dir)
+        if info.get('recording_mode') == 'subtask':
+            return (
+                f"full_{info.get('full_episode_index', 0)}_"
+                f"subtask_{info.get('subtask_index', 0)}"
+            )
+        return str(info.get('episode_index') or episode_dir.name)
+
+    @staticmethod
+    def _converted_dir_name(episode_dir: Path) -> str:
+        info = Mp4ConversionWorker._read_episode_info(episode_dir)
+        if info.get('recording_mode') == 'subtask':
+            try:
+                full_idx = int(info.get('full_episode_index', 0))
+            except (TypeError, ValueError):
+                full_idx = 0
+            try:
+                subtask_idx = int(info.get('subtask_index', 0))
+            except (TypeError, ValueError):
+                subtask_idx = 0
+            try:
+                raw_idx = int(info.get('episode_index', 0))
+            except (TypeError, ValueError):
+                raw_idx = 0
+            return (
+                f'full_{full_idx:06d}_subtask_{subtask_idx:03d}_'
+                f'raw_{raw_idx:06d}_converted'
+            )
+        try:
+            raw_idx = int(info.get('episode_index', episode_dir.name))
+            return f'{raw_idx}_converted'
+        except (TypeError, ValueError):
+            return f'{episode_dir.name}_converted'
+
+    @staticmethod
     def _collect_converted_bag_paths(dataset_path: Path) -> List[Path]:
         return sorted(
             [
-                d for d in dataset_path.iterdir()
-                if d.is_dir() and d.name.endswith('_converted')
+                d for d in dataset_path.rglob('*')
+                if d.is_dir()
+                and d.name.endswith('_converted')
+                and Mp4ConversionWorker._is_rosbag_dir(d)
             ],
-            key=lambda d: int(d.name[: -len('_converted')]),
+            key=Mp4ConversionWorker._episode_sort_key,
         )
 
     @staticmethod
@@ -1190,22 +1330,7 @@ class Mp4ConversionWorker:
             output_dir = LEROBOT_OUTPUT_ROOT / f'{dataset_path.name}_lerobot_v21'
             repo_id = dataset_path.name
 
-            # Collect _converted folders as bag_paths.
-            # CRITICAL: sort NUMERICALLY by episode number, not
-            # lexicographically. Default ``sorted()`` on dir names gives
-            # ['0_converted', '10_converted', '11_converted', ...,
-            # '1_converted', '20_converted', ...] — and the index that
-            # ``_convert_rosbag_worker`` then assigns becomes the
-            # lerobot ``episode_index``, so raw ep 10 lands at lerobot
-            # ep 1, raw ep 1 lands at lerobot ep 11, etc. Lerobot
-            # episodes were silently reshuffled vs the recording order.
-            bag_paths = sorted(
-                [
-                    d for d in dataset_path.iterdir()
-                    if d.is_dir() and d.name.endswith('_converted')
-                ],
-                key=lambda d: int(d.name[: -len('_converted')]),
-            )
+            bag_paths = Mp4ConversionWorker._collect_converted_bag_paths(dataset_path)
 
             if not bag_paths:
                 return False, f'No _converted folders found in {dataset_path}'
@@ -1323,15 +1448,7 @@ class Mp4ConversionWorker:
             repo_id = dataset_path.name
 
             # Same input as Stage 2 — _converted/ folders from Stage 1.
-            # Numeric sort by episode number (see Stage 2 comment for
-            # the lexicographic-sort bug this avoids).
-            bag_paths = sorted(
-                [
-                    d for d in dataset_path.iterdir()
-                    if d.is_dir() and d.name.endswith('_converted')
-                ],
-                key=lambda d: int(d.name[: -len('_converted')]),
-            )
+            bag_paths = Mp4ConversionWorker._collect_converted_bag_paths(dataset_path)
 
             if not bag_paths:
                 return False, f'No _converted folders found in {dataset_path}'
