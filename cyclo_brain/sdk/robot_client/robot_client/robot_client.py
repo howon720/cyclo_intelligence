@@ -571,10 +571,11 @@ class RobotClient:
         values = np.asarray(action, dtype=np.float64).reshape(-1)
         offset = 0
         for action_key in keys:
-            cfg = self._action_groups.get(action_key)
+            publish_key = self._resolve_action_key(action_key)
+            cfg = self._action_groups.get(publish_key)
             if cfg is None:
                 continue
-            publisher_key = f"leader_{action_key}"
+            publisher_key = f"leader_{publish_key}"
             msg_type = cfg["msg_type"]
             width = 3 if msg_type == "geometry_msgs/msg/Twist" else len(cfg["joint_names"])
             segment = values[offset:offset + width]
@@ -591,6 +592,13 @@ class RobotClient:
                     self._command_joint_names.get(publisher_key, []),
                     segment,
                 )
+
+    def _resolve_action_key(self, action_key: str) -> str:
+        if action_key in self._action_groups:
+            return action_key
+        if action_key == "odometry" and "mobile" in self._action_groups:
+            return "mobile"
+        return action_key
 
     def _publish_twist(self, publisher: ROS2Publisher, values: np.ndarray) -> None:
         Vector3 = get_message_class("geometry_msgs/msg/Vector3")

@@ -2,6 +2,13 @@
 Changelog for package cyclo-ui
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.4 (2026-05-22)
+------------------
+* Fixed URDF loading fallbacks for the 3D robot viewer.
+* Added LeRobot and GR00T target backend selection for Hugging Face model downloads.
+* Routed model download folder browsing to the selected policy checkpoint dropbox.
+* Contributors: Dongyun Kim
+
 0.1.3 (2026-05-22)
 ------------------
 * None

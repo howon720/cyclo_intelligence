@@ -599,7 +599,7 @@ class DataManager:
     # UI so the user can pick where downloads land.
     DEFAULT_DOWNLOAD_PATHS = {
         'dataset': Path('/workspace/rosbag2'),
-        'model': Path('/workspace/model'),
+        'model': Path('/policy_checkpoints/lerobot'),
     }
 
     @staticmethod
