@@ -58,10 +58,18 @@ set -- "${NEW_ARGS[@]}"
 
 # Pre-create host bind-mount targets so docker doesn't auto-create them
 # as root-owned directories (which then can't be written to from the
-# host without sudo).
-for d in workspace huggingface; do
-    [ -d "${SCRIPT_DIR}/${d}" ] || mkdir -p "${SCRIPT_DIR}/${d}"
-done
+# host without sudo). Include the user-facing default browser locations
+# used by Cyclo Data and Cyclo Brain.
+ensure_host_dir() {
+    [ -d "$1" ] || mkdir -p "$1"
+}
+
+ensure_host_dir "${SCRIPT_DIR}/workspace"
+ensure_host_dir "${SCRIPT_DIR}/workspace/rosbag2"
+ensure_host_dir "${SCRIPT_DIR}/workspace/lerobot"
+ensure_host_dir "${SCRIPT_DIR}/huggingface"
+ensure_host_dir "${SCRIPT_DIR}/../cyclo_brain/policy/lerobot/checkpoints"
+ensure_host_dir "${SCRIPT_DIR}/../cyclo_brain/policy/groot/checkpoints"
 CYCLO_AGENT_SOCKETS_DIR="${CYCLO_AGENT_SOCKETS_DIR:-/var/run/robotis/agent_sockets/cyclo_intelligence}"
 export CYCLO_AGENT_SOCKETS_DIR
 mkdir -p "$CYCLO_AGENT_SOCKETS_DIR" 2>/dev/null \
