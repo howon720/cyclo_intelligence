@@ -2,6 +2,13 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.3 (2026-05-22)
+------------------
+* Fixed VideoRecorder MJPEG pipe finalization so the last real camera frame is preserved without muxing a fake gray trailer frame.
+* Removed ffmpeg ``+nobuffer`` from the recording pipe because it could drop the final MJPEG packet and leave MP4 frame counts one behind timestamp sidecars.
+* Added regression coverage for recorder trailer handling and raw video/sidecar frame-count parity.
+* Contributors: kimtaehyeong99
+
 0.1.2 (2026-05-20)
 ------------------
 * Optimized LeRobot video conversion by streaming selected MP4 frames directly into ffmpeg instead of writing temporary JPEG sequences.

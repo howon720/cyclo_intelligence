@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from queue import Empty, Full, Queue
+import shutil
+import subprocess
 import sys
 import threading
 import types
@@ -38,7 +40,10 @@ class _QoSProfile:
 sys.modules["rclpy.qos"].QoSProfile = _QoSProfile
 sys.modules["sensor_msgs.msg"].CompressedImage = object
 
-if "pyarrow" not in sys.modules:
+try:
+    import pyarrow  # noqa: F401
+    import pyarrow.parquet  # noqa: F401
+except ImportError:
     pyarrow_stub = types.ModuleType("pyarrow")
     pyarrow_stub.int32 = lambda: "int32"
     pyarrow_stub.int64 = lambda: "int64"
@@ -46,7 +51,6 @@ if "pyarrow" not in sys.modules:
     pyarrow_stub.schema = lambda fields: fields
     pyarrow_stub.table = lambda data, schema=None: {"data": data, "schema": schema}
     sys.modules["pyarrow"] = pyarrow_stub
-if "pyarrow.parquet" not in sys.modules:
     parquet_stub = types.ModuleType("pyarrow.parquet")
     parquet_stub.ParquetWriter = object
     sys.modules["pyarrow.parquet"] = parquet_stub
@@ -55,6 +59,8 @@ if "pyarrow.parquet" not in sys.modules:
 from cyclo_data.recorder.video_recorder import (  # noqa: E402
     _DEFAULT_QUEUE_MAX,
     _CameraStream,
+    _JPEG_SENTINEL,
+    _JPEG_SOI,
     _resolve_queue_max,
     VideoRecorder,
 )
@@ -150,6 +156,82 @@ def test_queue_max_default_env_override_and_invalid(monkeypatch):
     assert _resolve_queue_max() == _DEFAULT_QUEUE_MAX
 
 
+def test_ffmpeg_trailer_is_non_decodable_soi_marker():
+    assert _JPEG_SENTINEL == _JPEG_SOI
+    assert len(_JPEG_SENTINEL) == 2
+
+
+def test_ffmpeg_trailer_flushes_without_extra_gray_frame(tmp_path):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is not installed")
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        pytest.skip(f"OpenCV/numpy unavailable: {exc}")
+
+    frames = []
+    for value in (32, 96, 224):
+        image = np.zeros((16, 16, 3), dtype=np.uint8)
+        image[:, :, 0] = value
+        image[:, :, 1] = 255 - value
+        image[:, :, 2] = (value * 2) % 255
+        ok, encoded = cv2.imencode(".jpg", image)
+        assert ok
+        frames.append(encoded.tobytes())
+
+    output = tmp_path / "out.mp4"
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-use_wallclock_as_timestamps",
+        "1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "-i",
+        "pipe:0",
+        "-c:v",
+        "copy",
+        "-an",
+        "-fps_mode",
+        "passthrough",
+        "-video_track_timescale",
+        "90000",
+        str(output),
+    ]
+    result = subprocess.run(
+        command,
+        input=b"".join(frames) + _JPEG_SENTINEL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+
+    capture = cv2.VideoCapture(str(output))
+    decoded = []
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        decoded.append(frame)
+    capture.release()
+
+    assert len(decoded) == len(frames)
+    last = decoded[-1]
+    assert not np.allclose(last.mean(axis=(0, 1)), [128, 128, 128], atol=2)
+    assert last.std() > 0
+
+
 def test_enqueue_stop_sentinel_retries_when_queue_is_full():
     class FullThenWritableQueue:
         def __init__(self):
@@ -186,6 +268,7 @@ def test_stop_episode_final_join_happens_before_writer_close():
     stats = recorder.stop_episode()
 
     names = [event[0] for event in events]
+    assert ("stdin.write", len(_JPEG_SENTINEL)) in events
     assert names.index("stdin.write") < names.index("stdin.close")
     assert names.index("stdin.close") < names.index("process.wait")
     assert events.count(("worker.join", 10.0)) == 1
