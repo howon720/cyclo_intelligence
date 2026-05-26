@@ -236,7 +236,7 @@ export function useRosServiceCaller() {
 
         const request = {
           task_info: {
-            task_num: String(taskInfo.taskNum || ''),
+            task_num: String(taskInfo.taskNum ?? ''),
             task_name: String(taskName),
             task_type: String(taskType),
             task_instruction: taskInstruction,

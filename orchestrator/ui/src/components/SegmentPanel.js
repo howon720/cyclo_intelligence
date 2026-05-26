@@ -55,7 +55,9 @@ export default function SegmentPanel() {
 
   const serverRecording = recordStatus.recordPhase === RecordPhase.RECORDING;
   const isRecording = serverRecording || optimisticRecording;
-  const isPlanMode = plannedCount > 0;
+  const plannedCountNumber = Number(plannedCount) || 0;
+  const isPlanMode = plannedCountNumber > 0;
+  const isSingleMode = plannedCountNumber === 0;
   const firstPendingSlot = useMemo(
     () => slotToServerIdx.findIndex((v) => v === -1),
     [slotToServerIdx]
@@ -66,16 +68,15 @@ export default function SegmentPanel() {
     [slotToServerIdx]
   );
   const taskInfoComplete = Boolean(
-    (taskInfo.taskNum || '').trim() &&
-      (taskInfo.taskName || '').trim() &&
-      (taskInfo.taskInstruction?.[0] || '').trim()
+    String(taskInfo.taskNum ?? '').trim()
   );
   const allSubTasksFilled = useMemo(
     () =>
-      isPlanMode &&
-      plannedSubTasks.length === plannedCount &&
-      plannedSubTasks.every((s) => !!(s || '').trim()),
-    [isPlanMode, plannedSubTasks, plannedCount]
+      isSingleMode ||
+      (isPlanMode &&
+        plannedSubTasks.length === plannedCountNumber &&
+        plannedSubTasks.every((s) => !!(s || '').trim())),
+    [isSingleMode, isPlanMode, plannedSubTasks, plannedCountNumber]
   );
 
   useEffect(() => {
@@ -93,11 +94,11 @@ export default function SegmentPanel() {
   const applyPlanCount = useCallback(
     (n) => {
       const bounded = Math.max(0, Math.min(MAX_PLANNED_SLOTS, n));
-      if (bounded === plannedCount) return;
+      if (bounded === plannedCountNumber) return;
       let nextSubTasks;
       let nextSlotMap;
-      if (bounded > plannedCount) {
-        const add = bounded - plannedCount;
+      if (bounded > plannedCountNumber) {
+        const add = bounded - plannedCountNumber;
         nextSubTasks = [...plannedSubTasks, ...Array(add).fill('')];
         nextSlotMap = [...slotToServerIdx, ...Array(add).fill(-1)];
       } else {
@@ -110,7 +111,7 @@ export default function SegmentPanel() {
       const nextPending = nextSlotMap.findIndex((v) => v === -1);
       dispatch(setActiveSlotIndex(nextPending >= 0 ? nextPending : Math.max(0, bounded - 1)));
     },
-    [dispatch, plannedCount, plannedSubTasks, slotToServerIdx]
+    [dispatch, plannedCountNumber, plannedSubTasks, slotToServerIdx]
   );
 
   const handlePlanCountInput = useCallback(
@@ -153,7 +154,6 @@ export default function SegmentPanel() {
   );
 
   const canStartRecord =
-    isPlanMode &&
     !isRecording &&
     !savingInProgress &&
     !planComplete &&
@@ -163,7 +163,7 @@ export default function SegmentPanel() {
   const startRecordingSlot = useCallback(
     async (slotIdx) => {
       const subTask = (plannedSubTasks[slotIdx] || '').trim();
-      if (!subTask) return null;
+      if (!isSingleMode && !subTask) return null;
       dispatch(setActiveSlotIndex(slotIdx));
       setOptimisticRecording(true);
       const result = await runCommand('Record', 'start_segment', {
@@ -174,7 +174,7 @@ export default function SegmentPanel() {
       }
       return result;
     },
-    [dispatch, plannedSubTasks, runCommand]
+    [dispatch, isSingleMode, plannedSubTasks, runCommand]
   );
 
   const handleRecordStart = useCallback(async () => {
@@ -184,10 +184,11 @@ export default function SegmentPanel() {
 
   const handleSlotSave = useCallback(
     async (slotIdx) => {
-      if (slotIdx !== activeSlotIndex || !isRecording || savingInProgress) return;
+      if (!isSingleMode && slotIdx !== activeSlotIndex) return;
+      if (!isRecording || savingInProgress) return;
       setSavingInProgress(true);
       setOptimisticRecording(false);
-      const isLastSlot = slotIdx >= plannedCount - 1;
+      const isLastSlot = isSingleMode || slotIdx >= plannedCountNumber - 1;
       const result = await runCommand('Save', 'stop_segment', {
         segmentIndex: slotIdx,
       });
@@ -197,10 +198,12 @@ export default function SegmentPanel() {
       }
 
       const assignedServerIdx = slotToServerIdx.filter((v) => v >= 0).length;
-      const updatedSlotMap = slotToServerIdx.map((v, i) =>
-        i === slotIdx ? assignedServerIdx : v
-      );
-      dispatch(setSlotToServerIdx(updatedSlotMap));
+      const updatedSlotMap = isSingleMode
+        ? slotToServerIdx
+        : slotToServerIdx.map((v, i) => (i === slotIdx ? assignedServerIdx : v));
+      if (!isSingleMode) {
+        dispatch(setSlotToServerIdx(updatedSlotMap));
+      }
 
       if (isLastSlot) {
         const finishResult = await runCommand('Finish episode', 'finish_episode');
@@ -222,7 +225,8 @@ export default function SegmentPanel() {
       activeSlotIndex,
       dispatch,
       isRecording,
-      plannedCount,
+      isSingleMode,
+      plannedCountNumber,
       runCommand,
       savingInProgress,
       slotToServerIdx,
@@ -263,13 +267,25 @@ export default function SegmentPanel() {
     }
   }, [dispatch, isRecording, runCommand, savedCount]);
 
+  const canSaveSingle = isSingleMode && isRecording && !savingInProgress;
+
+  const handlePrimaryRecordButton = useCallback(async () => {
+    if (canSaveSingle) {
+      await handleSlotSave(0);
+      return;
+    }
+    if (canStartRecord) {
+      await handleRecordStart();
+    }
+  }, [canSaveSingle, canStartRecord, handleRecordStart, handleSlotSave]);
+
   useEffect(() => {
     const onKeyUp = (e) => {
       if (isInputFocused()) return;
       if (e.key === ' ' || e.code === 'Space') {
         if (canStartRecord) handleRecordStart();
       } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'x' || e.key === 'X')) {
-        if (isRecording && !savingInProgress) handleSlotSave(activeSlotIndex);
+        if (isRecording && !savingInProgress) handleSlotSave(isSingleMode ? 0 : activeSlotIndex);
       } else if (e.key === 'Escape') {
         if (isRecording && !savingInProgress) handleSlotTrash(activeSlotIndex);
       }
@@ -283,6 +299,7 @@ export default function SegmentPanel() {
     handleSlotSave,
     handleSlotTrash,
     isRecording,
+    isSingleMode,
     savingInProgress,
   ]);
 
@@ -387,7 +404,11 @@ export default function SegmentPanel() {
         content={
           <div className="text-center">
             <div className="font-semibold">
-              {isPlanMode ? 'Start recording the active subtask' : 'Set the number of subtasks below first'}
+              {isPlanMode
+                ? 'Start recording the active subtask'
+                : canSaveSingle
+                  ? 'Save the current single-task episode'
+                  : 'Start single-task recording'}
             </div>
             {canStartRecord && (
               <div className="text-sm mt-1 text-gray-300">
@@ -399,18 +420,20 @@ export default function SegmentPanel() {
         className="block w-full"
       >
         <button
-          onClick={handleRecordStart}
-          disabled={!canStartRecord}
+          onClick={handlePrimaryRecordButton}
+          disabled={!canStartRecord && !canSaveSingle}
           className={clsx(
             'w-full mb-3 px-3 py-2.5 rounded-lg font-semibold text-sm',
             'flex items-center justify-center gap-2 transition-colors',
-            canStartRecord
-              ? 'bg-red-500 text-white hover:bg-red-600'
+            canStartRecord || canSaveSingle
+              ? canSaveSingle
+                ? 'bg-green-500 text-white hover:bg-green-600'
+                : 'bg-red-500 text-white hover:bg-red-600'
               : 'bg-gray-200 text-gray-400 cursor-not-allowed'
           )}
         >
-          <MdFiberManualRecord size={18} />
-          Record Start
+          {canSaveSingle ? <MdSave size={18} /> : <MdFiberManualRecord size={18} />}
+          {canSaveSingle ? 'Save Episode' : 'Record Start'}
         </button>
       </Tooltip>
 
@@ -433,16 +456,16 @@ export default function SegmentPanel() {
             <div className="flex flex-col border-l border-gray-300">
               <button
                 type="button"
-                onClick={() => handlePlanCountInput(plannedCount + 1)}
-                disabled={isRecording || savingInProgress || plannedCount >= MAX_PLANNED_SLOTS}
+                onClick={() => handlePlanCountInput(plannedCountNumber + 1)}
+                disabled={isRecording || savingInProgress || plannedCountNumber >= MAX_PLANNED_SLOTS}
                 className="flex-1 px-1 border-b border-gray-300 text-gray-600 hover:bg-gray-100 disabled:text-gray-300"
               >
                 <MdArrowDropUp size={18} />
               </button>
               <button
                 type="button"
-                onClick={() => handlePlanCountInput(plannedCount - 1)}
-                disabled={isRecording || savingInProgress || plannedCount <= minAllowedCount}
+                onClick={() => handlePlanCountInput(plannedCountNumber - 1)}
+                disabled={isRecording || savingInProgress || plannedCountNumber <= minAllowedCount}
                 className="flex-1 px-1 text-gray-600 hover:bg-gray-100 disabled:text-gray-300"
               >
                 <MdArrowDropDown size={18} />
@@ -465,8 +488,8 @@ export default function SegmentPanel() {
       </div>
 
       <div className="flex flex-col gap-1.5 mb-3">
-        {Array.from({ length: plannedCount }, (_, i) => renderSlotRow(i))}
-        {isRecording && activeSlotIndex < plannedCount && (
+        {Array.from({ length: plannedCountNumber }, (_, i) => renderSlotRow(i))}
+        {isRecording && activeSlotIndex < plannedCountNumber && (
           <div className="text-xs text-red-600 font-mono px-2">
             Recording slot #{activeSlotIndex + 1}: {plannedSubTasks[activeSlotIndex] || '-'} ({recordStatus.proceedTime}s)
           </div>
@@ -476,7 +499,7 @@ export default function SegmentPanel() {
         )}
         {!isPlanMode && (
           <div className="text-xs text-gray-400 italic px-2">
-            Set a subtask count to start planning the episode.
+            Single-task mode. The whole recording will be saved as one episode.
           </div>
         )}
       </div>
