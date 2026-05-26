@@ -80,6 +80,15 @@ export default function useUrdfRobot(urdfPath) {
 
     loader.loadMeshCb = (path, _manager, onComplete) => {
       if (path.startsWith('package://')) {
+        const rel = path.slice('package://'.length);
+        const slashIdx = rel.indexOf('/');
+        const pkgName = slashIdx === -1 ? rel : rel.slice(0, slashIdx);
+        const relPath = slashIdx === -1 ? '' : rel.slice(slashIdx + 1);
+        const pkgBase = loader.packages[pkgName];
+        if (pkgBase && relPath) {
+          loadStl(`${pkgBase}/${relPath}`, onComplete);
+          return;
+        }
         onComplete(makeFallback());
         return;
       }

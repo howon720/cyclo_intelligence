@@ -15,6 +15,16 @@ const CAMERA_PRESETS = {
   top:         { label: 'Top' },
 };
 
+const ROBOT_URDF_BASENAMES = {
+  ffw_sg2_rev1: 'ffw_sg2_follower.urdf',
+  ffw_bg2_rev4: 'ffw_bg2_rev4_follower.urdf',
+};
+
+function getFallbackUrdfPath(robotType) {
+  const basename = ROBOT_URDF_BASENAMES[robotType];
+  return basename ? `/urdf/urdf/${basename}` : null;
+}
+
 function RobotModel({ robot }) {
   const groupRef = useRef();
 
@@ -360,6 +370,9 @@ export default function RobotViewer3D({
       setUrdfPath(null);
       return;
     }
+    const fallbackPath = getFallbackUrdfPath(robotType);
+    setUrdfPath(fallbackPath);
+
     let cancelled = false;
     (async () => {
       try {
@@ -371,7 +384,7 @@ export default function RobotViewer3D({
         const basename = info.urdf_path.split('/').pop();
         if (basename) setUrdfPath(`/urdf/urdf/${basename}`);
       } catch (e) {
-        console.error('Failed to fetch robot info for URDF:', e);
+        console.warn('Using local URDF fallback after robot info lookup failed:', e);
       }
     })();
     return () => {

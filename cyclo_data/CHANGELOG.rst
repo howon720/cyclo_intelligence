@@ -2,6 +2,11 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.4 (2026-05-22)
+------------------
+* Changed the default Hugging Face model download path to the LeRobot policy checkpoint dropbox.
+* Contributors: Dongyun Kim
+
 0.1.3 (2026-05-22)
 ------------------
 * Fixed VideoRecorder MJPEG pipe finalization so the last real camera frame is preserved without muxing a fake gray trailer frame.

@@ -31,8 +31,13 @@ import { useRosServiceCaller } from '../../../hooks/useRosServiceCaller';
 import FileBrowserModal from '../../../components/FileBrowserModal';
 import TokenInputPopup from '../../../components/TokenInputPopup';
 import SectionSelector from './SectionSelector';
-import { DEFAULT_PATHS, HF_ENDPOINT_PRESETS } from '../../../constants/paths';
+import { HF_ENDPOINT_PRESETS } from '../../../constants/paths';
 import HFStatus from '../../../constants/HFStatus';
+import {
+  DOWNLOAD_MODEL_BACKENDS,
+  getDefaultDownloadPath,
+  isManagedDownloadPath,
+} from '../hfDownloadPaths';
 
 // Sentinel value used by the endpoint dropdown to mean "let the user type a
 // custom URL". Anything else in the dropdown is a real endpoint URL.
@@ -149,7 +154,6 @@ const HuggingfaceSection = () => {
   const hfRepoIdUpload = useSelector((state) => state.editDataset.hfRepoIdUpload);
   const hfRepoIdDownload = useSelector((state) => state.editDataset.hfRepoIdDownload);
   const hfStatus = useSelector((state) => state.editDataset.hfStatus);
-  const downloadStatus = useSelector((state) => state.editDataset.downloadStatus);
   const uploadStatus = useSelector((state) => state.editDataset.uploadStatus);
   const hfActiveEndpoint = useSelector((state) => state.editDataset.hfActiveEndpoint);
   const hfEndpoints = useSelector((state) => state.editDataset.hfEndpoints);
@@ -170,31 +174,23 @@ const HuggingfaceSection = () => {
   // and the default destination path for download.
   const [uploadType, setUploadType] = useState('dataset');
   const [downloadType, setDownloadType] = useState('model');
-  // Destination directory for HF downloads. Default tracks the selected
-  // download type (model -> /workspace/model, dataset -> /workspace/rosbag2);
-  // the user can override via the input + browser.
-  const [hfLocalDirDownload, setHfLocalDirDownload] = useState(
-    DEFAULT_PATHS.HF_MODEL_DOWNLOAD_PATH
+  const [downloadModelBackend, setDownloadModelBackend] = useState('lerobot');
+  // Destination directory for HF downloads. Model downloads land in the
+  // selected policy checkpoint dropbox so Inference can browse them directly.
+  const [hfLocalDirDownload, setHfLocalDirDownload] = useState(() =>
+    getDefaultDownloadPath('model', 'lerobot')
   );
   // When the user toggles type, swap the destination to that type's
   // canonical default — but only if the current value is a known default
   // (i.e. they haven't typed something custom). Custom values stay put.
   useEffect(() => {
-    const knownDefaults = new Set([
-      DEFAULT_PATHS.HF_MODEL_DOWNLOAD_PATH,
-      DEFAULT_PATHS.HF_DATASET_DOWNLOAD_PATH,
-    ]);
-    if (knownDefaults.has(hfLocalDirDownload)) {
-      setHfLocalDirDownload(
-        downloadType === 'model'
-          ? DEFAULT_PATHS.HF_MODEL_DOWNLOAD_PATH
-          : DEFAULT_PATHS.HF_DATASET_DOWNLOAD_PATH
-      );
+    if (isManagedDownloadPath(hfLocalDirDownload)) {
+      setHfLocalDirDownload(getDefaultDownloadPath(downloadType, downloadModelBackend));
     }
     // hfLocalDirDownload intentionally omitted — we only react to type flips,
-    // not to the user editing the field.
+    // backend flips, not to the user editing the field.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [downloadType]);
+  }, [downloadType, downloadModelBackend]);
 
   const [showHfDownloadDirBrowserModal, setShowHfDownloadDirBrowserModal] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -1025,6 +1021,44 @@ const HuggingfaceSection = () => {
 
               {/* Download Dataset Section Content */}
               <div className="w-full flex flex-col gap-3">
+                {downloadType === 'model' && (
+                  <div className="w-full flex flex-col gap-2">
+                    <span className="text-lg font-bold">Model target backend</span>
+                    <div
+                      className="flex w-fit gap-1 rounded-md bg-gray-200 p-0.5"
+                      role="radiogroup"
+                      aria-label="Model target backend"
+                    >
+                      {DOWNLOAD_MODEL_BACKENDS.map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          role="radio"
+                          aria-checked={downloadModelBackend === option.value}
+                          onClick={() => setDownloadModelBackend(option.value)}
+                          disabled={isDownloading}
+                          className={clsx(
+                            'px-3 py-1 text-xs font-medium rounded transition-colors',
+                            downloadModelBackend === option.value
+                              ? 'bg-white text-gray-900 shadow-sm'
+                              : 'text-gray-500 hover:text-gray-700',
+                            isDownloading && 'cursor-not-allowed opacity-60'
+                          )}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="text-xs text-gray-500">
+                      Downloaded models are saved under{' '}
+                      <span className="font-mono text-blue-700">
+                        {getDefaultDownloadPath('model', downloadModelBackend)}
+                      </span>
+                      , the same checkpoint folder used by the Inference page.
+                    </div>
+                  </div>
+                )}
+
                 {/* Repo ID Input */}
                 <div className="w-full flex flex-col gap-2">
                   <span className="text-lg font-bold">Repository ID</span>
@@ -1185,8 +1219,8 @@ const HuggingfaceSection = () => {
         selectButtonText="Select"
         allowDirectorySelect={true}
         allowFileSelect={false}
-        initialPath={HF_FILE_BROWSER_ROOT}
-        defaultPath={HF_FILE_BROWSER_ROOT}
+        initialPath={getDefaultDownloadPath(downloadType, downloadModelBackend)}
+        defaultPath={getDefaultDownloadPath(downloadType, downloadModelBackend)}
         homePath=""
       />
 
