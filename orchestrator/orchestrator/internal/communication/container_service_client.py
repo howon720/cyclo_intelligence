@@ -350,7 +350,7 @@ class ContainerServiceClient:
 
         if timeout_sec is None:
             timeout_sec = 600.0 if command == self.CMD_LOAD else 10.0
-        availability_timeout_sec = 90.0 if command == self.CMD_LOAD else 10.0
+        availability_timeout_sec = 180.0 if command == self.CMD_LOAD else 10.0
 
         return self._call_service(
             self._inference_command_client,

@@ -96,6 +96,26 @@ function catalogEntryToParams(entry) {
   );
 }
 
+function normalizeBtStatus(status) {
+  return String(status || 'stopped').trim().toLowerCase();
+}
+
+function getBtStatusLabel(status) {
+  switch (normalizeBtStatus(status)) {
+    case 'running':
+      return 'Running';
+    case 'completed':
+      return 'Completed';
+    case 'failed':
+    case 'failure':
+      return 'Failed';
+    case 'stopping':
+      return 'Stopping';
+    default:
+      return 'Stopped';
+  }
+}
+
 export default function BTManagerPage({ isActive = true }) {
   const dispatch = useDispatch();
   const { callService } = useRosServiceCaller();
@@ -665,14 +685,19 @@ export default function BTManagerPage({ isActive = true }) {
     });
   }, [nodes, edges, activeNodeNames, selectedNodeId, handleToggleCollapse]);
 
-  const statusColor =
-    btStatus === 'running' ? 'bg-green-500' :
-    btStatus === 'completed' ? 'bg-yellow-400' : 'bg-gray-400';
-  const statusLabel =
-    btStatus === 'running' ? 'Running' :
-    btStatus === 'completed' ? 'Completed' : 'Stopped';
-
   const hasTree = nodes.length > 0;
+  const normalizedBtStatus = normalizeBtStatus(btStatus);
+  const isBtRunning = normalizedBtStatus === 'running';
+  const isBtBusy = isBtRunning || normalizedBtStatus === 'stopping';
+  const canStartBt = hasTree && !isBtBusy;
+  const canStopBt = isBtRunning;
+  const statusColor =
+    isBtRunning ? 'bg-green-500' :
+    normalizedBtStatus === 'completed' ? 'bg-yellow-400' :
+    ['failed', 'failure'].includes(normalizedBtStatus) ? 'bg-red-500' :
+    normalizedBtStatus === 'stopping' ? 'bg-orange-400' :
+    'bg-gray-400';
+  const statusLabel = getBtStatusLabel(btStatus);
 
   return (
     <div className="w-full h-full flex flex-col">
@@ -820,10 +845,10 @@ export default function BTManagerPage({ isActive = true }) {
         <div className="flex items-center gap-3">
           <button
             onClick={handleStart}
-            disabled={btStatus === 'running' || !hasTree}
+            disabled={!canStartBt}
             className={clsx(
               'flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-medium transition-colors',
-              (btStatus === 'running' || !hasTree)
+              !canStartBt
                 ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
                 : 'bg-green-600 hover:bg-green-700 text-white'
             )}
@@ -833,10 +858,10 @@ export default function BTManagerPage({ isActive = true }) {
           </button>
           <button
             onClick={handleStop}
-            disabled={btStatus === 'stopped'}
+            disabled={!canStopBt}
             className={clsx(
               'flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-medium transition-colors',
-              btStatus === 'stopped'
+              !canStopBt
                 ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
                 : 'bg-red-600 hover:bg-red-700 text-white'
             )}

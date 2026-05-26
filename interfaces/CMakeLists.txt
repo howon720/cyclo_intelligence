@@ -19,7 +19,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/BrowseFile.srv"
   "srv/ControlHfServer.srv"
   "srv/EditDataset.srv"
-  "srv/EngineCommand.srv"
   "srv/GetConversionStatus.srv"
   "srv/GetDatasetInfo.srv"
   "srv/GetDatasetList.srv"

@@ -70,7 +70,16 @@ if _groot_path and _groot_path not in sys.path:
 from scripts.deployment.standalone_inference_script import (  # noqa: E402
     replace_dit_with_tensorrt,
 )
-from scripts.deployment.export_onnx_n1d6 import DiTInputCapture, export_dit_to_onnx  # noqa: E402
+try:  # GR00T N1.7
+    from scripts.deployment.export_onnx_n1d7 import (  # noqa: E402
+        DiTInputCapture,
+        export_dit_to_onnx,
+    )
+except ImportError:  # GR00T N1.6 / N1.6.1
+    from scripts.deployment.export_onnx_n1d6 import (  # noqa: E402
+        DiTInputCapture,
+        export_dit_to_onnx,
+    )
 
 
 def build_trt_engine(policy: Gr00tPolicy, observation: dict, engine_path: str):
@@ -192,7 +201,12 @@ class GR00TInference:
             "language": [],    # e.g. ["annotation.human.task_description"]
         }
         self.robot_info: dict = {
-            "cameras": [],         # active camera names matched with model
+            # Policy camera keys to emit in the GR00T observation.
+            "cameras": [],
+            # policy_camera_key -> RobotClient camera key. This lets a model
+            # trained with cam_left_head consume a robot stream named
+            # cam_head_left without changing the checkpoint metadata.
+            "camera_sources": {},
             "joints": {},          # modality_key -> yaml_group mapping
             "camera_rotations": {},  # camera_name -> rotation_deg
         }
@@ -244,6 +258,11 @@ class GR00TInference:
                 if not os.path.exists(trt_path):
                     self.logger.info("No TRT engine found, building automatically...")
                     dummy_obs = self._build_dummy_observation(request.task_instruction)
+                    if dummy_obs.get("success") is False:
+                        raise RuntimeError(
+                            f"cannot build TRT without a valid observation: "
+                            f"{dummy_obs.get('message')}"
+                        )
                     build_trt_engine(self.policy, dummy_obs, trt_path)
 
                 replace_dit_with_tensorrt(self.policy, trt_path)
@@ -293,10 +312,16 @@ class GR00TInference:
         """Create RobotClient and resolve active cameras/joints from YAML."""
         self.robot = RobotClient(robot_type)
         cam_config = self.robot._config.get("cameras", {})
+        available_cameras = set(self.robot.camera_names)
 
-        self.robot_info["cameras"] = [
-            k for k in self.robot.camera_names if k in self.policy_info["video"]
-        ]
+        camera_sources = {}
+        for policy_key in self.policy_info["video"]:
+            source_key = self._resolve_camera_source(policy_key, available_cameras)
+            if source_key:
+                camera_sources[policy_key] = source_key
+
+        self.robot_info["cameras"] = list(camera_sources.keys())
+        self.robot_info["camera_sources"] = camera_sources
         self.robot_info["camera_rotations"] = {
             name: cfg.get("rotation_deg", 0)
             for name, cfg in cam_config.items()
@@ -312,16 +337,47 @@ class GR00TInference:
                 joints[modality_key] = group
         self.robot_info["joints"] = joints
 
-        # Sensor-backed state modalities. The training pipeline stores mobile
-        # as a joint-like 3-dim modality, but robot_client keeps odom/cmd_vel
-        # as sensors (semantically correct — they aren't joints). Bridge here.
+        # Sensor-backed state modalities. The training pipeline may store
+        # mobile/odometry as joint-like 3-dim modalities, but robot_client keeps
+        # odom/cmd_vel as sensors. Bridge those names here.
         sensor_states = {}
         sensors_cfg = self.robot._config.get("sensors", {})
         if "mobile" in self.policy_info["state"] and "odom" in sensors_cfg:
             sensor_states["mobile"] = "odom"
+        if "odometry" in self.policy_info["state"] and "odom" in sensors_cfg:
+            sensor_states["odometry"] = "odom"
         self.robot_info["sensor_states"] = sensor_states
 
         self.logger.info("Robot info: %s", self.robot_info)
+
+    def _resolve_camera_source(self, policy_key: str, available_cameras: set) -> Optional[str]:
+        if policy_key in available_cameras:
+            return policy_key
+
+        explicit_aliases = {
+            "cam_left_head": "cam_head_left",
+            "cam_right_head": "cam_head_right",
+            "cam_left_wrist": "cam_wrist_left",
+            "cam_right_wrist": "cam_wrist_right",
+        }
+        alias = explicit_aliases.get(policy_key)
+        if alias in available_cameras:
+            self.logger.info("Camera alias: %s <- %s", policy_key, alias)
+            return alias
+
+        parts = policy_key.split("_")
+        if len(parts) == 3 and parts[0] == "cam":
+            swapped = "_".join((parts[0], parts[2], parts[1]))
+            if swapped in available_cameras:
+                self.logger.info("Camera alias: %s <- %s", policy_key, swapped)
+                return swapped
+
+        self.logger.warning(
+            "No robot camera source matched policy camera key %s; available=%s",
+            policy_key,
+            sorted(available_cameras),
+        )
+        return None
 
     def get_action_chunk(self, request) -> dict:
         """Build observation from RobotClient, run inference, return action chunk."""
@@ -337,7 +393,10 @@ class GR00TInference:
             if "success" in observation:
                 return observation
 
+            t0 = time.monotonic()
+            self.logger.info("Running GR00T inference...")
             action, info = self.policy.get_action(observation)
+            self.logger.info("GR00T inference completed in %.3fs", time.monotonic() - t0)
             return self.postprocess_action(action)
 
         except Exception as e:
@@ -351,10 +410,11 @@ class GR00TInference:
 
         video_obs = {}
         for cam_key in self.robot_info["cameras"]:
-            img = images.get(cam_key)
+            source_key = self.robot_info.get("camera_sources", {}).get(cam_key, cam_key)
+            img = images.get(source_key)
             if img is None:
-                return self.fail(f"Missing camera: {cam_key}")
-            rotation = self.robot_info["camera_rotations"].get(cam_key)
+                return self.fail(f"Missing camera: {source_key} for {cam_key}")
+            rotation = self.robot_info["camera_rotations"].get(source_key)
             if rotation and rotation in self.ROTATE_MAP:
                 img = cv2.rotate(img, self.ROTATE_MAP[rotation])
             video_obs[cam_key] = img[np.newaxis, np.newaxis, ...]  # (1,1,H,W,C)
@@ -428,4 +488,3 @@ class GR00TInference:
     @staticmethod
     def fail(message: str) -> dict:
         return {"success": False, "message": message}
-

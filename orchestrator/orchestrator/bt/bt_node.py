@@ -272,7 +272,7 @@ class BehaviorTreeNode(Node):
             response.message = 'BT started'
             self.get_logger().info('BT execution started via service')
         else:
-            if self.tree_execution_mode in ('running', 'completed'):
+            if self.tree_execution_mode in ('running', 'completed', 'failed'):
                 self.tree_execution_mode = 'stopped'
                 if self.root is not None:
                     self.root.reset()
@@ -385,9 +385,11 @@ class BehaviorTreeNode(Node):
         if self.root is not None:
             self.root.reset()
 
-        self.tree_execution_mode = 'completed'
+        self.tree_execution_mode = (
+            'completed' if status == NodeStatus.SUCCESS else 'failed'
+        )
         self._publish_status()
-        self.get_logger().info('Behavior tree completed')
+        self.get_logger().info(f'Behavior tree {self.tree_execution_mode}')
 
 
 def main(args=None):

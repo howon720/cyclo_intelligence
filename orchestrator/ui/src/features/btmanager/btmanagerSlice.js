@@ -19,7 +19,7 @@ import { createSlice } from '@reduxjs/toolkit';
 const initialState = {
   treeXml: null,
   treeFileName: '',
-  btStatus: 'stopped', // 'stopped' | 'running'
+  btStatus: 'stopped', // 'stopped' | 'running' | 'completed' | 'failed'
   activeNodeNames: [], // names of currently active BT nodes
   selectedNodeId: null, // ID of the node selected for param editing
 };

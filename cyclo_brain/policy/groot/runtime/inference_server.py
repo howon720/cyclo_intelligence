@@ -406,6 +406,7 @@ class InferenceServer:
             return
 
         seq_id = int(msg.data)
+        logger.info(f"trigger rx seq={seq_id}")
 
         # GR00TInference.get_action_chunk takes a request-shaped object
         # with task_instruction. We don't pass model_path / robot_type

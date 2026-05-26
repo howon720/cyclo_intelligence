@@ -95,25 +95,31 @@ from zenoh_ros2_sdk import (  # noqa: E402
 )
 
 
-# -- post_processing SDK import shim -------------------------------------------
+# -- action_chunk_processing SDK import shim -----------------------------------
 # Bootstrap inline: we can't use the shared dev_sdk_path helper yet because
-# it lives inside post_processing — chicken-and-egg. After post_processing
+# it lives inside action_chunk_processing. After action_chunk_processing
 # is on sys.path we import the shared helper for subsequent paths.
 _parents = Path(__file__).resolve().parents
-_default_pp = (
-    str(_parents[3] / "sdk" / "post_processing") if len(_parents) > 3 else ""
+_default_acp = (
+    str(_parents[3] / "sdk" / "action_chunk_processing") if len(_parents) > 3 else ""
 )
-_POST_PROCESSING_PATH = os.environ.get("POST_PROCESSING_SDK_PATH", _default_pp)
-if os.path.exists(_POST_PROCESSING_PATH) and _POST_PROCESSING_PATH not in sys.path:
-    sys.path.insert(0, _POST_PROCESSING_PATH)
+_ACTION_CHUNK_PROCESSING_PATH = os.environ.get(
+    "ACTION_CHUNK_PROCESSING_SDK_PATH",
+    os.environ.get("POST_PROCESSING_SDK_PATH", _default_acp),
+)
+if (
+    os.path.exists(_ACTION_CHUNK_PROCESSING_PATH)
+    and _ACTION_CHUNK_PROCESSING_PATH not in sys.path
+):
+    sys.path.insert(0, _ACTION_CHUNK_PROCESSING_PATH)
 
-from post_processing import (  # noqa: E402
+from action_chunk_processing import (  # noqa: E402
     ActionChunkProcessor,
     build_action_joint_map,
     split_action,
 )
-from post_processing.ros_msg_helpers import make_joint_trajectory  # noqa: E402
-from post_processing.runtime_paths import dev_sdk_path  # noqa: E402
+from action_chunk_processing.ros_msg_helpers import make_joint_trajectory  # noqa: E402
+from action_chunk_processing.runtime_paths import dev_sdk_path  # noqa: E402
 
 
 # -- robot_client msg defs import shim -----------------------------------------

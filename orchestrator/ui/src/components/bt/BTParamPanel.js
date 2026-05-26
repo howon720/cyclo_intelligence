@@ -14,10 +14,12 @@
 //
 // Author: Claude (generated)
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useDispatch } from 'react-redux';
-import { MdClose } from 'react-icons/md';
+import { MdClose, MdFolderOpen } from 'react-icons/md';
+import FileBrowserModal from '../FileBrowserModal';
 import { setSelectedNodeId } from '../../features/btmanager/btmanagerSlice';
+import { DEFAULT_PATHS } from '../../constants/paths';
 
 const NUMBER_PARAMS = new Set([
   'duration', 'angle_deg', 'lift_position', 'control_hz', 'inference_hz',
@@ -105,6 +107,14 @@ export default function BTParamPanel({ nodes, selectedNodeId, onParamChange, onN
   const [localParams, setLocalParams] = useState({});
   // Local name buffer — same cursor-preservation trick as localParams.
   const [localName, setLocalName] = useState('');
+  const [showPolicyBrowser, setShowPolicyBrowser] = useState(false);
+
+  const policyBrowserPath = useMemo(() => {
+    const model = String(localParams.model || '').toLowerCase();
+    return model.startsWith('groot')
+      ? DEFAULT_PATHS.GROOT_CHECKPOINTS_PATH
+      : DEFAULT_PATHS.LEROBOT_CHECKPOINTS_PATH;
+  }, [localParams.model]);
 
   // Reset local state only when switching to a different node
   useEffect(() => {
@@ -112,6 +122,9 @@ export default function BTParamPanel({ nodes, selectedNodeId, onParamChange, onN
       setLocalParams(selectedNode.data.params || {});
       setLocalName(selectedNode.data.label || '');
     }
+    setShowPolicyBrowser(false);
+    // Keep mid-edit cursor position stable; reset only when the selection changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedNodeId]); // intentionally excludes selectedNode to avoid resetting mid-edit
 
   if (!selectedNode) return null;
@@ -137,6 +150,19 @@ export default function BTParamPanel({ nodes, selectedNodeId, onParamChange, onN
 
   const handleBlur = (paramName) => {
     onParamChange(selectedNodeId, paramName, localParams[paramName]);
+  };
+
+  const commitParam = (paramName, value) => {
+    setLocalParams((prev) => ({ ...prev, [paramName]: value }));
+    onParamChange(selectedNodeId, paramName, value);
+  };
+
+  const handlePolicyFolderSelect = (item) => {
+    const fullPath = item?.full_path || '';
+    if (fullPath) {
+      commitParam('policy_path', fullPath);
+    }
+    setShowPolicyBrowser(false);
   };
 
   const renderInput = (key, value, disabled = false) => {
@@ -179,6 +205,32 @@ export default function BTParamPanel({ nodes, selectedNodeId, onParamChange, onN
           />
           <span className="text-sm text-gray-600">{value === 'true' || value === true ? 'true' : 'false'}</span>
         </label>
+      );
+    }
+
+    if (nodeType === 'SendCommand' && key === 'policy_path') {
+      return (
+        <div className="flex flex-row items-start gap-2">
+          <textarea
+            value={value}
+            disabled={disabled}
+            onChange={(e) => handleChange(key, e.target.value)}
+            onBlur={() => handleBlur(key)}
+            rows={String(value).length > 60 ? 3 : 1}
+            placeholder="Enter Policy Path or Repo ID"
+            className={`flex-1 min-w-0 px-2 py-1.5 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y${disabledCls}`}
+          />
+          <button
+            type="button"
+            onClick={() => !disabled && setShowPolicyBrowser(true)}
+            disabled={disabled}
+            className="flex items-center justify-center w-8 h-8 text-blue-500 bg-gray-100 border border-gray-300 rounded hover:text-blue-700 hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+            aria-label="Browse for policy model folder"
+            title="Browse for policy model folder"
+          >
+            <MdFolderOpen size={18} />
+          </button>
+        </div>
       );
     }
 
@@ -264,6 +316,18 @@ export default function BTParamPanel({ nodes, selectedNodeId, onParamChange, onN
           })
         )}
       </div>
+      <FileBrowserModal
+        isOpen={showPolicyBrowser}
+        onClose={() => setShowPolicyBrowser(false)}
+        onFileSelect={handlePolicyFolderSelect}
+        title="Select policy model folder"
+        selectButtonText="Select"
+        allowDirectorySelect={true}
+        allowFileSelect={false}
+        initialPath={policyBrowserPath}
+        defaultPath={policyBrowserPath}
+        homePath={DEFAULT_PATHS.POLICY_CHECKPOINTS_PATH}
+      />
     </div>
   );
 }
