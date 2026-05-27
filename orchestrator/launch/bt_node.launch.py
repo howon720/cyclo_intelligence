@@ -32,13 +32,9 @@ def launch_setup(context, *args, **kwargs):
 
     robot_type = LaunchConfiguration('robot_type').perform(context)
 
-    orchestrator_share = get_package_share_directory('orchestrator')
     shared_share = get_package_share_directory('shared')
 
     config_dir = os.path.join(shared_share, 'robot_configs')
-    bt_params_path = os.path.join(
-        orchestrator_share, 'bt', 'bringup', 'bt_node_params.yaml'
-    )
     robot_config_path = os.path.join(config_dir, f'{robot_type}_config.yaml')
 
     if not os.path.exists(robot_config_path):
@@ -68,6 +64,8 @@ def launch_setup(context, *args, **kwargs):
     ]
 
     bt_params = {
+        'robot_type': robot_type,
+        'tick_rate': 30.0,
         f'{robot_type}.joint_list': joint_list,
         f'{robot_type}.joint_topic_list': joint_topic_list,
     }
@@ -82,7 +80,6 @@ def launch_setup(context, *args, **kwargs):
         name='bt_node',
         output='screen',
         parameters=[
-            bt_params_path,
             bt_params
         ]
     )

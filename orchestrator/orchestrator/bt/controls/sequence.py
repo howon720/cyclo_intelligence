@@ -28,7 +28,11 @@ if TYPE_CHECKING:
 
 
 class Sequence(BaseControl):
-    """Execute children sequentially until one fails or all succeed."""
+    """Tick children left to right.
+
+    Returns RUNNING while a child is running, FAILURE on the first failing
+    child, and SUCCESS once every child has returned SUCCESS.
+    """
 
     def __init__(self, node: 'Node', name: str = 'Sequence'):
         """Initialize the Sequence control node."""

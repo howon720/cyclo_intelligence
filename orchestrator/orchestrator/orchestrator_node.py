@@ -175,6 +175,7 @@ class OrchestratorNode(Node):
         # cycle + 100 Hz control loop (§5.5); orchestrator only dispatches
         # LOAD / START / PAUSE / RESUME / STOP / UNLOAD from UI commands.
         self.container_service_client: Optional[ContainerServiceClient] = None
+        self._loaded_inference_policy_path: str = ''
 
         # HF endpoint registry — orchestrator-owned because the
         # set/get/list/select_hf_endpoint services also read and mutate
@@ -1135,50 +1136,73 @@ class OrchestratorNode(Node):
                 )
                 service_prefix = self._determine_service_prefix(task_info)
 
-                # If a policy is already loaded on this container, treat
-                # START_INFERENCE as RESUME. The policy container may have
-                # been restarted outside orchestrator, though; in that case
-                # the cached client is stale and the container replies with
-                # "not running" or "LOAD first". Fall back to a fresh
-                # LOAD -> START instead of surfacing that confusing error.
+                # If the requested policy is already loaded on this
+                # container, treat START_INFERENCE as RESUME. If the user
+                # selected a different checkpoint on the same backend, tear
+                # down first so START performs a real fresh LOAD.
+                #
+                # The policy container may have been restarted outside
+                # orchestrator, though; in that case the cached client is
+                # stale and the container replies with "not running" or
+                # "LOAD first". Fall back to a fresh LOAD -> START instead
+                # of surfacing that confusing error.
                 # Snapshot the client so a concurrent _teardown_inference_client
                 # cannot null it between the prefix check and the call.
+                requested_policy_path = self._normalize_policy_path(
+                    task_info.policy_path
+                )
                 with self._state_lock:
                     existing_client = self.container_service_client
+                    loaded_policy_path = self._loaded_inference_policy_path
                 start_handled = False
                 if (
                     existing_client is not None
                     and existing_client._service_prefix == service_prefix
                 ):
-                    resume_result = existing_client.inference_command(
-                        ContainerServiceClient.CMD_RESUME,
-                        task_instruction=task_instruction,
-                    )
-                    if resume_result.success:
-                        self._set_session_active(
-                            on_inference=True,
-                            start_time=time.perf_counter(),
+                    if (
+                        requested_policy_path
+                        and loaded_policy_path
+                        and requested_policy_path != loaded_policy_path
+                    ):
+                        self.get_logger().info(
+                            'Requested inference policy changed '
+                            f'({loaded_policy_path} -> {requested_policy_path}); '
+                            'reloading policy'
                         )
-                        self._publish_inference_phase(InferenceStatus.INFERENCING)
-                        response.success = True
-                        response.message = 'Inference resumed (model already loaded)'
-                        start_handled = True
+                        self._teardown_inference_client()
                     else:
-                        resume_message = resume_result.message or ''
-                        if resume_message in ('not running', 'LOAD first'):
-                            self.get_logger().warning(
-                                'Cached inference client for '
-                                f'{service_prefix} is stale '
-                                f'({resume_message}); reloading policy'
+                        resume_result = existing_client.inference_command(
+                            ContainerServiceClient.CMD_RESUME,
+                            task_instruction=task_instruction,
+                        )
+                        if resume_result.success:
+                            self._set_session_active(
+                                on_inference=True,
+                                start_time=time.perf_counter(),
                             )
-                            self._teardown_inference_client()
-                        else:
-                            response.success = False
-                            response.message = resume_message
+                            self._publish_inference_phase(
+                                InferenceStatus.INFERENCING)
+                            response.success = True
+                            response.message = (
+                                'Inference resumed (model already loaded)'
+                            )
                             start_handled = True
-                    self.get_logger().info(
-                        f'RESUME inference result: {resume_result.message}'
-                    )
+                        else:
+                            resume_message = resume_result.message or ''
+                            if resume_message in ('not running', 'LOAD first'):
+                                self.get_logger().warning(
+                                    'Cached inference client for '
+                                    f'{service_prefix} is stale '
+                                    f'({resume_message}); reloading policy'
+                                )
+                                self._teardown_inference_client()
+                            else:
+                                response.success = False
+                                response.message = resume_message
+                                start_handled = True
+                        self.get_logger().info(
+                            f'RESUME inference result: {resume_result.message}'
+                        )
                 if not start_handled:
                     # Fresh start. LOAD on the policy container can take 10+
                     # minutes the first time (model load to GPU + on-disk
@@ -1215,6 +1239,7 @@ class OrchestratorNode(Node):
                     client = new_client
                     record_inference_mode = task_info.record_inference_mode
                     model_path = task_info.policy_path
+                    normalized_model_path = requested_policy_path
                     robot_type = self.robot_type
 
                     def _load_and_start():
@@ -1259,6 +1284,11 @@ class OrchestratorNode(Node):
                                 on_inference=True,
                                 start_time=time.perf_counter(),
                             )
+                            with self._state_lock:
+                                if self.container_service_client is client:
+                                    self._loaded_inference_policy_path = (
+                                        normalized_model_path
+                                    )
                             self._publish_inference_phase(InferenceStatus.INFERENCING)
                         except Exception as e:
                             self.get_logger().error(
@@ -1518,6 +1548,7 @@ class OrchestratorNode(Node):
                                 task_instruction=task_instruction,
                             )
                             if result.success:
+                                self.on_inference = True
                                 self._publish_inference_phase(InferenceStatus.INFERENCING)
                             response.success = result.success
                             response.message = result.message or 'Inference resumed'
@@ -2081,6 +2112,14 @@ class OrchestratorNode(Node):
         'smolvla', 'xvla', 'sac',
     }
 
+    @staticmethod
+    def _normalize_policy_path(policy_path: str) -> str:
+        """Normalize policy paths for same-checkpoint comparisons."""
+        value = (policy_path or '').strip()
+        if not value:
+            return ''
+        return os.path.normpath(value)
+
     def _determine_service_prefix(self, task_info) -> str:
         """Determine inference service prefix from task_info or policy config.
 
@@ -2137,6 +2176,7 @@ class OrchestratorNode(Node):
         with self._state_lock:
             client = self.container_service_client
             self.container_service_client = None
+            self._loaded_inference_policy_path = ''
         if client is None:
             return
 

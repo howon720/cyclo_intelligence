@@ -182,11 +182,13 @@ _BACKENDS: Dict[str, Dict[str, str]] = {
         "service": "lerobot",
         "container": "lerobot_server",
         "image": f"robotis/lerobot-zenoh:1.0.1-{_BACKEND_ARCH}",
+        "services": ["main-runtime", "engine-process"],
     },
     "groot": {
         "service": "groot",
         "container": "groot_server",
         "image": f"robotis/groot-zenoh:1.2.1-{_BACKEND_ARCH}",
+        "services": ["inference-server", "control-publisher"],
     },
 }
 
@@ -300,22 +302,40 @@ def _missing_required_mounts(name: str, container) -> List[str]:
     ]
 
 
-def _backend_service_statuses(container, raw_state: str) -> List[ServiceStatus]:
+def _missing_required_mounts(name: str, container) -> List[str]:
+    required_mounts = _REQUIRED_BACKEND_MOUNTS.get(name, ())
+    if not required_mounts:
+        return []
+    mounted_destinations = {
+        mount.get("Destination")
+        for mount in container.attrs.get("Mounts", [])
+    }
+    return [
+        destination for destination in required_mounts
+        if destination not in mounted_destinations
+    ]
+
+
+def _backend_service_statuses(
+    container,
+    raw_state: str,
+    service_names: List[str],
+) -> List[ServiceStatus]:
     """Inspect the two s6-managed policy runtime processes."""
-    service_names = ("main-runtime", "engine-process")
     if raw_state != "running":
         return []
 
-    script = r"""
+    services = " ".join(service_names)
+    script = f"""
 S6_SVSTAT=$(ls /package/admin/s6-*/command/s6-svstat 2>/dev/null | head -1)
 [ -z "$S6_SVSTAT" ] && S6_SVSTAT=$(command -v s6-svstat 2>/dev/null)
 if [ -z "$S6_SVSTAT" ]; then
-  for svc in main-runtime engine-process; do
+  for svc in {services}; do
     printf '%s\ts6-svstat not found\n' "$svc"
   done
   exit 0
 fi
-for svc in main-runtime engine-process; do
+for svc in {services}; do
   svdir="/run/service/$svc"
   if [ -d "$svdir" ]; then
     raw=$("$S6_SVSTAT" "$svdir" 2>&1)
@@ -651,7 +671,8 @@ async def backend_status(name: str) -> BackendStatus:
             mapped = "exited"
         else:
             mapped = "unknown"
-        services = _backend_service_statuses(ctr, raw)
+        service_names = spec.get("services", ["main-runtime", "engine-process"])
+        services = _backend_service_statuses(ctr, raw, service_names)
         return pulled, mapped, ctr.id, raw, services
 
     pulled, container_state, container_id, raw, services = await asyncio.to_thread(_inspect)

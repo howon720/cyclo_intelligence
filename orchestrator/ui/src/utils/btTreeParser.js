@@ -21,8 +21,18 @@ const CONTROL_TYPES = new Set(['Sequence', 'Loop', 'Fallback', 'Parallel']);
 const NODE_WIDTH = 200;
 const NODE_HEIGHT = 80;
 
+// Attributes that are internal metadata, not BT node parameters.
+// bt_collapsed is a UI-only flag persisted on Control nodes so the
+// collapse/expand state survives Save As, page navigation, and file
+// reloads. BT.cpp doesn't recognise it and ignores unknown attributes.
+const INTERNAL_ATTRS = new Set(['ID', 'name', 'bt_x', 'bt_y', 'bt_collapsed']);
+
 /**
- * Parse BT XML string into React Flow nodes and edges.
+ * Parse BT XML string into React Flow nodes, edges, and a nodeDataMap.
+ *
+ * nodeDataMap: Map<id, {tag, name, params}> — used as primary state after load.
+ * bt_x / bt_y XML attributes override dagre positions when present (set by
+ * serializeFromGraph on save, so position is preserved across load/save cycles).
  */
 export function parseBTXml(xmlString) {
   const parser = new DOMParser();
@@ -39,13 +49,13 @@ export function parseBTXml(xmlString) {
   let rootElement = null;
   for (const bt of behaviorTrees) {
     if (bt.getAttribute('ID') === mainTreeId) {
+      // Only the selected BehaviorTree's first child becomes the graph root.
       rootElement = bt.children[0];
       break;
     }
   }
 
   if (!rootElement) {
-    // Fallback: use the first BehaviorTree
     const firstBT = behaviorTrees[0];
     if (firstBT && firstBT.children.length > 0) {
       rootElement = firstBT.children[0];
@@ -53,37 +63,50 @@ export function parseBTXml(xmlString) {
   }
 
   if (!rootElement) {
-    return { nodes: [], edges: [] };
+    return { nodes: [], edges: [], xmlDoc: doc, nodeElementMap: new Map(), nodeDataMap: new Map() };
   }
 
   const nodes = [];
   const edges = [];
   let nodeIdCounter = 0;
+  const nodeElementMap = new Map();
+  const nodeDataMap = new Map();
 
   function traverse(element, parentId) {
     const id = `bt_${nodeIdCounter++}`;
+    nodeElementMap.set(id, element);
     const tag = element.tagName;
     const name = element.getAttribute('name') || tag;
     const isControl = CONTROL_TYPES.has(tag);
 
-    // Collect params (skip ID and name)
     const params = {};
     for (const attr of element.attributes) {
-      if (attr.name !== 'ID' && attr.name !== 'name') {
+      if (!INTERNAL_ATTRS.has(attr.name)) {
         params[attr.name] = attr.value;
       }
     }
 
+    const storedX = element.getAttribute('bt_x');
+    const storedY = element.getAttribute('bt_y');
+    // Only Control nodes carry a collapsed flag — action nodes have no
+    // children to hide. Default false when the attribute is absent.
+    const collapsed = isControl && element.getAttribute('bt_collapsed') === 'true';
+
     nodes.push({
       id,
       type: isControl ? 'btControl' : 'btAction',
-      data: {
-        label: name,
-        nodeType: tag,
-        params,
-      },
-      position: { x: 0, y: 0 }, // Will be set by dagre
+      data: isControl
+        ? { label: name, nodeType: tag, params, collapsed }
+        : { label: name, nodeType: tag, params },
+      position: { x: 0, y: 0 },
+      _storedX: storedX,
+      _storedY: storedY,
     });
+
+    nodeDataMap.set(
+      id,
+      isControl ? { tag, name, params, collapsed } : { tag, name, params },
+    );
 
     if (parentId) {
       edges.push({
@@ -95,7 +118,6 @@ export function parseBTXml(xmlString) {
       });
     }
 
-    // Recurse into children (skip non-element nodes)
     for (const child of element.children) {
       traverse(child, id);
     }
@@ -103,11 +125,19 @@ export function parseBTXml(xmlString) {
 
   traverse(rootElement, null);
 
-  // Apply dagre layout
-  return applyDagreLayout(nodes, edges);
+  const layout = applyDagreLayout(nodes, edges);
+  return { ...layout, xmlDoc: doc, nodeElementMap, nodeDataMap };
 }
 
-function applyDagreLayout(nodes, edges) {
+/**
+ * Run dagre on the (nodes, edges) pair and return a new nodes array with
+ * computed positions. With `respectStored: true` (the load-from-XML path)
+ * the parser-injected `_storedX/_storedY` win — that's how saved layouts
+ * survive a reload. With `respectStored: false` (in-app re-layout after
+ * a structural change) the stored hints are ignored so dagre is the sole
+ * source of truth and the graph stays tidy.
+ */
+export function applyDagreLayout(nodes, edges, { respectStored = true } = {}) {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({ rankdir: 'TB', nodesep: 40, ranksep: 60 });
@@ -116,14 +146,44 @@ function applyDagreLayout(nodes, edges) {
     g.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
   });
 
-  edges.forEach((edge) => {
+  // dagre's child ordering tracks the order edges are inserted into the
+  // graph. Sort sibling edges (same source) by the target's current x so
+  // users who hand-arranged children left-to-right keep that order after
+  // Auto Layout. Edges with different sources compare equal — the sort is
+  // stable, so cross-parent ordering stays as-is.
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const xOf = (id) => {
+    const n = nodeById.get(id);
+    if (!n) return 0;
+    if (n.position && typeof n.position.x === 'number') return n.position.x;
+    if (
+      n._storedX !== null && n._storedX !== undefined && n._storedX !== ''
+    ) {
+      const v = parseFloat(n._storedX);
+      return Number.isNaN(v) ? 0 : v;
+    }
+    return 0;
+  };
+  const sortedEdges = [...edges].sort((a, b) => {
+    if (a.source !== b.source) return 0;
+    return xOf(a.target) - xOf(b.target);
+  });
+  sortedEdges.forEach((edge) => {
     g.setEdge(edge.source, edge.target);
   });
 
   dagre.layout(g);
 
-  const layoutNodes = nodes.map((node) => {
+  const layoutNodes = nodes.map(({ _storedX, _storedY, ...node }) => {
+    if (
+      respectStored &&
+      _storedX !== null && _storedX !== undefined && _storedX !== '' &&
+      _storedY !== null && _storedY !== undefined && _storedY !== ''
+    ) {
+      return { ...node, position: { x: parseFloat(_storedX), y: parseFloat(_storedY) } };
+    }
     const pos = g.node(node.id);
+    if (!pos) return node;
     return {
       ...node,
       position: {

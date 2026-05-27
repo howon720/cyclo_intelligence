@@ -29,7 +29,10 @@ if TYPE_CHECKING:
 
 
 class Wait(BaseAction):
-    """Action that returns RUNNING for a specified duration, then SUCCESS."""
+    """Block the surrounding sequence for a fixed duration, then return SUCCESS.
+
+    Useful for letting hardware settle between motion commands.
+    """
 
     def __init__(self, node: 'Node', duration: float = 5.0):
         """Initialize the Wait action."""

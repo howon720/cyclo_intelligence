@@ -18,12 +18,14 @@
 
 """ROS 2 node for executing behavior trees."""
 
+import json
 import os
 
 from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from interfaces.srv import GetNodeCatalog
 from interfaces.srv import LoadAndRunTree
 from interfaces.srv import SendCommand
 from std_msgs.msg import String
@@ -32,6 +34,12 @@ from std_srvs.srv import SetBool
 from orchestrator.bt.blackboard import Blackboard  # noqa: I100
 from orchestrator.bt.bt_core import NodeStatus  # noqa: I100
 from orchestrator.bt.bt_nodes_loader import TreeLoader  # noqa: I100
+from orchestrator.bt.node_registry import (  # noqa: I100
+    SCHEMA_VERSION,
+    build_registry,
+    catalog_payload,
+    validate_registry,
+)
 
 
 class BehaviorTreeNode(Node):
@@ -47,7 +55,7 @@ class BehaviorTreeNode(Node):
         self.main_tree_path = None
 
         self.declare_parameter('robot_type', 'ffw_sg2_rev1')
-        self.declare_parameter('tree_xml', 'ffw_test.xml')
+        self.declare_parameter('tree_xml', '')
         self.declare_parameter('tick_rate', 30.0)
 
         robot_type = self.get_parameter('robot_type').value
@@ -60,17 +68,6 @@ class BehaviorTreeNode(Node):
 
         pkg_share = get_package_share_directory('orchestrator')
 
-        self.main_tree_path = os.path.join(pkg_share, 'bt', 'trees', tree_xml)
-        if not os.path.exists(self.main_tree_path):
-            # In-tree fallback for editable checkouts; installed packages
-            # resolve through share/orchestrator/bt/trees above.
-            self.main_tree_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
-                'bt',
-                'trees',
-                tree_xml
-            )
-
         self.tree_loader = TreeLoader(
             self,
             joint_names=self.joint_names,
@@ -78,26 +75,46 @@ class BehaviorTreeNode(Node):
         )
 
         self.root = None
-        try:
-            self.get_logger().info(
-                f'Loading main tree: {self.main_tree_path}'
+        if tree_xml:
+            self.main_tree_path = os.path.join(
+                pkg_share, 'bt', 'trees', tree_xml
             )
-            if os.path.exists(self.main_tree_path):
-                tree_file = self.main_tree_path
-                self.root = self.tree_loader.load_tree_from_file(tree_file)
-                self.tree_execution_mode = 'stopped'
+            if not os.path.exists(self.main_tree_path):
+                # In-tree fallback for editable checkouts; installed packages
+                # resolve through share/orchestrator/bt/trees above.
+                self.main_tree_path = os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    'bt',
+                    'trees',
+                    tree_xml
+                )
+
+            try:
                 self.get_logger().info(
-                    f'Main tree loaded successfully: {self.root.name}'
+                    f'Loading main tree: {self.main_tree_path}'
                 )
-            else:
+                if os.path.exists(self.main_tree_path):
+                    tree_file = self.main_tree_path
+                    self.root = self.tree_loader.load_tree_from_file(tree_file)
+                    self.tree_execution_mode = 'stopped'
+                    self.get_logger().info(
+                        f'Main tree loaded successfully: {self.root.name}'
+                    )
+                else:
+                    self.get_logger().error(
+                        f'Main tree file not found: {self.main_tree_path}'
+                    )
+                    self.tree_execution_mode = 'stopped'
+            except Exception as e:
                 self.get_logger().error(
-                    f'Main tree file not found: {self.main_tree_path}'
+                    f'Failed to load main tree: {str(e)}'
                 )
+                self.root = None
                 self.tree_execution_mode = 'stopped'
-        except Exception as e:
-            self.get_logger().error(f'Failed to load main tree: {str(e)}')
-            self.root = None
-            self.tree_execution_mode = 'stopped'
+        else:
+            self.get_logger().info(
+                'No default main tree configured; waiting for load_and_run'
+            )
 
         self.timer = self.create_timer(1.0 / tick_rate, self.tick_callback)
 
@@ -109,6 +126,17 @@ class BehaviorTreeNode(Node):
         # Service: load tree from XML string and start execution
         self.load_and_run_srv = self.create_service(
             LoadAndRunTree, '/bt/load_and_run', self._load_and_run_callback
+        )
+
+        # Service: return the catalog of available BT node types. The UI
+        # palette + param panel consume this. Validation runs once at startup
+        # so catalog shape mistakes surface in logs instead of silently
+        # breaking the first fetch.
+        self._validate_node_registry()
+        self.nodes_catalog_srv = self.create_service(
+            GetNodeCatalog,
+            '/bt/nodes/catalog',
+            self._nodes_catalog_callback,
         )
 
         # Service client: cleanup inference on BT stop
@@ -127,13 +155,13 @@ class BehaviorTreeNode(Node):
 
         self.get_logger().info('Behavior Tree Node initialized')
         self.get_logger().info(f'Robot type: {robot_type}')
-        self.get_logger().info(f'Main tree XML: {tree_xml}')
+        self.get_logger().info(f'Main tree XML: {tree_xml or "<none>"}')
         if self.root:
             self.get_logger().info(
                 'Tree loaded, waiting for start command'
             )
         else:
-            self.get_logger().error('Tree failed to load')
+            self.get_logger().info('No tree loaded yet')
         self.get_logger().info(f'Tick rate: {tick_rate} Hz')
 
     def _load_joint_order(self, robot_type: str) -> list:
@@ -253,7 +281,7 @@ class BehaviorTreeNode(Node):
             response.message = 'BT started'
             self.get_logger().info('BT execution started via service')
         else:
-            if self.tree_execution_mode == 'running':
+            if self.tree_execution_mode in ('running', 'completed', 'failed'):
                 self.tree_execution_mode = 'stopped'
                 if self.root is not None:
                     self.root.reset()
@@ -295,6 +323,38 @@ class BehaviorTreeNode(Node):
             self._publish_status()
         return response
 
+    def _validate_node_registry(self):
+        """Log any inconsistencies between catalog entries and ctors."""
+        registry = build_registry()
+        problems = validate_registry(registry)
+        for problem in problems:
+            self.get_logger().error(f'Node registry: {problem}')
+        if not problems:
+            self.get_logger().info(
+                f'Node registry validated ({len(registry)} nodes, '
+                f'schema {SCHEMA_VERSION})'
+            )
+
+    def _nodes_catalog_callback(self, request, response):
+        """Return the BT node catalog as a JSON string."""
+        try:
+            registry = build_registry()
+            problems = validate_registry(registry)
+            if problems:
+                raise ValueError('; '.join(problems))
+
+            response.catalog_json = json.dumps(catalog_payload(registry))
+            response.schema_version = SCHEMA_VERSION
+            response.success = True
+            response.message = ''
+        except Exception as e:
+            response.catalog_json = '[]'
+            response.schema_version = SCHEMA_VERSION
+            response.success = False
+            response.message = f'Failed to build catalog: {e}'
+            self.get_logger().error(response.message)
+        return response
+
     def _publish_status(self):
         """Publish current BT execution status."""
         msg = String()
@@ -334,9 +394,11 @@ class BehaviorTreeNode(Node):
         if self.root is not None:
             self.root.reset()
 
-        self.tree_execution_mode = 'stopped'
+        self.tree_execution_mode = (
+            'completed' if status == NodeStatus.SUCCESS else 'failed'
+        )
         self._publish_status()
-        self.get_logger().info('Behavior tree completed')
+        self.get_logger().info(f'Behavior tree {self.tree_execution_mode}')
 
 
 def main(args=None):

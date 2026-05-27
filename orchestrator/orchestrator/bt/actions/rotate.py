@@ -36,7 +36,21 @@ if TYPE_CHECKING:
 
 
 class Rotate(BaseAction):
-    """Action to rotate the mobile base by a target angle in degrees."""
+    """Rotate the mobile base by a target angle around the vertical axis.
+
+    Reads /odom for closed-loop control and stops once the rotation completes
+    within tolerance.
+    """
+
+    @classmethod
+    def from_xml_params(cls, context, name: str, params: dict):
+        action = cls(
+            node=context.node,
+            angle_deg=params.get('angle_deg', DEFAULT_ROTATION_ANGLE_DEG),  # noqa: F405
+            topic_config=context.topic_config,
+        )
+        action.name = name
+        return action
 
     @staticmethod
     def angle_diff_deg(a, b):

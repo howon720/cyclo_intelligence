@@ -2,6 +2,12 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.6 (2026-05-27)
+------------------
+* Added behavior tree XML save support to the data file server API.
+* Extended JSON error responses with structured details for tree-save conflicts.
+* Contributors: kimtaehyeong99, Seongoo
+
 0.1.5 (2026-05-26)
 ------------------
 * Canonicalized camera names to ``cam_<side>_<part>`` throughout recording, MP4 conversion, and LeRobot export.

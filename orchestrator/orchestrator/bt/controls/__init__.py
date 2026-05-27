@@ -18,7 +18,15 @@
 
 """Control nodes for Behavior Tree."""
 
-from orchestrator.bt.controls.loop import Loop
-from orchestrator.bt.controls.sequence import Sequence
-
 __all__ = ['Loop', 'Sequence']
+
+
+def __getattr__(name):
+    """Lazily expose built-in controls."""
+    if name == 'Loop':
+        from orchestrator.bt.controls.loop import Loop
+        return Loop
+    if name == 'Sequence':
+        from orchestrator.bt.controls.sequence import Sequence
+        return Sequence
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

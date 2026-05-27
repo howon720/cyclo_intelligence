@@ -16,12 +16,18 @@
 #
 # Author: Seongwoo Kim
 
-"""Base class for action nodes in the behavior tree."""
+"""Stable base class for behavior tree action nodes.
+
+User-defined actions should subclass :class:`BaseAction`, implement
+``tick()``, and expose user-editable XML parameters as constructor kwargs.
+Copy a template from ``orchestrator.bt.templates`` when creating a new
+action; this file is the inheritance API, not the user-facing template.
+"""
 
 from orchestrator.bt.bt_core import BTNode
 
 
 class BaseAction(BTNode):
-    """Base class for action nodes in the behavior tree."""
+    """Base class for leaf nodes that perform work and return NodeStatus."""
 
     pass

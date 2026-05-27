@@ -16,9 +16,14 @@
 #
 # Author: Seongwoo Kim
 
-"""Base classes for control and decorator nodes in the behavior tree."""
+"""Stable base class for behavior tree control nodes.
 
-from typing import List
+User-defined controls should subclass :class:`BaseControl`, implement
+``tick()``, and expose user-editable XML parameters as constructor kwargs.
+Copy a template from ``orchestrator.bt.templates`` when creating a new
+control; this file is the inheritance API, not the user-facing template.
+"""
+
 from typing import TYPE_CHECKING
 
 from orchestrator.bt.bt_core import BTNode
@@ -28,12 +33,12 @@ if TYPE_CHECKING:
 
 
 class BaseControl(BTNode):
-    """Base class for control nodes in the behavior tree."""
+    """Base class for nodes that own and tick child BT nodes."""
 
     def __init__(self, node: 'Node', name: str):
         """Initialize a control node."""
         super().__init__(node, name)
-        self.children: List[BTNode] = []
+        self.children: list[BTNode] = []
 
     def add_child(self, child: BTNode):
         """Add a child node to this control node."""

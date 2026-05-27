@@ -57,6 +57,8 @@ docker/zenoh_cache
 # container at /workspace.
 cyclo_brain/policy/lerobot/workspace/
 cyclo_brain/policy/groot/workspace/
+cyclo_brain/policy/lerobot/checkpoints/
+cyclo_brain/policy/groot/checkpoints/
 
 # ────────────────────────────────────────────────────────────
 # IDE / OS

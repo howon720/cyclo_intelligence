@@ -43,7 +43,7 @@ services:
   # ============================================================
   cyclo_intelligence:
     container_name: cyclo_intelligence
-    image: robotis/cyclo-intelligence:${VERSION:-0.1.5}-${ARCH:-arm64}
+    image: robotis/cyclo-intelligence:${VERSION:-0.1.6}-${ARCH:-arm64}
     build:
       context: ..
       dockerfile: docker/Dockerfile.${ARCH:-arm64}
@@ -237,7 +237,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "S6_SVSTAT=$$(ls /package/admin/s6-*/command/s6-svstat 2>/dev/null | head -1); [ -n \"$$S6_SVSTAT\" ] && \"$$S6_SVSTAT\" /run/service/main-runtime | grep -q up && \"$$S6_SVSTAT\" /run/service/engine-process | grep -q up",
+          "S6_SVSTAT=$$(ls /package/admin/s6-*/command/s6-svstat 2>/dev/null | head -1); [ -n \"$$S6_SVSTAT\" ] && \"$$S6_SVSTAT\" /run/service/main-runtime | grep -q '^up ' && \"$$S6_SVSTAT\" /run/service/engine-process | grep -q '^up '",
         ]
       interval: 30s
       timeout: 10s
@@ -252,7 +252,8 @@ services:
 
   # ============================================================
   # GR00T N1.7 two-process policy container.
-  # Mirrors lerobot's s6-overlay layout (main-runtime + engine-process).
+  # Uses GR00T's backend-local s6-overlay layout
+  # (inference-server + control-publisher).
   # Pulled / started on demand by the UI
   # via supervisor_api (PLAN §4.8).
   # ============================================================
@@ -326,8 +327,8 @@ services:
       - ../cyclo_brain/policy/common/runtime:/policy_runtime:ro
       # GR00T keeps backend-local app services, while preserving the image's
       # s6-overlay built-in bundles.
-      - ../cyclo_brain/policy/groot/s6-services/main-runtime:/etc/s6-overlay/s6-rc.d/main-runtime:ro
-      - ../cyclo_brain/policy/groot/s6-services/engine-process:/etc/s6-overlay/s6-rc.d/engine-process:ro
+      - ../cyclo_brain/policy/groot/s6-services/inference-server:/etc/s6-overlay/s6-rc.d/inference-server:ro
+      - ../cyclo_brain/policy/groot/s6-services/control-publisher:/etc/s6-overlay/s6-rc.d/control-publisher:ro
       - ../cyclo_brain/policy/groot/s6-services/user/contents.d:/etc/s6-overlay/s6-rc.d/user/contents.d:ro
       # Live-edit GR00T engine code.
       - ../cyclo_brain/policy/groot/groot_engine:/app/groot_engine:ro
@@ -350,6 +351,16 @@ services:
 
     restart: unless-stopped
     runtime: nvidia
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "S6_SVSTAT=$$(ls /package/admin/s6-*/command/s6-svstat 2>/dev/null | head -1); [ -n \"$$S6_SVSTAT\" ] && \"$$S6_SVSTAT\" /run/service/inference-server | grep -q '^up ' && \"$$S6_SVSTAT\" /run/service/control-publisher | grep -q '^up '",
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
     deploy:
       resources:
         reservations:

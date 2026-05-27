@@ -23,7 +23,7 @@ author_emails = ', '.join(email for _, email in authors_info)
 #   ├── orchestrator/        ← Python package (D17)
 #   │   ├── __init__.py
 #   │   ├── orchestrator_node.py
-#   │   ├── bt/              (incl. bt/trees/, bt/bringup/ — data co-located with code)
+#   │   ├── bt/              (incl. bt/trees/ — data co-located with code)
 #   │   ├── internal/
 #   │   ├── timer/
 #   │   └── training/
@@ -40,6 +40,7 @@ packages = [
     f'{package_name}.bt',
     f'{package_name}.bt.actions',
     f'{package_name}.bt.controls',
+    f'{package_name}.bt.templates',
     f'{package_name}.internal',
     f'{package_name}.internal.communication',
     f'{package_name}.internal.device_manager',
@@ -50,7 +51,7 @@ packages = [
 
 setup(
     name=package_name,
-    version='0.1.5',
+    version='0.1.6',
     packages=packages,
     # Nested layout convention (D17): root namespace '' maps to current
     # directory. Avoids colcon-core's _symlinks_in_build veto on
@@ -66,7 +67,7 @@ setup(
         # resolves them via get_package_share_directory('shared') +
         # 'robot_configs'.
         # BT assets live next to the orchestrator.bt Python package. The
-        # trees / bringup data dirs are installed to the package share tree.
+        # tree data dir is installed to the package share tree.
         # Share install path stays the same so `get_package_share_directory(
         # 'orchestrator') / 'bt' / 'trees'` keeps working.
         (
@@ -74,8 +75,8 @@ setup(
             glob(f'{package_name}/bt/trees/*.xml'),
         ),
         (
-            'share/' + package_name + '/bt/bringup',
-            glob(f'{package_name}/bt/bringup/*.yaml'),
+            'share/' + package_name + '/bt/templates',
+            glob(f'{package_name}/bt/templates/*'),
         ),
     ],
     install_requires=[

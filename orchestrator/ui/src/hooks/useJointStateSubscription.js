@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useSelector } from 'react-redux';
 import ROSLIB from 'roslib';
+import rosConnectionManager from '../utils/rosConnectionManager';
 
 // Single unified joint_states topic — carries all upper-body joints
 // (arm_l × 8, arm_r × 8, head × 2, lift × 1 = 19 joints) at 100 Hz.
@@ -38,7 +39,9 @@ const ACTION_COMMAND_TOPICS = [
   },
 ];
 
-const THROTTLE_MS = 33;
+const DEFAULT_LIVE_UPDATE_HZ = 15;
+const MIN_THROTTLE_MS = 1;
+const TOPIC_QUEUE_LENGTH = 1;
 
 export default function useJointStateSubscription(
   setJointValues,
@@ -46,23 +49,30 @@ export default function useJointStateSubscription(
   enabled = true,
   options = {},
 ) {
-  const rosHost = useSelector((state) => state.ros.rosHost);
+  const rosbridgeUrl = useSelector((state) => state.ros.rosbridgeUrl);
   const subscribersRef = useRef([]);
   const lastJointUpdateRef = useRef(0);
   const lastActionUpdateRef = useRef(0);
   const visualizationSource = options.visualizationSource || 'state';
+  const liveUpdateHz =
+    typeof options.liveUpdateHz === 'number' && options.liveUpdateHz > 0
+      ? options.liveUpdateHz
+      : DEFAULT_LIVE_UPDATE_HZ;
+  const throttleMs = Math.max(MIN_THROTTLE_MS, Math.round(1000 / liveUpdateHz));
+  const actionSubscriptionsEnabled =
+    Boolean(options.enableActionPreview) && visualizationSource === 'action';
 
   const handleJointState = useCallback(
     (msg) => {
       const now = Date.now();
-      if (now - lastJointUpdateRef.current < THROTTLE_MS) return;
+      if (now - lastJointUpdateRef.current < throttleMs) return;
       lastJointUpdateRef.current = now;
 
       if (msg.name && msg.position) {
         setJointValues({ name: msg.name, position: msg.position });
       }
     },
-    [setJointValues]
+    [setJointValues, throttleMs]
   );
 
   const handleActionChunk = useCallback(
@@ -89,7 +99,7 @@ export default function useJointStateSubscription(
 
       if (visualizationSource === 'action') {
         const now = Date.now();
-        if (now - lastActionUpdateRef.current >= THROTTLE_MS) {
+        if (now - lastActionUpdateRef.current >= throttleMs) {
           lastActionUpdateRef.current = now;
           setJointValues({ name: msg.joint_names, position: positions });
         }
@@ -102,70 +112,80 @@ export default function useJointStateSubscription(
         });
       }
     },
-    [setJointValues, setActionChunk, visualizationSource]
+    [setJointValues, setActionChunk, visualizationSource, throttleMs]
   );
 
   useEffect(() => {
-    if (!enabled || !rosHost) return;
+    if (!enabled || !rosbridgeUrl) return;
 
-    const ros = new ROSLIB.Ros({ url: `ws://${rosHost}:9090` });
+    let cancelled = false;
     const subs = [];
 
-    ros.on('connection', () => {
-      if (visualizationSource === 'state') {
-        const jointSub = new ROSLIB.Topic({
-          ros,
-          name: JOINT_STATE_TOPIC.name,
-          messageType: JOINT_STATE_TOPIC.type,
-          throttle_rate: THROTTLE_MS,
-        });
-        jointSub.subscribe(handleJointState);
-        subs.push(jointSub);
-      }
-
-      const chunkSub = new ROSLIB.Topic({
-        ros,
-        name: ACTION_CHUNK_TOPIC.name,
-        messageType: ACTION_CHUNK_TOPIC.type,
-      });
-      chunkSub.subscribe(handleActionChunk);
-      subs.push(chunkSub);
-
-      ACTION_COMMAND_TOPICS.forEach((topic) => {
-        const commandSub = new ROSLIB.Topic({
-          ros,
-          name: topic.name,
-          messageType: topic.type,
-          throttle_rate: THROTTLE_MS,
-        });
-        commandSub.subscribe(handleActionCommand);
-        subs.push(commandSub);
-      });
-
-      subscribersRef.current = subs;
-    });
-
-    ros.on('error', (err) => {
-      console.error('Joint state ROS connection error:', err);
-    });
-
-    return () => {
+    const unsubscribeAll = () => {
       subs.forEach((sub) => {
         try {
           sub.unsubscribe();
         } catch (_e) { /* ignore */ }
       });
       subscribersRef.current = [];
+    };
+
+    const subscribeTopic = (ros, topic, callback) => {
+      const sub = new ROSLIB.Topic({
+        ros,
+        name: topic.name,
+        messageType: topic.type,
+        throttle_rate: throttleMs,
+        queue_length: TOPIC_QUEUE_LENGTH,
+      });
+      sub.subscribe(callback);
+      subs.push(sub);
+    };
+
+    const setupSubscriptions = async () => {
       try {
-        ros.close();
-      } catch (_e) { /* ignore */ }
+        const ros = await rosConnectionManager.getConnection(rosbridgeUrl);
+        if (cancelled || !ros) return;
+
+        if (!actionSubscriptionsEnabled) {
+          subscribeTopic(ros, JOINT_STATE_TOPIC, handleJointState);
+        }
+
+        if (actionSubscriptionsEnabled) {
+          subscribeTopic(ros, ACTION_CHUNK_TOPIC, handleActionChunk);
+
+          ACTION_COMMAND_TOPICS.forEach((topic) => {
+            subscribeTopic(ros, topic, handleActionCommand);
+          });
+        }
+
+        if (cancelled) {
+          unsubscribeAll();
+          return;
+        }
+
+        subscribersRef.current = subs;
+      } catch (err) {
+        if (!cancelled) {
+          console.error('Joint state ROS connection error:', err);
+        }
+      }
+    };
+
+    setupSubscriptions();
+
+    return () => {
+      cancelled = true;
+      unsubscribeAll();
     };
   }, [
     enabled,
-    rosHost,
+    rosbridgeUrl,
     handleJointState,
     handleActionChunk,
     handleActionCommand,
     visualizationSource,
+    actionSubscriptionsEnabled,
+    throttleMs,
   ]);
 }

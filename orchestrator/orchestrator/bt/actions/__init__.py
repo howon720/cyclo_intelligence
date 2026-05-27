@@ -19,27 +19,29 @@
 """Cyclo Intelligence Behavior Tree actions package."""
 
 from orchestrator.bt.actions.base_action import BaseAction
-from orchestrator.bt.actions.inference_until_gripper import InferenceUntilGripperClose
-from orchestrator.bt.actions.inference_until_gripper import InferenceUntilGripperOpen
-from orchestrator.bt.actions.inference_until_gripper import InferenceUntilStatic
-from orchestrator.bt.actions.inference_until_position_with_gripper import InferenceUntilPositionWithGripper
-from orchestrator.bt.actions.move_arms import MoveArms
-from orchestrator.bt.actions.move_head import MoveHead
-from orchestrator.bt.actions.move_lift import MoveLift
-from orchestrator.bt.actions.rotate import Rotate
-from orchestrator.bt.actions.send_command import SendCommandAction
-from orchestrator.bt.actions.wait import Wait
 
 __all__ = [
     'BaseAction',
-    'InferenceUntilGripperClose',
-    'InferenceUntilGripperOpen',
-    'InferenceUntilPositionWithGripper',
-    'InferenceUntilStatic',
-    'MoveArms',
-    'MoveLift',
-    'MoveHead',
+    'JointControl',
     'Rotate',
+    'SendCommand',
     'SendCommandAction',
     'Wait',
 ]
+
+
+def __getattr__(name):
+    """Lazily expose built-in actions without importing ROS-heavy modules."""
+    if name == 'JointControl':
+        from orchestrator.bt.actions.joint_control import JointControl
+        return JointControl
+    if name == 'Rotate':
+        from orchestrator.bt.actions.rotate import Rotate
+        return Rotate
+    if name in ('SendCommand', 'SendCommandAction'):
+        from orchestrator.bt.actions.send_command import SendCommand
+        return SendCommand
+    if name == 'Wait':
+        from orchestrator.bt.actions.wait import Wait
+        return Wait
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

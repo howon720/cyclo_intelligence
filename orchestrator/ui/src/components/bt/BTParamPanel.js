@@ -14,41 +14,175 @@
 //
 // Author: Claude (generated)
 
-import React from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useDispatch } from 'react-redux';
-import { MdClose } from 'react-icons/md';
-import { setSelectedNodeId, updateNodeParam } from '../../features/btmanager/btmanagerSlice';
+import { MdClose, MdFolderOpen } from 'react-icons/md';
+import FileBrowserModal from '../FileBrowserModal';
+import { setSelectedNodeId } from '../../features/btmanager/btmanagerSlice';
+import { DEFAULT_PATHS } from '../../constants/paths';
 
 const NUMBER_PARAMS = new Set([
-  'duration', 'angle_deg', 'lift_position', 'control_hz', 'position_threshold',
+  'duration', 'angle_deg', 'lift_position', 'control_hz', 'inference_hz',
+  'chunk_align_window_s', 'max_iterations',
 ]);
 
-const BOOL_PARAMS = new Set(['wait_until_ready']);
+// Per-param helper text shown beneath the input. Keep these short — they
+// render directly under the field as a small gray hint.
+const HELP_TEXT = {
+  max_iterations: '0 = loop forever',
+};
 
-const COMMAND_OPTIONS = ['START_INFERENCE', 'STOP_INFERENCE', 'RESUME_INFERENCE'];
+// JointControl toggles each sub-group on/off via these flags. Other
+// boolean params can be added here as they come up.
+const BOOL_PARAMS = new Set(['enable_head', 'enable_arms', 'enable_lift']);
 
-export default function BTParamPanel({ nodes, selectedNodeId }) {
+// Enum params surface as <select> dropdowns. Keep value lists in sync with
+// the Python action definitions (send_command.COMMAND_MAP).
+const ENUM_PARAMS = {
+  command: ['LOAD', 'RESUME', 'STOP', 'CLEAR'],
+  model: [
+    'lerobot:act',
+    'lerobot:smolvla',
+    'lerobot:xvla',
+    'lerobot:pi0',
+    'lerobot:pi05',
+    'lerobot:diffusion',
+    'groot:n17',
+    'groot',
+    'lerobot',
+  ],
+};
+
+// SendCommand inputs that are meaningful per command. Anything outside
+// the set for the current command is rendered disabled — the value stays
+// in params so flipping back to LOAD restores the user's earlier entries.
+// 'command' itself is always editable.
+const SEND_COMMAND_ACTIVE_FIELDS = {
+  LOAD: new Set([
+    'command', 'model', 'policy_path', 'task_instruction',
+    'inference_hz', 'control_hz', 'chunk_align_window_s',
+  ]),
+  // Resume re-conditions language mid-run; the other LOAD inputs are
+  // already baked into the loaded policy.
+  RESUME: new Set(['command', 'task_instruction']),
+  STOP: new Set(['command']),
+  CLEAR: new Set(['command']),
+};
+
+// JointControl: each group's positions input is gated on its enable_*
+// flag. enable_* toggles themselves + duration are always editable.
+const truthy = (v) => v === true || v === 'true';
+
+function isSendCommandFieldDisabled(nodeType, key, params) {
+  if (nodeType !== 'SendCommand') return false;
+  const cmd = String(params.command || 'LOAD').toUpperCase();
+  const active = SEND_COMMAND_ACTIVE_FIELDS[cmd];
+  if (!active) return false;
+  return !active.has(key);
+}
+
+function isJointControlFieldDisabled(nodeType, key, params) {
+  if (nodeType !== 'JointControl') return false;
+  if (key === 'head_positions') return !truthy(params.enable_head);
+  if (key === 'left_positions' || key === 'right_positions') {
+    return !truthy(params.enable_arms);
+  }
+  if (key === 'lift_position') return !truthy(params.enable_lift);
+  return false;  // enable_*, duration stay editable
+}
+
+function isFieldDisabled(nodeType, key, params) {
+  return (
+    isSendCommandFieldDisabled(nodeType, key, params) ||
+    isJointControlFieldDisabled(nodeType, key, params)
+  );
+}
+
+export default function BTParamPanel({ nodes, selectedNodeId, onParamChange, onNameChange }) {
   const dispatch = useDispatch();
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId);
+
+  // Local param state — isolates keystrokes from parent re-renders (preserves cursor)
+  const [localParams, setLocalParams] = useState({});
+  // Local name buffer — same cursor-preservation trick as localParams.
+  const [localName, setLocalName] = useState('');
+  const [showPolicyBrowser, setShowPolicyBrowser] = useState(false);
+
+  const policyBrowserPath = useMemo(() => {
+    const model = String(localParams.model || '').toLowerCase();
+    return model.startsWith('groot')
+      ? DEFAULT_PATHS.GROOT_CHECKPOINTS_PATH
+      : DEFAULT_PATHS.LEROBOT_CHECKPOINTS_PATH;
+  }, [localParams.model]);
+
+  // Reset local state only when switching to a different node
+  useEffect(() => {
+    if (selectedNode) {
+      setLocalParams(selectedNode.data.params || {});
+      setLocalName(selectedNode.data.label || '');
+    }
+    setShowPolicyBrowser(false);
+    // Keep mid-edit cursor position stable; reset only when the selection changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNodeId]); // intentionally excludes selectedNode to avoid resetting mid-edit
+
   if (!selectedNode) return null;
 
-  const { label, nodeType, params = {} } = selectedNode.data;
-  const paramEntries = Object.entries(params);
+  const { label, nodeType } = selectedNode.data;
+  const paramEntries = Object.entries(localParams);
 
-  const handleChange = (paramName, value) => {
-    dispatch(updateNodeParam({ nodeId: selectedNodeId, paramName, paramValue: value }));
+  const commitName = () => {
+    const trimmed = localName.trim();
+    if (!trimmed) {
+      // Reject empty — snap input back to current label.
+      setLocalName(label);
+      return;
+    }
+    if (trimmed !== label) {
+      onNameChange?.(selectedNodeId, trimmed);
+    }
   };
 
-  const renderInput = (key, value) => {
-    if (key === 'command') {
+  const handleChange = (paramName, value) => {
+    setLocalParams((prev) => ({ ...prev, [paramName]: value }));
+  };
+
+  const handleBlur = (paramName) => {
+    onParamChange(selectedNodeId, paramName, localParams[paramName]);
+  };
+
+  const commitParam = (paramName, value) => {
+    setLocalParams((prev) => ({ ...prev, [paramName]: value }));
+    onParamChange(selectedNodeId, paramName, value);
+  };
+
+  const handlePolicyFolderSelect = (item) => {
+    const fullPath = item?.full_path || '';
+    if (fullPath) {
+      commitParam('policy_path', fullPath);
+    }
+    setShowPolicyBrowser(false);
+  };
+
+  const renderInput = (key, value, disabled = false) => {
+    const disabledCls = disabled
+      ? ' bg-gray-100 text-gray-400 cursor-not-allowed'
+      : '';
+
+    if (ENUM_PARAMS[key]) {
       return (
         <select
           value={value}
-          onChange={(e) => handleChange(key, e.target.value)}
-          className="w-full px-2 py-1.5 border border-gray-300 rounded text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+          disabled={disabled}
+          onChange={(e) => {
+            handleChange(key, e.target.value);
+            // select has no meaningful blur event for this; sync immediately
+            onParamChange(selectedNodeId, key, e.target.value);
+          }}
+          className={`w-full px-2 py-1.5 border border-gray-300 rounded text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-400${disabledCls}`}
         >
-          {COMMAND_OPTIONS.map((opt) => (
+          {ENUM_PARAMS[key].map((opt) => (
             <option key={opt} value={opt}>{opt}</option>
           ))}
         </select>
@@ -57,15 +191,46 @@ export default function BTParamPanel({ nodes, selectedNodeId }) {
 
     if (BOOL_PARAMS.has(key)) {
       return (
-        <label className="flex items-center gap-2 cursor-pointer">
+        <label className={`flex items-center gap-2 ${disabled ? 'cursor-not-allowed text-gray-400' : 'cursor-pointer'}`}>
           <input
             type="checkbox"
+            disabled={disabled}
             checked={value === 'true' || value === true}
-            onChange={(e) => handleChange(key, e.target.checked ? 'true' : 'false')}
+            onChange={(e) => {
+              const v = e.target.checked ? 'true' : 'false';
+              handleChange(key, v);
+              onParamChange(selectedNodeId, key, v);
+            }}
             className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-400"
           />
           <span className="text-sm text-gray-600">{value === 'true' || value === true ? 'true' : 'false'}</span>
         </label>
+      );
+    }
+
+    if (nodeType === 'SendCommand' && key === 'policy_path') {
+      return (
+        <div className="flex flex-row items-start gap-2">
+          <textarea
+            value={value}
+            disabled={disabled}
+            onChange={(e) => handleChange(key, e.target.value)}
+            onBlur={() => handleBlur(key)}
+            rows={String(value).length > 60 ? 3 : 1}
+            placeholder="Enter Policy Path or Repo ID"
+            className={`flex-1 min-w-0 px-2 py-1.5 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y${disabledCls}`}
+          />
+          <button
+            type="button"
+            onClick={() => !disabled && setShowPolicyBrowser(true)}
+            disabled={disabled}
+            className="flex items-center justify-center w-8 h-8 text-blue-500 bg-gray-100 border border-gray-300 rounded hover:text-blue-700 hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+            aria-label="Browse for policy model folder"
+            title="Browse for policy model folder"
+          >
+            <MdFolderOpen size={18} />
+          </button>
+        </div>
       );
     }
 
@@ -75,8 +240,10 @@ export default function BTParamPanel({ nodes, selectedNodeId }) {
           type="number"
           step="any"
           value={value}
+          disabled={disabled}
           onChange={(e) => handleChange(key, e.target.value)}
-          className="w-full px-2 py-1.5 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+          onBlur={() => handleBlur(key)}
+          className={`w-full px-2 py-1.5 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400${disabledCls}`}
         />
       );
     }
@@ -84,9 +251,11 @@ export default function BTParamPanel({ nodes, selectedNodeId }) {
     return (
       <textarea
         value={value}
+        disabled={disabled}
         onChange={(e) => handleChange(key, e.target.value)}
+        onBlur={() => handleBlur(key)}
         rows={String(value).length > 60 ? 3 : 1}
-        className="w-full px-2 py-1.5 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y"
+        className={`w-full px-2 py-1.5 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y${disabledCls}`}
       />
     );
   };
@@ -94,10 +263,24 @@ export default function BTParamPanel({ nodes, selectedNodeId }) {
   return (
     <div className="absolute right-0 top-0 bottom-0 w-[320px] bg-white border-l border-gray-200 shadow-lg z-10 flex flex-col">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200">
-        <div>
-          <div className="text-sm font-bold text-gray-800">{label}</div>
-          <div className="text-xs text-gray-500">{nodeType}</div>
+      <div className="flex items-start justify-between px-4 py-3 border-b border-gray-200">
+        <div className="flex-1 min-w-0 pr-2">
+          <div className="text-xs text-gray-500 mb-1">{nodeType}</div>
+          <input
+            type="text"
+            value={localName}
+            onChange={(e) => setLocalName(e.target.value)}
+            onBlur={commitName}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.currentTarget.blur();
+              } else if (e.key === 'Escape') {
+                setLocalName(label);
+                e.currentTarget.blur();
+              }
+            }}
+            className="w-full text-sm font-bold text-gray-800 bg-transparent border-0 border-b border-transparent hover:border-gray-300 focus:border-blue-400 focus:outline-none px-0 py-0.5"
+          />
         </div>
         <button
           onClick={() => dispatch(setSelectedNodeId(null))}
@@ -112,16 +295,39 @@ export default function BTParamPanel({ nodes, selectedNodeId }) {
         {paramEntries.length === 0 ? (
           <p className="text-sm text-gray-400">No parameters</p>
         ) : (
-          paramEntries.map(([key, value]) => (
-            <div key={key}>
-              <label className="block text-xs font-medium text-gray-600 mb-1">
-                {key}
-              </label>
-              {renderInput(key, value)}
-            </div>
-          ))
+          paramEntries.map(([key, value]) => {
+            const disabled = isFieldDisabled(nodeType, key, localParams);
+            const help = HELP_TEXT[key];
+            return (
+              <div key={key}>
+                <label
+                  className={`block text-xs font-medium mb-1 ${
+                    disabled ? 'text-gray-400' : 'text-gray-600'
+                  }`}
+                >
+                  {key}
+                </label>
+                {renderInput(key, value, disabled)}
+                {help && !disabled && (
+                  <div className="mt-1 text-xs text-gray-500">{help}</div>
+                )}
+              </div>
+            );
+          })
         )}
       </div>
+      <FileBrowserModal
+        isOpen={showPolicyBrowser}
+        onClose={() => setShowPolicyBrowser(false)}
+        onFileSelect={handlePolicyFolderSelect}
+        title="Select policy model folder"
+        selectButtonText="Select"
+        allowDirectorySelect={true}
+        allowFileSelect={false}
+        initialPath={policyBrowserPath}
+        defaultPath={policyBrowserPath}
+        homePath={DEFAULT_PATHS.POLICY_CHECKPOINTS_PATH}
+      />
     </div>
   );
 }

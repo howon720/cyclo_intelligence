@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="Sequence_1">
+      <SendCommand name="ModelLoad"
+        command="LOAD"
+        model="groot:n17"
+        policy_path="/policy_checkpoints/groot/test"
+        task_instruction="Place the paper cups in to the basket."
+        inference_hz="10"
+        control_hz="100"
+        chunk_align_window_s="0.3"/>
+      <SendCommand name="ResumeInference" command="RESUME"/>
+      <Wait name="Wait_1" duration="5.0"/>
+      <SendCommand name="SendCommand_1" command="STOP"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

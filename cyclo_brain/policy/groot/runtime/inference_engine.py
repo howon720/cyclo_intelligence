@@ -16,19 +16,23 @@
 #
 # Author: Dongyun Kim
 
-"""GR00T inference engine.
+"""GR00T N1.6 inference engine.
 
-Encapsulates Gr00tPolicy loading, RobotClient setup, observation preprocessing,
-and action chunk postprocessing. Imported by ``groot_engine`` and hosted by the
-common Engine process.
+Encapsulates Gr00tPolicy loading, RobotClient setup, observation
+preprocessing, and action chunk postprocessing. Imported by
+runtime/inference_server.py (Process A) which slots it into the
+cyclo_intelligence two-process pattern (LOAD srv → configure broadcast
+→ Zenoh trigger/chunk).
 
 Original Step 1 location: cyclo_brain/policy/groot/inference.py.
+Moved to runtime/ as part of D10-groot (mirrors lerobot/runtime/ layout).
 """
-import gc
 import logging
 import os
 import sys
-from typing import Callable, Optional
+import tempfile
+import time
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -42,16 +46,17 @@ _ROBOT_CLIENT_PATH = os.environ.get("ROBOT_CLIENT_SDK_PATH", "/robot_client_sdk"
 if os.path.exists(_ROBOT_CLIENT_PATH) and _ROBOT_CLIENT_PATH not in sys.path:
     sys.path.insert(0, _ROBOT_CLIENT_PATH)
 
-_POLICY_RUNTIME_PATH = os.environ.get("POLICY_RUNTIME_PATH", "/policy_runtime")
-if os.path.exists(_POLICY_RUNTIME_PATH) and _POLICY_RUNTIME_PATH not in sys.path:
-    sys.path.insert(0, _POLICY_RUNTIME_PATH)
-
 import gr00t.model  # noqa: F401 - register custom models
-from engine import InferenceEngine  # noqa: E402
 from gr00t.data.embodiment_tags import EmbodimentTag  # noqa: E402
 from gr00t.policy.gr00t_policy import Gr00tPolicy  # noqa: E402
-from runtime.camera_mapping import resolve_camera_mappings  # noqa: E402
 from robot_client import RobotClient  # noqa: E402
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 # Add GR00T root to sys.path for deployment script imports.
 # After the move into runtime/, parents[0]=runtime, parents[1]=groot,
@@ -69,7 +74,7 @@ else:
 if _groot_path and _groot_path not in sys.path:
     sys.path.insert(0, _groot_path)
 
-# TensorRT DiT optimization - reuse existing GR00T deployment code.
+# TensorRT DiT acceleration - reuse existing GR00T deployment code
 from scripts.deployment.standalone_inference_script import (  # noqa: E402
     replace_dit_with_tensorrt,
 )
@@ -92,10 +97,13 @@ def build_trt_engine(policy: Gr00tPolicy, observation: dict, engine_path: str):
     then builds the TRT engine via build_tensorrt_engine.build_engine().
     Takes ~3-5 min on Orin.
     """
-    from scripts.deployment.build_tensorrt_engine import build_engine
+    from scripts.deployment.build_tensorrt_engine import (
+        build_engine,
+        derive_shapes_with_hint,
+    )
 
     logger = logging.getLogger("groot_inference")
-    onnx_path = engine_path.replace(".trt", ".onnx")
+    engine_dir = os.path.dirname(engine_path)
 
     # Step 1: Capture DiT input shapes via hook
     logger.info("Capturing DiT input shapes...")
@@ -110,128 +118,69 @@ def build_trt_engine(policy: Gr00tPolicy, observation: dict, engine_path: str):
     if not capture.captured:
         raise RuntimeError("Failed to capture DiT inputs")
 
-    # Step 2: Export DiT to ONNX
-    # Patch torch.onnx.export to force dynamo=False (avoids torch.export failures
-    # with DiT's dynamic shapes, without modifying the upstream GR00T code)
-    _orig_export = torch.onnx.export
-    def _patched_export(*args, **kwargs):
-        kwargs.setdefault("dynamo", False)
-        return _orig_export(*args, **kwargs)
-    torch.onnx.export = _patched_export
-    try:
-        export_dit_to_onnx(
-            policy=policy,
-            captured_inputs=capture,
-            output_path=onnx_path,
-            use_bf16=True,
-        )
-    finally:
-        torch.onnx.export = _orig_export
+    # Step 2/3: Export DiT to ONNX in an isolated temporary directory, then
+    # build the TensorRT engine into the checkpoint directory. GR00T's ONNX
+    # exporter consolidates external-data files by deleting every non
+    # .onnx/.json/.data file next to the ONNX path. Keeping ONNX artifacts out
+    # of the checkpoint directory prevents model-*.safetensors from being
+    # mistaken for temporary external data.
+    with tempfile.TemporaryDirectory(prefix=".trt_export_", dir=engine_dir) as export_dir:
+        onnx_path = os.path.join(export_dir, "dit_model_bf16.onnx")
 
-    logger.info("ONNX exported: %s", onnx_path)
-
-    # Step 3: Build TensorRT engine
-    min_shapes = {
-        "sa_embs": (1, 1, 1536),
-        "vl_embs": (1, 1, 2048),
-        "timestep": (1,),
-        "image_mask": (1, 1),
-        "backbone_attention_mask": (1, 1),
-    }
-    opt_shapes = {
-        "sa_embs": (1, 51, 1536),
-        "vl_embs": (1, 122, 2048),
-        "timestep": (1,),
-        "image_mask": (1, 122),
-        "backbone_attention_mask": (1, 122),
-    }
-    max_shapes = {
-        "sa_embs": (1, 256, 1536),
-        "vl_embs": (1, 512, 2048),
-        "timestep": (1,),
-        "image_mask": (1, 512),
-        "backbone_attention_mask": (1, 512),
-    }
-
-    build_engine(
-        onnx_path=onnx_path,
-        engine_path=engine_path,
-        precision="bf16",
-        workspace_mb=8192,
-        min_shapes=min_shapes,
-        opt_shapes=opt_shapes,
-        max_shapes=max_shapes,
-    )
-
-    # Clean up ONNX and external data files (no longer needed after TRT build)
-    onnx_dir = os.path.dirname(onnx_path)
-    onnx_basename = os.path.splitext(os.path.basename(onnx_path))[0]
-    keep_exts = (".trt", ".json", ".safetensors", ".py", ".txt", ".model", ".md", ".bin")
-    for f in os.listdir(onnx_dir):
-        fpath = os.path.join(onnx_dir, f)
-        if not os.path.isfile(fpath):
-            continue
-        # Remove the ONNX file itself
-        if f.endswith(".onnx"):
-            os.remove(fpath)
-            continue
-        # Remove external data files (created by ONNX export, no standard extension)
-        if not f.endswith(keep_exts):
-            os.remove(fpath)
-    logger.info("Cleaned up ONNX export files from: %s", onnx_dir)
-
-
-class TensorRTOptimizer:
-    """Build and attach the optional GR00T DiT TensorRT engine.
-
-    The policy can run without this optimizer. Keeping this behind a
-    class boundary makes the core inference engine responsible for
-    lifecycle, while TensorRT-specific export/build/replace details live here.
-    """
-
-    logger = logging.getLogger("groot_inference")
-
-    def __init__(self, engine_filename: str = "dit_model_bf16.trt") -> None:
-        self._engine_filename = engine_filename
-
-    def engine_path(self, model_path: str) -> str:
-        return os.path.join(model_path, self._engine_filename)
-
-    def apply(
-        self,
-        policy: Gr00tPolicy,
-        model_path: str,
-        observation_factory: Callable[[], dict],
-    ) -> Optional[str]:
-        """Ensure the TensorRT engine exists, then patch the policy.
-
-        Returns the TRT path on success. Returns None when TensorRT is
-        unavailable so inference can continue with PyTorch eager.
-        """
-        trt_enabled = os.environ.get("GROOT_TRT_ENABLED", "true").lower()
-        if trt_enabled in {"0", "false", "no", "off"}:
-            self.logger.info(
-                "TensorRT optimization disabled by GROOT_TRT_ENABLED=%s", trt_enabled
-            )
-            return None
-
-        trt_path = self.engine_path(model_path)
+        # Patch torch.onnx.export to force dynamo=False (avoids torch.export
+        # failures with DiT's dynamic shapes, without modifying upstream GR00T).
+        _orig_export = torch.onnx.export
+        def _patched_export(*args, **kwargs):
+            kwargs.setdefault("dynamo", False)
+            return _orig_export(*args, **kwargs)
+        torch.onnx.export = _patched_export
         try:
-            if not os.path.exists(trt_path):
-                self.logger.info("No TRT engine found, building automatically...")
-                build_trt_engine(policy, observation_factory(), trt_path)
-
-            replace_dit_with_tensorrt(policy, trt_path)
-            self.logger.info("DiT optimized with TensorRT: %s", trt_path)
-            return trt_path
-        except Exception as e:
-            self.logger.warning(
-                "TensorRT optimization unavailable, using PyTorch Eager: %s", e
+            export_dit_to_onnx(
+                policy=policy,
+                captured_inputs=capture,
+                output_path=onnx_path,
+                use_bf16=True,
             )
-            return None
+        finally:
+            torch.onnx.export = _orig_export
+
+        logger.info("ONNX exported: %s", onnx_path)
+
+        # N1.7 exports only the visual-language sequence axis as dynamic. The
+        # state/action sequence (sa_embs) is static for a given policy/action
+        # horizon. Derive profiles from ONNX so fixed dims stay fixed and only
+        # named dynamic dims get ranges.
+        vl_seq_len = int(capture.vl_embs.shape[1])
+        min_shapes, opt_shapes, max_shapes = derive_shapes_with_hint(
+            onnx_path,
+            opt_seq_lens={"vl_seq_len": vl_seq_len},
+            max_batch=1,
+        )
+
+        # Keep the previous generous upper bound for language-conditioned
+        # inputs. derive_shapes_with_hint uses ~2x opt by default, which can be
+        # too tight if the BT sends a longer instruction than export captured.
+        for name in ("vl_embs", "image_mask", "backbone_attention_mask"):
+            shape = max_shapes.get(name)
+            if shape and len(shape) > 1 and shape[1] != opt_shapes[name][1]:
+                widened = list(shape)
+                widened[1] = max(widened[1], 512)
+                max_shapes[name] = tuple(widened)
+
+        build_engine(
+            onnx_path=onnx_path,
+            engine_path=engine_path,
+            precision="bf16",
+            workspace_mb=8192,
+            min_shapes=min_shapes,
+            opt_shapes=opt_shapes,
+            max_shapes=max_shapes,
+        )
+
+    logger.info("Cleaned up temporary ONNX export directory")
 
 
-class GR00TInference(InferenceEngine):
+class GR00TInference:
     """Encapsulates GR00T policy loading, observation building, and inference."""
 
     logger = logging.getLogger("groot_inference")
@@ -246,7 +195,6 @@ class GR00TInference(InferenceEngine):
     def __init__(self):
         self.policy: Optional[Gr00tPolicy] = None
         self.robot: Optional[RobotClient] = None
-        self.optimizer = TensorRTOptimizer()
         self._loaded_model_path: Optional[str] = None  # track cached policy path
         self.policy_info: dict = {
             "video": [],       # e.g. ["cam_left_head", "cam_left_wrist", ...]
@@ -255,8 +203,12 @@ class GR00TInference(InferenceEngine):
             "language": [],    # e.g. ["annotation.human.task_description"]
         }
         self.robot_info: dict = {
-            "cameras": [],         # active camera names matched with model
-            "camera_map": {},      # robot camera name -> policy video key
+            # Policy camera keys to emit in the GR00T observation.
+            "cameras": [],
+            # policy_camera_key -> RobotClient camera key. This lets a model
+            # trained with cam_left_head consume a robot stream named
+            # cam_head_left without changing the checkpoint metadata.
+            "camera_sources": {},
             "joints": {},          # modality_key -> yaml_group mapping
             "camera_rotations": {},  # camera_name -> rotation_deg
         }
@@ -268,11 +220,6 @@ class GR00TInference(InferenceEngine):
     def load_policy(self, request) -> dict:
         """Load GR00T policy and create RobotClient for sensor data."""
         model_path = request.model_path
-        embodiment_tag = (
-            str(getattr(request, "embodiment_tag", "") or "").strip()
-            or os.environ.get("GROOT_EMBODIMENT_TAG", "").strip()
-            or self.DEFAULT_EMBODIMENT_TAG
-        )
         robot_type = request.robot_type
 
         try:
@@ -293,10 +240,9 @@ class GR00TInference(InferenceEngine):
                 }
 
             self.logger.info("Loading GR00T policy from: %s", model_path)
-            self.logger.info("Using GR00T embodiment tag: %s", embodiment_tag)
 
             self.policy = Gr00tPolicy(
-                embodiment_tag=EmbodimentTag.resolve(embodiment_tag),
+                embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
                 model_path=model_path,
                 device="cuda",
             )
@@ -306,13 +252,34 @@ class GR00TInference(InferenceEngine):
             self.init_robot_info(robot_type)
             self.robot.wait_for_ready(timeout=10.0)
 
-            self.optimizer.apply(
-                policy=self.policy,
-                model_path=model_path,
-                observation_factory=lambda: self._build_dummy_observation(
-                    request.task_instruction
-                ),
-            )
+            # TensorRT acceleration for DiT (Action Head).
+            # Keep this opt-in while validating N1.7 model-load/action flow;
+            # ONNX/TRT export writes into the checkpoint directory.
+            if _env_flag("GROOT_TRT_ENABLED", default=False):
+                trt_path = os.path.join(model_path, "dit_model_bf16.trt")
+                try:
+                    if not os.path.exists(trt_path):
+                        self.logger.info("No TRT engine found, building automatically...")
+                        dummy_obs = self._build_dummy_observation(request.task_instruction)
+                        if dummy_obs.get("success") is False:
+                            raise RuntimeError(
+                                f"cannot build TRT without a valid observation: "
+                                f"{dummy_obs.get('message')}"
+                            )
+                        build_trt_engine(self.policy, dummy_obs, trt_path)
+
+                    replace_dit_with_tensorrt(self.policy, trt_path)
+                    self.logger.info("DiT accelerated with TensorRT: %s", trt_path)
+                except Exception as e:
+                    self.logger.warning(
+                        "TensorRT acceleration unavailable, using PyTorch Eager: %s", e
+                    )
+            else:
+                self.logger.info(
+                    "TensorRT acceleration disabled (GROOT_TRT_ENABLED=%s); "
+                    "using PyTorch Eager",
+                    os.environ.get("GROOT_TRT_ENABLED", "unset"),
+                )
 
             return {
                 "success": True,
@@ -354,13 +321,16 @@ class GR00TInference(InferenceEngine):
         """Create RobotClient and resolve active cameras/joints from YAML."""
         self.robot = RobotClient(robot_type)
         cam_config = self.robot._config.get("cameras", {})
+        available_cameras = set(self.robot.camera_names)
 
-        camera_map = resolve_camera_mappings(
-            self.robot.camera_names,
-            self.policy_info["video"],
-        )
-        self.robot_info["cameras"] = list(camera_map.keys())
-        self.robot_info["camera_map"] = camera_map
+        camera_sources = {}
+        for policy_key in self.policy_info["video"]:
+            source_key = self._resolve_camera_source(policy_key, available_cameras)
+            if source_key:
+                camera_sources[policy_key] = source_key
+
+        self.robot_info["cameras"] = list(camera_sources.keys())
+        self.robot_info["camera_sources"] = camera_sources
         self.robot_info["camera_rotations"] = {
             name: cfg.get("rotation_deg", 0)
             for name, cfg in cam_config.items()
@@ -390,6 +360,35 @@ class GR00TInference(InferenceEngine):
 
         self.logger.info("Robot info: %s", self.robot_info)
 
+    def _resolve_camera_source(self, policy_key: str, available_cameras: set) -> Optional[str]:
+        if policy_key in available_cameras:
+            return policy_key
+
+        explicit_aliases = {
+            "cam_left_head": "cam_head_left",
+            "cam_right_head": "cam_head_right",
+            "cam_left_wrist": "cam_wrist_left",
+            "cam_right_wrist": "cam_wrist_right",
+        }
+        alias = explicit_aliases.get(policy_key)
+        if alias in available_cameras:
+            self.logger.info("Camera alias: %s <- %s", policy_key, alias)
+            return alias
+
+        parts = policy_key.split("_")
+        if len(parts) == 3 and parts[0] == "cam":
+            swapped = "_".join((parts[0], parts[2], parts[1]))
+            if swapped in available_cameras:
+                self.logger.info("Camera alias: %s <- %s", policy_key, swapped)
+                return swapped
+
+        self.logger.warning(
+            "No robot camera source matched policy camera key %s; available=%s",
+            policy_key,
+            sorted(available_cameras),
+        )
+        return None
+
     def get_action_chunk(self, request) -> dict:
         """Build observation from RobotClient, run inference, return action chunk."""
         if not self.is_ready:
@@ -404,7 +403,10 @@ class GR00TInference(InferenceEngine):
             if "success" in observation:
                 return observation
 
+            t0 = time.monotonic()
+            self.logger.info("Running GR00T inference...")
             action, info = self.policy.get_action(observation)
+            self.logger.info("GR00T inference completed in %.3fs", time.monotonic() - t0)
             return self.postprocess_action(action)
 
         except Exception as e:
@@ -417,14 +419,15 @@ class GR00TInference(InferenceEngine):
             return self.fail("No recent observations from sensors")
 
         video_obs = {}
-        for cam_key, policy_key in self.robot_info.get("camera_map", {}).items():
-            img = images.get(cam_key)
+        for cam_key in self.robot_info["cameras"]:
+            source_key = self.robot_info.get("camera_sources", {}).get(cam_key, cam_key)
+            img = images.get(source_key)
             if img is None:
-                return self.fail(f"Missing camera: {cam_key}")
-            rotation = self.robot_info["camera_rotations"].get(cam_key)
+                return self.fail(f"Missing camera: {source_key} for {cam_key}")
+            rotation = self.robot_info["camera_rotations"].get(source_key)
             if rotation and rotation in self.ROTATE_MAP:
                 img = cv2.rotate(img, self.ROTATE_MAP[rotation])
-            video_obs[policy_key] = img[np.newaxis, np.newaxis, ...]  # (1,1,H,W,C)
+            video_obs[cam_key] = img[np.newaxis, np.newaxis, ...]  # (1,1,H,W,C)
 
         state_obs = {}
         for modality_key, yaml_group in self.robot_info["joints"].items():
@@ -470,32 +473,24 @@ class GR00TInference(InferenceEngine):
         self.logger.info("Action chunk: T=%d, D=%d", T, D)
         return {
             "success": True,
-            # Keep the backend contract as a flat numpy chunk. The common
-            # Engine process converts it to EngineCommand.action_list.
+            # Keep as numpy — zenoh_ros2_sdk's publisher uses .view() for fast
+            # CDR encoding and crashes on plain lists ('list' object has no
+            # attribute 'view'). inference_server._publish_chunk passes this
+            # straight through.
             "action_chunk": np.asarray(chunk.flatten(), dtype=np.float64),
             "chunk_size": T,
             "action_dim": D,
         }
 
     def cleanup(self) -> None:
-        """Release robot and policy resources for a true UNLOAD."""
+        """Release robot resources. Policy is kept cached for fast restart."""
         if self.robot is not None:
             self.robot.close()
             self.robot = None
 
-        if self.policy is not None:
-            self.logger.info("Releasing GR00T policy: %s", self._loaded_model_path)
-            self.policy = None
-            self._loaded_model_path = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-
         self.policy_info = {k: [] for k in self.policy_info}
         self.robot_info = {
             "cameras": [],
-            "camera_map": {},
             "joints": {},
             "camera_rotations": {},
         }
@@ -503,7 +498,3 @@ class GR00TInference(InferenceEngine):
     @staticmethod
     def fail(message: str) -> dict:
         return {"success": False, "message": message}
-
-
-def create_engine() -> InferenceEngine:
-    return GR00TInference()

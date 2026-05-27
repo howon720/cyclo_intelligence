@@ -14,30 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Action list post-processing pipeline.
-
-Extracted from ``orchestrator/inference/inference_manager.py`` (Step 4-A).
-Pure numpy + stdlib — no ROS2, Zenoh, or rclpy dependency — so the control
-loop can own it, and so it can be unit-tested outside a ROS2 environment.
-
-Pipeline on each incoming raw action list (shape ``(T, D)`` at
-``inference_hz``):
-
-    1. Optionally match/align against ``last_action`` on the first
-       ``chunk_align_window_s * inference_hz`` raw waypoints — skips past
-       waypoints the robot has already crossed while preventing "jump ahead"
-       on loop trajectories (A→B→C→B→A).
-    2. Interpolate from model cadence to control cadence. A 16-step model
-       action list can become a 100-step control list when
-       ``target_chunk_size=100``.
-    3. Linear blend of the first ``BLEND_DURATION_S * control_hz`` waypoints
-       toward ``last_action`` so chunk boundaries don't discontinuously jump.
-    4. Append to an internal buffer the control loop pops from.
-
-Post-processing is optional. With ``postprocess=False`` the raw action list
-is buffered as-is, and the caller should run its control loop at the model
-action cadence instead of forcing 100 Hz.
-"""
+"""Action list post-processing pipeline."""
 
 from __future__ import annotations
 
@@ -71,9 +48,7 @@ class ActionChunkProcessor:
         if self._target_chunk_size is not None and self._target_chunk_size <= 0:
             raise ValueError("target_chunk_size must be positive")
         if self._alignment_mode not in {"l2", "none", "rtc"}:
-            raise ValueError(
-                "alignment_mode must be one of: 'l2', 'none', 'rtc'"
-            )
+            raise ValueError("alignment_mode must be one of: 'l2', 'none', 'rtc'")
 
         self._buffer: collections.deque = collections.deque()
         self._last_action: Optional[np.ndarray] = None
@@ -91,20 +66,9 @@ class ActionChunkProcessor:
 
     @property
     def output_hz(self) -> float:
-        """Cadence the caller should use when popping this processor.
-
-        Post-processed chunks are meant for the control loop cadence. Direct
-        mode buffers raw model actions, so the caller should tick at the model
-        action cadence instead.
-        """
         return self._control_hz if self._postprocess else self._inference_hz
 
     def push_chunk(self, chunk: np.ndarray) -> int:
-        """Align, interpolate, blend, and append ``chunk`` to the buffer.
-
-        Returns the number of interpolated waypoints appended. May be 0 if
-        the chunk collapses to empty after L2 alignment.
-        """
         if chunk.ndim != 2:
             raise ValueError(f"chunk must be 2D (T, D); got shape {chunk.shape}")
 
@@ -131,33 +95,18 @@ class ActionChunkProcessor:
             return len(blended)
 
     def push_actions(self, actions: np.ndarray) -> int:
-        """Alias for callers that think in model action lists, not chunks."""
         return self.push_chunk(actions)
 
     def pop_action(self) -> Optional[np.ndarray]:
-        """Pop the next action.
-
-        Returns the next buffered action, or a copy of ``last_action`` if
-        the buffer has drained (hold last command), or ``None`` if nothing
-        has been pushed yet.
-        """
         with self._lock:
             if self._buffer:
                 return self._buffer.popleft()
             return None if self._last_action is None else self._last_action.copy()
 
     def clear(self) -> None:
-        """Drop all buffered waypoints and forget ``last_action``.
-
-        The next ``push_chunk`` will behave as the first push — no alignment
-        and no blending.
-        """
         with self._lock:
             self._buffer.clear()
             self._last_action = None
-
-    # -- internals ---------------------------------------------------------
-    # All internals assume the caller holds ``self._lock``.
 
     def _align(self, chunk: np.ndarray) -> np.ndarray:
         if self._alignment_mode == "none":
@@ -179,11 +128,6 @@ class ActionChunkProcessor:
         return chunk[start_idx:]
 
     def _rtc_align(self, chunk: np.ndarray) -> np.ndarray:
-        """Placeholder for the RTC aligner.
-
-        RTC will live behind the same alignment hook as L2 matching, so adding
-        it later won't change the control loop or buffer API.
-        """
         raise NotImplementedError("RTC alignment is not implemented yet")
 
     def _interpolate(self, chunk: np.ndarray) -> np.ndarray:
@@ -226,13 +170,6 @@ def build_action_joint_map(
     action_keys: List[str],
     joint_order: Dict[str, List[str]],
 ) -> Dict[str, str]:
-    """Map model action modality keys to joint_order leader groups.
-
-    For each ``key`` in ``action_keys``, looks up
-    ``"joint_order.leader_<key>"`` in ``joint_order``. Keys without a
-    matching leader group are silently dropped; the caller is responsible for
-    logging if that is unexpected.
-    """
     action_joint_map: Dict[str, str] = {}
     for key in action_keys:
         leader_key = f"joint_order.leader_{key}"
@@ -246,12 +183,6 @@ def split_action(
     action_joint_map: Dict[str, str],
     joint_order: Dict[str, List[str]],
 ) -> Dict[str, np.ndarray]:
-    """Slice a flat action vector into per-publisher-key segments.
-
-    Returns ``{publisher_key: values}`` where ``publisher_key`` is the
-    leader group with the ``"joint_order."`` prefix stripped. The caller
-    decides whether to wrap each segment as ``Twist`` or ``JointTrajectory``.
-    """
     result: Dict[str, np.ndarray] = {}
     offset = 0
     for _modality_key, leader_group in action_joint_map.items():
