@@ -2,6 +2,14 @@
 Changelog for package cyclo_brain
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.6 (2026-05-27)
+------------------
+* Updated LeRobot and GR00T policy container runtimes for behavior tree inference workflows.
+* Added backend-specific s6 service status reporting for inference and control publisher processes.
+* Improved GR00T TensorRT engine build safety and behavior tree inference lifecycle handling.
+* Updated action chunk processing and policy runtime wiring for synchronized SendCommand execution.
+* Contributors: kimtaehyeong99
+
 0.1.5 (2026-05-26)
 ------------------
 * Updated LeRobot and GR00T policy IO mapping to use canonical ``cam_<side>_<part>`` camera names.
