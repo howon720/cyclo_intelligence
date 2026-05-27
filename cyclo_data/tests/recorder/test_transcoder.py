@@ -38,6 +38,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 
 # The tests import from cyclo_data — make the source tree importable
@@ -136,10 +137,76 @@ def _make_episode(
             "robot_type": "test_robot",
             "episode_index": 0,
             "format_version": "robotis_v2",
-            "camera_rotations": dict(rotations or {}),
             "transcoding_status": initial_status,
         }
         (ep / "episode_info.json").write_text(json.dumps(info, indent=2))
+    if rotations:
+        camera_info_dir = ep / "camera_info"
+        camera_info_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "format_version": "robotis_camera_metadata_v1",
+            "source": "robot_config",
+            "cameras": {
+                cam: {
+                    "rotation_deg": int(deg),
+                    "rotation_applied_at": "record",
+                }
+                for cam, deg in rotations.items()
+            },
+        }
+        (camera_info_dir / "camera_metadata.yaml").write_text(
+            yaml.safe_dump(payload, sort_keys=False),
+            encoding="utf-8",
+        )
+    return ep
+
+
+def _make_nested_episode(
+    root: Path,
+    segments: dict[str, dict[str, tuple[int, int]]],
+    *,
+    write_info: bool = True,
+    initial_status: str = STATUS_PENDING,
+    rotations: dict[str, int] | None = None,
+) -> Path:
+    """Materialise a segmented archived episode.
+
+    ``segments`` maps ``segment_name`` → ``{cam_name: (mp4_frames, sidecar_rows)}``.
+    """
+    ep = Path(root) / "Task_X" / "0"
+    for segment, cameras in segments.items():
+        videos_dir = ep / "videos" / segment
+        videos_dir.mkdir(parents=True, exist_ok=True)
+        for cam, (mp4_frames, sidecar_rows) in cameras.items():
+            _make_mjpeg_mp4(videos_dir / f"{cam}.mp4", mp4_frames)
+            _make_sidecar(videos_dir / f"{cam}_timestamps.parquet", sidecar_rows)
+    if write_info:
+        info = {
+            "task_instruction": "test",
+            "robot_type": "test_robot",
+            "episode_index": 0,
+            "format_version": "robotis_v2",
+            "transcoding_status": initial_status,
+        }
+        (ep / "episode_info.json").write_text(json.dumps(info, indent=2))
+    if rotations:
+        camera_info_dir = ep / "camera_info"
+        camera_info_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "format_version": "robotis_camera_metadata_v1",
+            "source": "robot_config",
+            "cameras": {
+                cam: {
+                    "rotation_deg": int(deg),
+                    "rotation_applied_at": "record",
+                }
+                for cam, deg in rotations.items()
+            },
+        }
+        (camera_info_dir / "camera_metadata.yaml").write_text(
+            yaml.safe_dump(payload, sort_keys=False),
+            encoding="utf-8",
+        )
     return ep
 
 
@@ -188,7 +255,7 @@ class TestHappyPath:
         # Status updated
         info = _read_status(ep)
         assert info["transcoding_status"] == STATUS_DONE
-        assert info["transcoding_encoder"] == res.encoder
+        assert info["transcoding_cameras_failed"] == {}
         # No orphan .tmp left behind
         assert list((ep / "videos").glob("*.h264.tmp")) == []
 
@@ -256,6 +323,38 @@ class TestHappyPath:
         again = _detect_encoder()
         assert again == encoder
 
+    def test_a6_nested_segment_camera_transcodes_in_place(self, tmp_path, worker):
+        ep = _make_nested_episode(tmp_path, {"0_0": {"cam0": (12, 12)}})
+        res = worker.submit(ep).result(timeout=60)
+        assert res.success, res
+        assert res.cameras_done == ["0_0/cam0"]
+        mp4 = ep / "videos" / "0_0" / "cam0.mp4"
+        assert _ffprobe_codec(mp4) == "h264"
+        assert _mp4_frame_count(mp4) == 12
+        info = _read_status(ep)
+        assert info["transcoding_status"] == STATUS_DONE
+        assert info["transcoding_cameras_failed"] == {}
+        assert "transcoding_cameras_done" not in info
+        assert "transcoding_cameras_skipped" not in info
+        assert "transcoding_elapsed_sec" not in info
+        assert "transcoding_updated" not in info
+
+    def test_a7_nested_multiple_segments_and_cameras(self, tmp_path, worker):
+        ep = _make_nested_episode(
+            tmp_path,
+            {
+                "0_0": {"cam_left": (10, 10), "cam_right": (10, 10)},
+                "0_1": {"cam_left": (8, 8), "cam_right": (8, 8)},
+            },
+        )
+        res = worker.submit(ep).result(timeout=120)
+        assert res.success, res
+        expected = ["0_0/cam_left", "0_0/cam_right", "0_1/cam_left", "0_1/cam_right"]
+        assert sorted(res.cameras_done) == expected
+        for camera_id in expected:
+            segment, cam = camera_id.split("/", 1)
+            assert _ffprobe_codec(ep / "videos" / segment / f"{cam}.mp4") == "h264"
+
 
 # ----------------------------------------------------------------------
 # B — Edge cases
@@ -320,6 +419,16 @@ class TestEdgeCases:
         info = _read_status(ep)
         assert info["transcoding_status"] == STATUS_FAILED
 
+    def test_b6_nested_camera_failure_preserves_raw(self, tmp_path, worker):
+        ep = _make_nested_episode(tmp_path, {"0_0": {"cam0": (5, 30)}})
+        res = worker.submit(ep).result(timeout=60)
+        assert not res.success
+        assert "0_0/cam0" in res.cameras_failed
+        assert _ffprobe_codec(ep / "videos" / "0_0" / "cam0.mp4") == "mjpeg"
+        info = _read_status(ep)
+        assert info["transcoding_status"] == STATUS_FAILED
+        assert "0_0/cam0" in info["transcoding_cameras_failed"]
+
 
 # ----------------------------------------------------------------------
 # C — Recovery
@@ -344,16 +453,13 @@ class TestRecovery:
     def test_c2_resume_pending_picks_up_pending(self, tmp_path):
         # Two pending episodes laid out under a fake workspace.
         for ep_idx in (0, 1):
-            (tmp_path / "Task_X" / str(ep_idx) / "videos").mkdir(
-                parents=True, exist_ok=True
-            )
-            _make_mjpeg_mp4(
-                tmp_path / "Task_X" / str(ep_idx) / "videos" / "cam0.mp4", 10,
-            )
-            _make_sidecar(
-                tmp_path / "Task_X" / str(ep_idx) / "videos"
-                / "cam0_timestamps.parquet", 10,
-            )
+            if ep_idx == 0:
+                videos_dir = tmp_path / "Task_X" / str(ep_idx) / "videos"
+            else:
+                videos_dir = tmp_path / "Task_X" / str(ep_idx) / "videos" / "1_0"
+            videos_dir.mkdir(parents=True, exist_ok=True)
+            _make_mjpeg_mp4(videos_dir / "cam0.mp4", 10)
+            _make_sidecar(videos_dir / "cam0_timestamps.parquet", 10)
             (tmp_path / "Task_X" / str(ep_idx) / "episode_info.json").write_text(
                 json.dumps({
                     "transcoding_status": STATUS_PENDING,

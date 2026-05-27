@@ -29,10 +29,7 @@ Output structure:
     ├── episode_info.json   (copied)
     ├── metadata.yaml       (copied)
     ├── robot.urdf          (copied)
-    ├── cam_head_left.mp4   (new - replaces image topic)
-    ├── cam_head_right.mp4
-    ├── cam_wrist_left.mp4
-    ├── cam_wrist_right.mp4
+    ├── <camera_name>.mp4   (camera key from robot_config observation.images)
     └── episode.mcap        (modified - no images, synced camera_info only)
 """
 
@@ -48,6 +45,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
+import yaml
 
 try:
     from mcap.reader import make_reader
@@ -65,6 +63,11 @@ except ImportError:
     deserialize_message = None
     serialize_message = None
     get_message = None
+
+try:
+    from shared.robot_configs import schema as robot_schema
+except ImportError:
+    robot_schema = None
 
 
 @dataclass
@@ -113,29 +116,6 @@ class RosbagToMp4Converter:
     with image topics removed and only matched camera_info retained.
     """
 
-    # Camera topic mapping: (image_topic, camera_info_topic).
-    # ZED + RealSense publish camera_info at the driver-native bare path,
-    # not under the compressed image transport — _read_and_match_cameras
-    # pairs them by header timestamp, so prefix mismatch is fine.
-    DEFAULT_CAMERA_PAIRS = {
-        'cam_head_left': (
-            '/zed/zed_node/left/image_rect_color/compressed',
-            '/zed/zed_node/left/camera_info'
-        ),
-        'cam_head_right': (
-            '/zed/zed_node/right/image_rect_color/compressed',
-            '/zed/zed_node/right/camera_info'
-        ),
-        'cam_wrist_left': (
-            '/camera_left/camera_left/color/image_rect_raw/compressed',
-            '/camera_left/camera_left/color/camera_info'
-        ),
-        'cam_wrist_right': (
-            '/camera_right/camera_right/color/image_rect_raw/compressed',
-            '/camera_right/camera_right/color/camera_info'
-        ),
-    }
-
     # Cameras that need downsampling from source fps to target fps
     # Format: {camera_name: downsample_ratio} (e.g., 2 means keep every 2nd frame)
     DEFAULT_DOWNSAMPLE_CAMERAS = {}
@@ -152,6 +132,32 @@ class RosbagToMp4Converter:
         'target_min_ms': 67.0,            # Smoothed interval min
         'target_max_ms': 68.0,            # Smoothed interval max
     }
+
+    @staticmethod
+    def camera_pairs_from_robot_config(
+        robot_type: str,
+        robot_config_path: Optional[str] = None,
+    ) -> Dict[str, Tuple[str, str]]:
+        """Build camera pairs from robot_config observation image keys."""
+        if robot_schema is None:
+            raise ImportError('shared.robot_configs.schema is required')
+        if not robot_type and robot_config_path:
+            with open(robot_config_path, 'r', encoding='utf-8') as f:
+                raw = yaml.safe_load(f) or {}
+            params = (raw.get('orchestrator') or {}).get('ros__parameters') or {}
+            if params:
+                robot_type = next(iter(params.keys()))
+        section = robot_schema.load_robot_section(
+            robot_type,
+            explicit_path=robot_config_path,
+        )
+        image_topics = robot_schema.get_image_topics(section)
+        camera_info_topics = robot_schema.get_camera_info_topics(section)
+        return {
+            cam_name: (cfg['topic'], camera_info_topics[cam_name])
+            for cam_name, cfg in image_topics.items()
+            if cam_name in camera_info_topics
+        }
 
     def __init__(
         self,
@@ -174,7 +180,7 @@ class RosbagToMp4Converter:
         Args:
             fps: Output video frame rate.
             use_hardware_encoding: Try to use Jetson NVENC if available.
-            camera_pairs: Custom camera topic pairs. If None, uses defaults.
+            camera_pairs: Camera topic pairs from robot_config.
             exclude_topics: List of topic keywords to exclude (e.g., ['head_leader', 'lift_follower']).
             joint_offsets: Dict of joint offsets to apply.
                 Format: {'topic_keyword': {'joint_name': offset_rad}}
@@ -202,7 +208,7 @@ class RosbagToMp4Converter:
         self.enable_timestamp_smoothing = enable_timestamp_smoothing
         self.trim_start_sec = trim_start_sec
         self.trim_end_sec = trim_end_sec
-        self.camera_pairs = camera_pairs or self.DEFAULT_CAMERA_PAIRS
+        self.camera_pairs = dict(camera_pairs or {})
         self.exclude_topics = exclude_topics or []
         self.joint_offsets = joint_offsets or {}
         self.downsample_cameras = downsample_cameras if downsample_cameras is not None else self.DEFAULT_DOWNSAMPLE_CAMERAS
@@ -235,8 +241,10 @@ class RosbagToMp4Converter:
 
         for encoder in encoders_to_try:
             try:
+                from .video_sync import _ffmpeg
+
                 result = subprocess.run(
-                    ['ffmpeg', '-hide_banner', '-encoders'],
+                    [_ffmpeg(), '-hide_banner', '-encoders'],
                     capture_output=True,
                     text=True,
                     timeout=5
@@ -268,6 +276,18 @@ class RosbagToMp4Converter:
         input_path = Path(input_path)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.camera_pairs:
+            return {
+                "": ConversionResult(
+                    success=False,
+                    message=(
+                        "No camera_pairs configured. Build camera pairs from "
+                        "robot_config observation.images before converting "
+                        "images-in-MCAP recordings."
+                    ),
+                )
+            }
 
         # Find MCAP file
         mcap_file = self._find_mcap_file(input_path)
@@ -1209,9 +1229,9 @@ class RosbagToMp4Converter:
         camera_name: str = '',
     ) -> bool:
         """Try to encode video with specified encoder."""
-        from .video_sync import _ffmpeg_threads_arg
+        from .video_sync import _ffmpeg, _ffmpeg_threads_arg
         cmd = [
-            'ffmpeg',
+            _ffmpeg(),
             '-y',
             *_ffmpeg_threads_arg(),
             '-f', 'rawvideo',
@@ -1396,12 +1416,22 @@ def convert_dataset(
     exclude_topics: Optional[List[str]] = None,
     joint_offsets: Optional[Dict[str, Dict[str, float]]] = None,
     enable_timestamp_smoothing: bool = True,
-    downsample_cameras: Optional[Dict[str, int]] = None
+    downsample_cameras: Optional[Dict[str, int]] = None,
+    robot_type: str = '',
+    robot_config_path: Optional[str] = None,
 ) -> Dict[str, Dict[str, ConversionResult]]:
     """Convert all episodes in a dataset to MP4 format."""
+    camera_pairs = (
+        RosbagToMp4Converter.camera_pairs_from_robot_config(
+            robot_type,
+            robot_config_path,
+        )
+        if robot_type or robot_config_path else {}
+    )
     converter = RosbagToMp4Converter(
         fps=fps,
         use_hardware_encoding=use_hardware_encoding,
+        camera_pairs=camera_pairs,
         exclude_topics=exclude_topics,
         joint_offsets=joint_offsets,
         enable_timestamp_smoothing=enable_timestamp_smoothing,
@@ -1506,6 +1536,16 @@ def main():
              'By default, frame timestamps are adjusted to keep intervals '
              'within 67-68ms range (68ms threshold).'
     )
+    parser.add_argument(
+        '--robot-type',
+        default='',
+        help='Robot type used to load shared robot_config camera names/topics.',
+    )
+    parser.add_argument(
+        '--robot-config',
+        default='',
+        help='Explicit robot_config YAML path.',
+    )
 
     args = parser.parse_args()
 
@@ -1533,12 +1573,22 @@ def main():
             exclude_topics=exclude_topics,
             joint_offsets=joint_offsets,
             enable_timestamp_smoothing=enable_smoothing,
-            downsample_cameras=None  # Use default downsampling config
+            downsample_cameras=None,  # Use default downsampling config
+            robot_type=args.robot_type,
+            robot_config_path=args.robot_config or None,
         )
     else:
+        camera_pairs = (
+            RosbagToMp4Converter.camera_pairs_from_robot_config(
+                args.robot_type,
+                args.robot_config or None,
+            )
+            if args.robot_type or args.robot_config else {}
+        )
         converter = RosbagToMp4Converter(
             fps=args.fps,
             use_hardware_encoding=not args.no_hw,
+            camera_pairs=camera_pairs,
             exclude_topics=exclude_topics,
             joint_offsets=joint_offsets,
             enable_timestamp_smoothing=enable_smoothing,

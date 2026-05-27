@@ -67,6 +67,7 @@ from cyclo_data.converter.to_lerobot_v21 import (
 if "pandas" not in sys.modules:
     pandas_stub = types.ModuleType("pandas")
     pandas_stub.DataFrame = MagicMock
+    pandas_stub.__version__ = "0.0.0"
     sys.modules["pandas"] = pandas_stub
 
 from cyclo_data.converter.to_lerobot_v30 import (
@@ -119,6 +120,8 @@ class TestEpisodeData(unittest.TestCase):
         self.assertEqual(episode.video_files, {})
         self.assertEqual(episode.tasks, [])
         self.assertEqual(episode.length, 0)
+        self.assertEqual(episode.recording_mode, "single")
+        self.assertEqual(episode.subtask_instructions, [])
 
     def test_with_data(self):
         episode = EpisodeData(
@@ -142,6 +145,133 @@ class TestEpisodeData(unittest.TestCase):
         self.assertEqual(episode.length, 3)
 
 
+class TestSubtaskStitching(unittest.TestCase):
+    """Tests for recording-time subtask episodes stitched at conversion time."""
+
+    def _make_subtask_episode(self, raw_idx, full_idx, sub_idx, total, values):
+        return EpisodeData(
+            episode_index=raw_idx,
+            timestamps=[0.0, 0.1],
+            observation_state=[
+                np.array([values[0]], dtype=np.float32),
+                np.array([values[1]], dtype=np.float32),
+            ],
+            action=[
+                np.array([values[0] + 10], dtype=np.float32),
+                np.array([values[1] + 10], dtype=np.float32),
+            ],
+            tasks=["main task"],
+            length=2,
+            recording_mode="subtask",
+            full_episode_index=full_idx,
+            subtask_index=sub_idx,
+            subtask_total=total,
+            subtask_instruction=f"subtask {sub_idx}",
+        )
+
+    def test_complete_subtasks_stitch_into_one_episode(self):
+        converter = RosbagToLerobotConverter(
+            ConversionConfig(repo_id="test", output_dir=Path("/tmp/out"), fps=10)
+        )
+        episodes = [
+            self._make_subtask_episode(0, 0, 0, 3, [1, 2]),
+            self._make_subtask_episode(1, 0, 1, 3, [3, 4]),
+            self._make_subtask_episode(2, 0, 2, 3, [5, 6]),
+        ]
+
+        stitched = converter.prepare_episodes_for_writing(episodes)
+
+        self.assertEqual(len(stitched), 1)
+        self.assertEqual(stitched[0].episode_index, 0)
+        self.assertEqual(stitched[0].recording_mode, "stitched_subtask")
+        self.assertEqual(stitched[0].tasks, ["main task"])
+        self.assertEqual(stitched[0].subtask_instructions, [
+            "subtask 0", "subtask 1", "subtask 2",
+        ])
+        self.assertEqual(stitched[0].length, 6)
+        self.assertEqual([round(t, 3) for t in stitched[0].timestamps], [
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5,
+        ])
+        self.assertEqual(
+            [float(state[0]) for state in stitched[0].observation_state],
+            [1, 2, 3, 4, 5, 6],
+        )
+
+    def test_incomplete_subtask_group_is_skipped(self):
+        converter = RosbagToLerobotConverter(
+            ConversionConfig(repo_id="test", output_dir=Path("/tmp/out"), fps=10)
+        )
+        episodes = [
+            self._make_subtask_episode(0, 0, 0, 3, [1, 2]),
+            self._make_subtask_episode(1, 0, 2, 3, [5, 6]),
+        ]
+
+        stitched = converter.prepare_episodes_for_writing(episodes)
+
+        self.assertEqual(stitched, [])
+
+    def test_mixed_single_and_subtask_counts_are_rejected(self):
+        converter = RosbagToLerobotConverter(
+            ConversionConfig(repo_id="test", output_dir=Path("/tmp/out"), fps=10)
+        )
+        single = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0],
+            observation_state=[np.array([1.0], dtype=np.float32)],
+            action=[np.array([2.0], dtype=np.float32)],
+            tasks=["main task"],
+            length=1,
+        )
+        subtask = EpisodeData(
+            episode_index=1,
+            timestamps=[0.0],
+            observation_state=[np.array([3.0], dtype=np.float32)],
+            action=[np.array([4.0], dtype=np.float32)],
+            tasks=["main task"],
+            length=1,
+            subtask_segments=[
+                {
+                    "subtask_index": 0,
+                    "sub_task_instruction": "subtask",
+                    "frame_duration": [0.0, 0.1],
+                }
+            ],
+        )
+
+        prepared = converter.prepare_episodes_for_writing([single, subtask])
+
+        self.assertEqual(prepared, [])
+
+    def test_matching_single_segment_counts_are_allowed(self):
+        converter = RosbagToLerobotConverter(
+            ConversionConfig(repo_id="test", output_dir=Path("/tmp/out"), fps=10)
+        )
+        episodes = [
+            EpisodeData(
+                episode_index=idx,
+                timestamps=[0.0],
+                observation_state=[np.array([float(idx)], dtype=np.float32)],
+                action=[np.array([float(idx)], dtype=np.float32)],
+                tasks=["main task"],
+                length=1,
+                subtask_segments=[
+                    {
+                        "subtask_index": 0,
+                        "sub_task_instruction": "main task",
+                        "frame_duration": [0.0, 0.1],
+                    }
+                ],
+                subtask_indices=[0],
+            )
+            for idx in range(2)
+        ]
+
+        prepared = converter.prepare_episodes_for_writing(episodes)
+
+        self.assertEqual(len(prepared), 2)
+        self.assertEqual([ep.episode_index for ep in prepared], [0, 1])
+
+
 class TestRosbagToLerobotConverter(unittest.TestCase):
     """Tests for RosbagToLerobotConverter class."""
 
@@ -157,6 +287,38 @@ class TestRosbagToLerobotConverter(unittest.TestCase):
         self.assertEqual(self.converter.config.repo_id, "test/dataset")
         self.assertEqual(self.converter._total_episodes, 0)
         self.assertEqual(self.converter._total_frames, 0)
+
+    def test_single_segment_archive_is_detected(self):
+        episode_dir = Path(self.temp_dir) / "0"
+        episode_dir.mkdir()
+        (episode_dir / "0_0.mcap").touch()
+        episode_info = {
+            "segments": [
+                {
+                    "sub_task_instruction": "main task",
+                    "frame_duration": [0.0, 1.0],
+                }
+            ]
+        }
+
+        self.assertTrue(
+            self.converter._is_archived_segment_episode(
+                episode_dir,
+                episode_info,
+            )
+        )
+
+    def test_empty_segments_remain_legacy(self):
+        episode_dir = Path(self.temp_dir) / "0"
+        episode_dir.mkdir(exist_ok=True)
+        (episode_dir / "episode.mcap").touch()
+
+        self.assertFalse(
+            self.converter._is_archived_segment_episode(
+                episode_dir,
+                {"segments": []},
+            )
+        )
 
     def test_get_topic_group_key_basic(self):
         result = self.converter._get_topic_group_key(
@@ -215,6 +377,85 @@ class TestRosbagToLerobotConverter(unittest.TestCase):
         self.assertIn("action", self.converter._features)
         self.assertEqual(self.converter._features["observation.state"]["shape"], (3,))
         self.assertEqual(self.converter._features["action"]["shape"], (3,))
+
+    def test_v21_video_feature_key_uses_rgb_prefix(self):
+        self.assertEqual(
+            self.converter._video_feature_key("cam_left_head"),
+            "observation.images.rgb.cam_left_head",
+        )
+
+    def test_v21_parquet_omits_frame_index(self):
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0, 1.0 / 15.0],
+            observation_state=[
+                np.array([1.0, 2.0], dtype=np.float32),
+                np.array([3.0, 4.0], dtype=np.float32),
+            ],
+            action=[
+                np.array([0.1, 0.2], dtype=np.float32),
+                np.array([0.3, 0.4], dtype=np.float32),
+            ],
+            tasks=["task"],
+            length=2,
+            subtask_indices=[0, 0],
+        )
+        self.converter._features = {
+            "subtask_index": {"dtype": "int64", "shape": (1,), "names": None},
+        }
+        self.converter._task_to_index = {"task": 0}
+        parquet_path = Path(self.temp_dir) / "episode.parquet"
+
+        self.converter._write_parquet(episode, parquet_path)
+
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(parquet_path)
+        self.assertEqual(
+            table.column_names,
+            [
+                "index",
+                "episode_index",
+                "task_index",
+                "timestamp",
+                "action",
+                "observation.state",
+                "subtask_index",
+            ],
+        )
+        self.assertNotIn("frame_index", table.column_names)
+        self.assertEqual(str(table.schema.field("timestamp").type), "double")
+
+    def test_v21_subtask_annotations_are_frame_based(self):
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0, 1.0 / 15.0, 2.0 / 15.0],
+            tasks=["main task"],
+            length=3,
+            subtask_segments=[
+                {
+                    "subtask_index": 0,
+                    "sub_task_instruction": "main task",
+                    "frame_duration": [0.0, 3.0 / 15.0],
+                }
+            ],
+            subtask_indices=[0, 0, 0],
+        )
+
+        self.converter._write_subtask_annotations(Path(self.temp_dir), [episode])
+
+        annotation_path = (
+            Path(self.temp_dir)
+            / "annotations/task-0000/episode_00000000.json"
+        )
+        with open(annotation_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        self.assertEqual(payload["meta_data"]["task_duration"], 3)
+        self.assertEqual(payload["meta_data"]["valid_duration"], [0, 3])
+        self.assertEqual(
+            payload["sub_task_annotation"][0]["frame_duration"],
+            [0, 3],
+        )
 
     def test_compute_episode_stats(self):
         episode = EpisodeData(
@@ -432,8 +673,15 @@ class TestInfoJsonGeneration(unittest.TestCase):
     def test_write_info_json(self):
         self.converter._features = {
             "timestamp": {"dtype": "float32", "shape": (1,), "names": None},
+            "frame_index": {"dtype": "int64", "shape": (1,), "names": None},
             "observation.state": {"dtype": "float32", "shape": (6,), "names": None},
             "action": {"dtype": "float32", "shape": (6,), "names": None},
+            "observation.images.rgb.cam_left_head": {
+                "dtype": "video",
+                "shape": (3, 720, 1280),
+                "names": ["channels", "height", "width"],
+                "info": {"video.fps": 30.0},
+            },
         }
         self.converter._tasks = {0: "test_task"}
         self.converter._total_episodes = 5
@@ -455,6 +703,89 @@ class TestInfoJsonGeneration(unittest.TestCase):
         self.assertEqual(info["total_episodes"], 5)
         self.assertEqual(info["total_frames"], 500)
         self.assertIn("features", info)
+        self.assertEqual(info["chunks_size"], 10000)
+        self.assertEqual(
+            info["data_path"],
+            "data/task-{episode_chunk:04d}/episode_{episode_index:08d}.parquet",
+        )
+        self.assertEqual(
+            info["video_path"],
+            "videos/task-{episode_chunk:04d}/{video_key}/episode_{episode_index:08d}.mp4",
+        )
+        self.assertNotIn("frame_index", info["features"])
+        self.assertEqual(info["features"]["timestamp"]["dtype"], "float64")
+
+    def test_write_root_info_json_uses_robot_config_rotations(self):
+        self.converter.config.selected_cameras = [
+            "cam_left_head",
+            "cam_left_wrist",
+        ]
+        self.converter.config.camera_rotations = {
+            "cam_left_head": 0,
+            "cam_left_wrist": 0,
+        }
+        self.converter._camera_rotations = {
+            "cam_left_head": 0,
+            "cam_left_wrist": 270,
+        }
+        self.converter.config.source_rosbags = ["Task_X_MCAP"]
+        self.converter.config.state_topics = ["/joint_states", "/odom"]
+        self.converter.config.action_topics = [
+            "/leader/joint_trajectory_command_broadcaster_left/joint_trajectory",
+            "/cmd_vel",
+        ]
+        self.converter._state_topic_key_map = {
+            "/joint_states": "follower_upper_body",
+            "/odom": "follower_mobile",
+        }
+        self.converter._action_topic_key_map = {
+            "/leader/joint_trajectory_command_broadcaster_left/joint_trajectory":
+                "leader_arm_left",
+            "/cmd_vel": "leader_mobile",
+        }
+        self.converter._tasks = {0: "wipe table"}
+
+        self.converter._write_root_info_json()
+
+        info_path = Path(self.temp_dir) / "info.json"
+        self.assertTrue(info_path.exists())
+        with open(info_path) as f:
+            info = json.load(f)
+
+        self.assertEqual(info["source_rosbags"], ["Task_X_MCAP"])
+        config = info["conversion_config"]
+        self.assertEqual(
+            list(config.keys()),
+            [
+                "robot_type",
+                "task_name",
+                "fps",
+                "camera_rotations",
+                "selected_end_effector_topics",
+                "selected_cameras",
+                "output_dataset_name",
+                "image_resize",
+                "selected_joint_state_topics",
+                "primitive_instructions",
+                "selected_action_topics",
+            ],
+        )
+        self.assertEqual(
+            config["camera_rotations"],
+            {"cam_left_wrist": 270},
+        )
+        self.assertEqual(config["task_name"], "wipe table")
+        self.assertEqual(
+            config["selected_joint_state_topics"],
+            ["upper_body", "mobile"],
+        )
+        self.assertEqual(
+            config["selected_action_topics"],
+            ["arm_left", "mobile"],
+        )
+        self.assertEqual(config["selected_end_effector_topics"], [])
+        self.assertEqual(config["primitive_instructions"], [])
+        self.assertNotIn("selected_joints", config)
 
 
 class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
@@ -477,6 +808,12 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
         self.input_a.touch()
         self.input_b.touch()
 
+    def test_v30_video_feature_key_uses_rgb_prefix(self):
+        self.assertEqual(
+            self.converter._video_feature_key("cam_left_head"),
+            "observation.images.rgb.cam_left_head",
+        )
+
     @patch("cyclo_data.converter.to_lerobot_v30.subprocess.run")
     def test_concatenate_videos_uses_cfr_reencode(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
@@ -485,7 +822,7 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
 
         self.converter._concatenate_videos(
             Path(self.temp_dir),
-            "observation.images.cam_wrist_right",
+            "observation.images.rgb.cam_right_wrist",
             0,
             0,
             [(0, self.input_a, 0.0), (1, self.input_b, 0.0)],
@@ -507,7 +844,7 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
 
         self.converter._concatenate_videos(
             Path(self.temp_dir),
-            "observation.images.cam_head_left",
+            "observation.images.rgb.cam_left_head",
             0,
             0,
             [(0, self.input_a, 0.0)],
@@ -524,7 +861,7 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "bad concat"):
             self.converter._concatenate_videos(
                 Path(self.temp_dir),
-                "observation.images.cam_head_left",
+                "observation.images.rgb.cam_left_head",
                 0,
                 0,
                 [(0, self.input_a, 0.0)],
@@ -555,7 +892,7 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
 
         self.converter._concatenate_videos(
             Path(self.temp_dir),
-            "observation.images.cam_head_left",
+            "observation.images.rgb.cam_left_head",
             0,
             0,
             [(0, video_a, 2 / 15), (1, video_b, 3 / 15)],
@@ -563,7 +900,7 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
 
         output = (
             Path(self.temp_dir)
-            / "videos/observation.images.cam_head_left/chunk-000/file-000.mp4"
+            / "videos/observation.images.rgb.cam_left_head/chunk-000/file-000.mp4"
         )
         self.assertEqual(self.converter._get_video_frame_count(output), 5)
         self.assertAlmostEqual(self.converter._probe_video_fps(output), 15.0, places=2)

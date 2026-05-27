@@ -109,8 +109,8 @@ class FFmpegEncoder(VideoEncoder):
         # Directly construct FFmpeg command. Thread cap honours
         # CYCLO_FFMPEG_THREADS (default 2) so a parallel-worker
         # conversion doesn't oversubscribe the host CPUs.
-        from cyclo_data.converter.video_sync import _ffmpeg_threads_arg
-        cmd = ['ffmpeg']
+        from cyclo_data.converter.video_sync import _ffmpeg, _ffmpeg_threads_arg
+        cmd = [_ffmpeg()]
         cmd.extend(_ffmpeg_threads_arg())
         cmd.extend(['-f', 'rawvideo'])
         cmd.extend(['-vcodec', 'rawvideo'])

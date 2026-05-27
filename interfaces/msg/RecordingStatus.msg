@@ -14,6 +14,10 @@ uint16 proceed_time             # [s]
 uint16 current_episode_number
 uint16 current_scenario_number
 string current_task_instruction
+uint16 current_subtask_index
+uint16 subtask_count
+string current_subtask_instruction
+string[] subtask_instructions
 float32 encoding_progress       # [%]
 float32 used_storage_size       # [GB]
 float32 total_storage_size      # [GB]

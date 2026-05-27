@@ -60,6 +60,13 @@ _COMMAND_NAMES = {
     RecordingCommand.Request.SKIP_TASK: 'SKIP_TASK',
     RecordingCommand.Request.CANCEL: 'CANCEL',
     RecordingCommand.Request.REFRESH_TOPICS: 'REFRESH_TOPICS',
+    RecordingCommand.Request.START_SEGMENT: 'START_SEGMENT',
+    RecordingCommand.Request.STOP_SEGMENT: 'STOP_SEGMENT',
+    RecordingCommand.Request.DISCARD_SEGMENT: 'DISCARD_SEGMENT',
+    RecordingCommand.Request.FINISH_EPISODE: 'FINISH_EPISODE',
+    RecordingCommand.Request.DISCARD_EPISODE: 'DISCARD_EPISODE',
+    RecordingCommand.Request.SET_TASK_INFO: 'SET_TASK_INFO',
+    RecordingCommand.Request.CANCEL_SEGMENT: 'CANCEL_SEGMENT',
 }
 
 
@@ -113,6 +120,8 @@ class RecordingService:
         # _session_lock just brackets the pointer reads/writes — DataManager
         # has its own internal _state_lock so we never need to nest locks.
         self._session_lock = threading.Lock()
+        self._finish_episode_lock = threading.Lock()
+        self._finish_episode_thread: Optional[threading.Thread] = None
 
         # Idle-state metrics: filled into the 5 Hz status publish before any
         # session_manager exists so the UI's CPU/RAM/Storage panel keeps
@@ -188,6 +197,66 @@ class RecordingService:
                     f'TranscodeWorker.shutdown failed: {exc}')
             self._transcoder = None
         self._rosbag.shutdown()
+
+    # ------------------------------------------------------------------
+    # Background episode archive
+    # ------------------------------------------------------------------
+
+    def _finish_episode_in_progress(self) -> bool:
+        with self._finish_episode_lock:
+            thread = self._finish_episode_thread
+            return thread is not None and thread.is_alive()
+
+    def _start_finish_episode_thread(self, data_manager: DataManager) -> bool:
+        with self._finish_episode_lock:
+            thread = self._finish_episode_thread
+            if thread is not None and thread.is_alive():
+                return False
+            thread = threading.Thread(
+                target=self._finish_episode_worker,
+                args=(data_manager,),
+                name='cyclo_finish_episode',
+                daemon=True,
+            )
+            self._finish_episode_thread = thread
+            thread.start()
+            return True
+
+    def _finish_episode_worker(self, data_manager: DataManager) -> None:
+        self._publish_umbrella_status(
+            DataOperationStatus.RUNNING,
+            'FINISH_EPISODE',
+            'Episode archive started',
+        )
+        try:
+            archived_dir = data_manager.finish_full_episode()
+            if archived_dir is not None:
+                archived_dir = Path(archived_dir)
+                info = DataManager._read_episode_info(archived_dir)
+                status = info.get('transcoding_status')
+                if (
+                    status == 'pending'
+                    or (status is None and (archived_dir / 'videos').exists())
+                ):
+                    self._submit_transcode(archived_dir)
+        except Exception as exc:  # noqa: BLE001
+            self._node.get_logger().error(
+                f'FINISH_EPISODE archive failed: {exc!r}')
+            self._publish_umbrella_status(
+                DataOperationStatus.FAILED,
+                'FINISH_EPISODE',
+                f'Episode finish failed: {exc}',
+            )
+        else:
+            self._publish_umbrella_status(
+                DataOperationStatus.COMPLETED,
+                'FINISH_EPISODE',
+                'Episode archived',
+            )
+        finally:
+            with self._finish_episode_lock:
+                if self._finish_episode_thread is threading.current_thread():
+                    self._finish_episode_thread = None
 
     # ------------------------------------------------------------------
     # DataManager management
@@ -294,11 +363,21 @@ class RecordingService:
         try:
             if cmd == Req.REFRESH_TOPICS:
                 return self._do_refresh_topics(request, response)
-            if cmd == Req.START:
+            if cmd == Req.SET_TASK_INFO:
+                return self._do_set_task_info(request, response)
+            if cmd in (Req.START, Req.START_SEGMENT):
                 return self._do_start(request, response)
-            if cmd in (Req.STOP, Req.FINISH, Req.MOVE_TO_NEXT):
+            if cmd in (Req.STOP, Req.FINISH, Req.MOVE_TO_NEXT, Req.STOP_SEGMENT):
                 return self._do_stop_and_save(
                     request, response, command_name, event='finish')
+            if cmd == Req.CANCEL_SEGMENT:
+                return self._do_cancel(request, response)
+            if cmd == Req.DISCARD_SEGMENT:
+                return self._do_discard_saved_segment(request, response)
+            if cmd == Req.FINISH_EPISODE:
+                return self._do_finish_episode(request, response)
+            if cmd == Req.DISCARD_EPISODE:
+                return self._do_discard_episode(request, response)
             if cmd == Req.RERECORD:
                 return self._do_cancel_with_review(
                     request, response, event='cancel')
@@ -458,6 +537,10 @@ class RecordingService:
         return image_topics, camera_info_topics, rotations
 
     def _do_start(self, request, response):
+        if self._finish_episode_in_progress():
+            response.success = False
+            response.message = 'START blocked: episode archive still running'
+            return response
         if not request.robot_type:
             response.success = False
             response.message = 'START requires robot_type'
@@ -466,8 +549,9 @@ class RecordingService:
             response.success = False
             response.message = 'rosbag_recorder service unavailable'
             return response
-
         dm = self._ensure_data_manager(request.task_info, request.robot_type)
+        if request.command == RecordingCommand.Request.START_SEGMENT:
+            dm.set_current_subtask_index(int(request.segment_index))
 
         # rosbag_recorder is normally prepared at REFRESH_TOPICS time
         # (= robot_type selection) — _prepare_rosbag_topics short-circuits
@@ -521,6 +605,16 @@ class RecordingService:
 
         response.success = True
         response.message = 'Recording started'
+        return response
+
+    def _do_set_task_info(self, request, response):
+        if not request.robot_type:
+            response.success = True
+            response.message = 'task_info cached upstream; robot_type not set yet'
+            return response
+        self._ensure_data_manager(request.task_info, request.robot_type)
+        response.success = True
+        response.message = 'task_info cached'
         return response
 
     def _ensure_transcoder(self) -> TranscodeWorker:
@@ -644,15 +738,33 @@ class RecordingService:
                 video_stats=self._last_video_stats,
                 camera_info_files=self._last_camera_info_files,
                 camera_rotations=self._last_camera_rotations,
+                image_topics=self._last_image_topics,
+                camera_info_topics=self._last_camera_info_topics,
             )
 
-        # Fire the H.264 transcode in the background. The episode dir is
-        # captured before stop_recording() bumps the episode counter so
-        # we hand off the right path.
-        if episode_dir.exists() and (episode_dir / 'videos').exists():
+        is_segmented_storage = bool(
+            getattr(self._data_manager, '_segmented_storage_mode', False)
+        )
+        finishes_full_episode = command_name not in (
+            'MOVE_TO_NEXT', 'STOP_SEGMENT',
+        )
+
+        # Fire the H.264 transcode in the background for normal episodes.
+        # Segmented recordings are archived into their full-episode folder
+        # on FINISH_EPISODE/FINISH, so per-segment video transcodes would
+        # race with that archival cleanup.
+        if (not is_segmented_storage
+                and episode_dir.exists()
+                and (episode_dir / 'videos').exists()):
             self._submit_transcode(episode_dir)
 
-        self._data_manager.stop_recording()
+        self._data_manager.stop_recording(
+            finish_full_episode=(
+                finishes_full_episode and not is_segmented_storage
+            )
+        )
+        if is_segmented_storage and finishes_full_episode:
+            self._start_finish_episode_thread(self._data_manager)
         self._rosbag.publish_action_event(event)
 
         self._publish_umbrella_status(
@@ -665,7 +777,85 @@ class RecordingService:
             'STOP': 'Recording stopped and saved',
             'FINISH': 'Recording finished and saved',
             'MOVE_TO_NEXT': 'Episode saved',
+            'STOP_SEGMENT': 'Subtask saved',
         }.get(command_name, f'{command_name} completed')
+        return response
+
+    def _do_discard_saved_segment(self, request, response):
+        if self._data_manager is None:
+            response.success = False
+            response.message = 'DISCARD_SEGMENT: no DataManager yet'
+            return response
+        if self._finish_episode_in_progress():
+            response.success = False
+            response.message = (
+                'DISCARD_SEGMENT: episode archive still running'
+            )
+            return response
+        if self._data_manager.is_recording():
+            response.success = False
+            response.message = 'DISCARD_SEGMENT: stop/cancel active recording first'
+            return response
+        segment_index = int(request.segment_index)
+        deleted = self._data_manager.discard_saved_subtask(segment_index)
+        response.success = True
+        response.message = (
+            f'Subtask {segment_index + 1} discarded'
+            if deleted else 'No saved subtask found to discard'
+        )
+        self._publish_umbrella_status(
+            DataOperationStatus.CANCELLED, 'DISCARD_SEGMENT',
+            response.message)
+        return response
+
+    def _do_finish_episode(self, request, response):
+        if self._data_manager is None:
+            response.success = False
+            response.message = 'FINISH_EPISODE: no DataManager yet'
+            return response
+        if self._data_manager.is_recording():
+            response.success = False
+            response.message = 'FINISH_EPISODE: save active subtask first'
+            return response
+        if not self._start_finish_episode_thread(self._data_manager):
+            response.success = True
+            response.message = 'Episode finish already in progress'
+            return response
+        response.success = True
+        response.message = 'Episode finish started'
+        return response
+
+    def _do_discard_episode(self, request, response):
+        if self._data_manager is None:
+            response.success = False
+            response.message = 'DISCARD_EPISODE: no DataManager yet'
+            return response
+        if self._finish_episode_in_progress():
+            response.success = False
+            response.message = 'DISCARD_EPISODE: episode archive still running'
+            return response
+        if self._data_manager.is_recording():
+            response = self._do_discard(request, response, event='cancel')
+            if not response.success:
+                return response
+            deleted = self._data_manager.discard_current_full_episode()
+            response.message = (
+                f'Episode discarded ({deleted} saved subtask(s) removed)'
+                if deleted else 'Episode discarded'
+            )
+            self._publish_umbrella_status(
+                DataOperationStatus.CANCELLED, 'DISCARD_EPISODE',
+                response.message)
+            return response
+        deleted = self._data_manager.discard_current_full_episode()
+        response.success = True
+        response.message = (
+            f'Episode discarded ({deleted} saved subtask(s) removed)'
+            if deleted else 'No saved subtasks found to discard'
+        )
+        self._publish_umbrella_status(
+            DataOperationStatus.CANCELLED, 'DISCARD_EPISODE',
+            response.message)
         return response
 
     def _do_cancel_with_review(self, request, response, event: str):
@@ -692,6 +882,8 @@ class RecordingService:
                 video_stats=self._last_video_stats,
                 camera_info_files=self._last_camera_info_files,
                 camera_rotations=self._last_camera_rotations,
+                image_topics=self._last_image_topics,
+                camera_info_topics=self._last_camera_info_topics,
             )
 
         self._data_manager.stop_recording()

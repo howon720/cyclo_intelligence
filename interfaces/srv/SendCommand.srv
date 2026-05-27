@@ -30,9 +30,17 @@ uint8 UPDATE_INSTRUCTION = 16
 # — without this, the joystick handler refuses the first press because
 # _last_ui_task_info is None.
 uint8 PREPARE_SESSION = 17
+uint8 START_SEGMENT = 18
+uint8 STOP_SEGMENT = 19
+uint8 DISCARD_SEGMENT = 20
+uint8 FINISH_EPISODE = 21
+uint8 DISCARD_EPISODE = 22
+uint8 SET_TASK_INFO = 23
+uint8 CANCEL_SEGMENT = 24
 
 uint8 command
 TaskInfo task_info
+uint16 segment_index
 
 # Conversion-only knobs. Only meaningful when command == CONVERT_MP4
 # and ignored otherwise. Lives here (not on TaskInfo) because it's a

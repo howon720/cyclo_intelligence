@@ -36,47 +36,19 @@ class VideoMetadataExtractor:
 
     def extract_camera_name_from_topic(self, topic: str) -> str:
         """
-        Extract a meaningful camera name from a topic path.
+        Extract a camera name only when the topic embeds one explicitly.
 
-        Examples (current ZED-stereo + RealSense convention):
-            /zed/zed_node/left/image_rect_color/compressed         -> cam_head_left
-            /zed/zed_node/right/image_rect_color/compressed        -> cam_head_right
-            /camera_left/camera_left/color/image_rect_raw/...      -> cam_wrist_left
-            /camera_right/camera_right/color/image_rect_raw/...    -> cam_wrist_right
-
-        Legacy datasets that recorded `/robot/camera/<cam_name>/...` keep
-        their original camera name via the embedded-name fallback below.
+        Robot-specific topic layouts such as ZED or RealSense are not
+        interpreted here. The canonical camera name comes from the robot
+        config's ``observation.images`` key and should be supplied through
+        ``camera_name_map`` in ``build_video_info``. This fallback exists for
+        generic paths such as ``/robot/camera/<cam_name>/...`` and for direct
+        video filenames.
         """
-        topic_lower = topic.lower()
-
-        # ZED stereo head — split into left/right.
-        if "zed" in topic_lower:
-            if "/right/" in topic_lower or "_right" in topic_lower:
-                return "cam_head_right"
-            return "cam_head_left"
-
-        # RealSense wrists.
-        if "camera_left" in topic_lower:
-            return "cam_wrist_left"
-        if "camera_right" in topic_lower:
-            return "cam_wrist_right"
-
-        # Legacy `/robot/camera/<cam_name>/...` pattern — preserve the
-        # embedded camera name verbatim so old datasets keep working.
         parts = topic.strip("/").split("/")
         for i, part in enumerate(parts):
             if part == "camera" and i + 1 < len(parts):
                 return parts[i + 1]
-
-        # Generic head/wrist hint fallback.
-        if "head" in topic_lower:
-            if "right" in topic_lower:
-                return "cam_head_right"
-            return "cam_head_left"
-        if "wrist" in topic_lower:
-            if "right" in topic_lower:
-                return "cam_wrist_right"
-            return "cam_wrist_left"
 
         parts = [
             p
@@ -123,7 +95,7 @@ class VideoMetadataExtractor:
             bag_path: Path to the ROSbag directory
 
         Returns:
-            List of relative video file paths (e.g., 'videos/cam_head.mp4')
+            List of relative video file paths (e.g., 'videos/cam_left_head.mp4')
         """
         videos_dir = Path(bag_path) / "videos"
         if not videos_dir.exists():

@@ -360,6 +360,7 @@ export default function RobotViewer3D({
   showGrid = true,
   className = '',
   showSourceSelector = false,
+  liveUpdateHz = 15,
 }) {
   const robotType = useSelector((state) => state.tasks.robotType);
   const { getRobotInfo } = useRosServiceCaller();
@@ -398,6 +399,7 @@ export default function RobotViewer3D({
   const [visualizationSource, setVisualizationSource] = useState('state');
   const [trajectoryPaths, setTrajectoryPaths] = useState(null);
   const [hasTrajectory, setHasTrajectory] = useState(false);
+  const actionPreviewEnabled = showSourceSelector && visualizationSource === 'action';
 
   const handleJointState = useCallback((data) => {
     setJointValues(data);
@@ -413,11 +415,22 @@ export default function RobotViewer3D({
     }
   }, [computeTrajectoryPaths]);
 
+  useEffect(() => {
+    if (!actionPreviewEnabled) {
+      setTrajectoryPaths(null);
+      setHasTrajectory(false);
+    }
+  }, [actionPreviewEnabled]);
+
   useJointStateSubscription(
     handleJointState,
     handleActionChunk,
     mode === 'live' && !!robot,
-    { visualizationSource },
+    {
+      visualizationSource,
+      liveUpdateHz,
+      enableActionPreview: showSourceSelector,
+    },
   );
 
   const handlePreset = useCallback((presetName) => {

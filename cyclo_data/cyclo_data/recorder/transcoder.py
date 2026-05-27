@@ -52,6 +52,7 @@ import time
 from typing import Callable, Dict, Iterable, Optional
 
 import pyarrow.parquet as pq
+import yaml
 
 
 _FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
@@ -135,6 +136,17 @@ class TranscodeResult:
     cameras_done: list[str]
     cameras_failed: dict[str, str]   # cam -> error message
     error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _CameraJob:
+    camera_id: str
+    camera_name: str
+    videos_dir: Path
+
+
+class _SkipCamera(Exception):
+    """Camera stream is unusable for this episode but should not fail it."""
 
 
 class TranscodeWorker:
@@ -264,10 +276,10 @@ class TranscodeWorker:
         videos_dir = episode_dir / "videos"
         if not videos_dir.exists():
             return
-        for stale in videos_dir.glob("*.h264.tmp"):
+        for stale in videos_dir.rglob("*.h264.tmp"):
             try:
                 stale.unlink()
-                self._log_info(f"transcode: cleaned orphan {stale.name}")
+                self._log_info(f"transcode: cleaned orphan {stale}")
             except OSError:
                 pass
 
@@ -318,14 +330,12 @@ class TranscodeWorker:
         assert self._encoder is not None
         encoder_name, encoder_opts = self._encoder
 
-        # Pull camera_rotations from episode_info.json — the recorder
-        # stored these per camera from the yaml at save_robotis_metadata
-        # time. The values represent the physical sensor orientation
-        # offset (e.g. ``270`` for an upside-down wrist camera) and we
-        # apply ``-vf transpose=N`` to fix it during this single
-        # decode+encode pass instead of pushing the cost downstream.
-        rotations: Dict[str, int] = {}
-        if info_path.exists():
+        # Pull record-time camera rotations from camera_metadata.yaml.
+        # episode_info.json stays focused on task/episode semantics while
+        # camera_info/ owns camera provenance and calibration-adjacent data.
+        rotations = _read_camera_metadata_rotations(episode_dir)
+        if not rotations and info_path.exists():
+            # Legacy fallback for recordings made before camera_metadata.yaml.
             try:
                 with open(info_path) as f:
                     info = json.load(f) or {}
@@ -340,17 +350,9 @@ class TranscodeWorker:
         # (see TranscodeWorker._cleanup_orphan_tmps) so this worker
         # thread can skip the per-job glob.
 
-        # Discover cameras: any <cam>.mp4 that has a paired sidecar.
-        cameras: list[str] = []
-        if videos_dir.exists():
-            for mp4 in sorted(videos_dir.glob("*.mp4")):
-                cam = mp4.stem
-                if cam.endswith("_synced"):
-                    continue  # converter-side derivative, never transcode
-                if (videos_dir / f"{cam}_timestamps.parquet").exists():
-                    cameras.append(cam)
+        camera_jobs = self._discover_camera_jobs(videos_dir)
 
-        if not cameras:
+        if not camera_jobs:
             self._log_info(
                 f"transcode: {episode_dir.name} has no cameras; marking not_required"
             )
@@ -363,30 +365,32 @@ class TranscodeWorker:
         _patch_status(info_path, STATUS_RUNNING, encoder=encoder_name)
 
         done: list[str] = []
+        skipped: dict[str, str] = {}
         failed: dict[str, str] = {}
-        for cam in cameras:
+        for job in camera_jobs:
             try:
                 self._transcode_camera(
-                    cam_name=cam,
-                    videos_dir=videos_dir,
+                    cam_name=job.camera_name,
+                    videos_dir=job.videos_dir,
                     encoder_name=encoder_name,
                     encoder_opts=encoder_opts,
-                    rotation_deg=rotations.get(cam, 0),
+                    rotation_deg=rotations.get(job.camera_name, 0),
                 )
-                done.append(cam)
+                done.append(job.camera_id)
+            except _SkipCamera as exc:
+                self._log_warn(
+                    f"transcode {episode_dir.name}/{job.camera_id}: skipped: {exc}"
+                )
+                skipped[job.camera_id] = str(exc)
             except Exception as exc:
                 self._log_error(
-                    f"transcode {episode_dir.name}/{cam}: {exc!r}"
+                    f"transcode {episode_dir.name}/{job.camera_id}: {exc!r}"
                 )
-                failed[cam] = repr(exc)
+                failed[job.camera_id] = repr(exc)
 
         elapsed = time.time() - t0
         success = len(failed) == 0
         final_status = STATUS_DONE if success else STATUS_FAILED
-        # Record per-camera applied rotations so downstream convert
-        # passes know whether to re-rotate (cf. base_converter +
-        # video_sync). Only cameras with success are listed.
-        applied = {cam: int(rotations.get(cam, 0)) for cam in done}
         _patch_status(
             info_path,
             final_status,
@@ -394,12 +398,37 @@ class TranscodeWorker:
             elapsed_sec=elapsed,
             cameras_done=done,
             cameras_failed=failed,
-            rotations_applied=applied,
+            cameras_skipped=skipped,
         )
         return TranscodeResult(
             episode_dir=episode_dir, success=success, elapsed_sec=elapsed,
             encoder=encoder_name, cameras_done=done, cameras_failed=failed,
         )
+
+    @staticmethod
+    def _discover_camera_jobs(videos_dir: Path) -> list[_CameraJob]:
+        """Find flat and segmented camera MP4s that have timestamp sidecars."""
+        if not videos_dir.exists():
+            return []
+
+        jobs: list[_CameraJob] = []
+
+        for mp4 in sorted(videos_dir.glob("*.mp4")):
+            cam = mp4.stem
+            if cam.endswith("_synced"):
+                continue
+            if (videos_dir / f"{cam}_timestamps.parquet").exists():
+                jobs.append(_CameraJob(cam, cam, videos_dir))
+
+        for mp4 in sorted(videos_dir.glob("*/*.mp4")):
+            cam = mp4.stem
+            if cam.endswith("_synced"):
+                continue
+            segment_dir = mp4.parent
+            if (segment_dir / f"{cam}_timestamps.parquet").exists():
+                jobs.append(_CameraJob(f"{segment_dir.name}/{cam}", cam, segment_dir))
+
+        return jobs
 
     @staticmethod
     def _transpose_filter(rotation_deg: int) -> Optional[str]:
@@ -456,7 +485,17 @@ class TranscodeWorker:
                 f"transcode {cam_name}: sidecar has 0 rows; deleting raw"
             )
             raw_mp4.unlink(missing_ok=True)
-            return
+            sidecar.unlink(missing_ok=True)
+            raise _SkipCamera("sidecar has 0 rows; removed camera files")
+
+        width, height = _mp4_dimensions(raw_mp4)
+        if width < 2 or height < 2:
+            raw_mp4.unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
+            raise _SkipCamera(
+                f"degenerate video dimensions {width}x{height}; "
+                "removed camera files for this episode"
+            )
 
         cmd = [
             _FFMPEG, "-hide_banner", "-loglevel", "warning", "-y",
@@ -481,14 +520,19 @@ class TranscodeWorker:
             "-f", "mp4",
             str(tmp_mp4),
         ]
+        filters = []
         rot_filter = self._transpose_filter(rotation_deg)
         if rot_filter is not None:
+            filters.append(rot_filter)
+        if width % 2 or height % 2:
+            filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+        if filters:
             # Insert the -vf right before the output path so it applies
             # to the encoded stream.
-            cmd = cmd[:-1] + ["-vf", rot_filter, cmd[-1]]
+            cmd = cmd[:-1] + ["-vf", ",".join(filters), cmd[-1]]
             self._log_info(
                 f"transcode {cam_name}: applying rotation_deg={rotation_deg} "
-                f"({rot_filter})"
+                f"({','.join(filters)})"
             )
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
@@ -527,6 +571,33 @@ def _sidecar_row_count(sidecar: Path) -> int:
 _FFPROBE_FRAME_COUNT_TIMEOUT = 30  # seconds
 
 
+def _mp4_dimensions(mp4: Path) -> tuple[int, int]:
+    try:
+        out = subprocess.run(
+            [
+                _FFPROBE, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x", str(mp4),
+            ],
+            capture_output=True, text=True,
+            timeout=_FFPROBE_FRAME_COUNT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"ffprobe dimensions timed out after {_FFPROBE_FRAME_COUNT_TIMEOUT}s "
+            f"for {mp4.name}"
+        ) from exc
+    text = (out.stdout or "").strip().splitlines()[0] if out.stdout else ""
+    try:
+        width, height = text.split("x", 1)
+        return int(width), int(height)
+    except Exception as exc:
+        raise RuntimeError(
+            f"ffprobe could not determine dimensions for {mp4.name}: "
+            f"stdout={out.stdout!r} stderr={out.stderr!r}"
+        ) from exc
+
+
 def _mp4_frame_count(mp4: Path) -> int:
     """Return the frame count of an MP4 via ffprobe.
 
@@ -560,6 +631,25 @@ def _mp4_frame_count(mp4: Path) -> int:
         ) from exc
 
 
+def _read_camera_metadata_rotations(episode_dir: Path) -> Dict[str, int]:
+    metadata_path = episode_dir / "camera_info" / "camera_metadata.yaml"
+    if not metadata_path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+        cameras = data.get("cameras") or {}
+        if not isinstance(cameras, dict):
+            return {}
+        rotations: Dict[str, int] = {}
+        for name, entry in cameras.items():
+            if not isinstance(entry, dict):
+                continue
+            rotations[str(name)] = int(entry.get("rotation_deg", 0) or 0)
+        return rotations
+    except Exception:
+        return {}
+
+
 def _patch_status(
     info_path: Path,
     status: str,
@@ -568,7 +658,7 @@ def _patch_status(
     elapsed_sec: Optional[float] = None,
     cameras_done: Optional[list[str]] = None,
     cameras_failed: Optional[dict[str, str]] = None,
-    rotations_applied: Optional[dict[str, int]] = None,
+    cameras_skipped: Optional[dict[str, str]] = None,
 ) -> None:
     """Read-modify-write episode_info.json atomically.
 
@@ -584,23 +674,18 @@ def _patch_status(
     except Exception:
         info = {}
     info["transcoding_status"] = status
-    if encoder is not None:
-        info["transcoding_encoder"] = encoder
-    if elapsed_sec is not None:
-        info["transcoding_elapsed_sec"] = round(elapsed_sec, 3)
-    if cameras_done is not None:
-        info["transcoding_cameras_done"] = list(cameras_done)
     if cameras_failed is not None:
         info["transcoding_cameras_failed"] = dict(cameras_failed)
-    if rotations_applied is not None:
-        # Merge with any existing applied rotations so a partial re-run
-        # doesn't lose history for cameras that already finished.
-        prev = info.get("camera_rotations_applied") or {}
-        prev.update({k: int(v) for k, v in rotations_applied.items()})
-        info["camera_rotations_applied"] = prev
-    info["transcoding_updated"] = time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-    )
+    else:
+        info.setdefault("transcoding_cameras_failed", {})
+    for stale_key in (
+        "transcoding_encoder",
+        "transcoding_elapsed_sec",
+        "transcoding_cameras_done",
+        "transcoding_cameras_skipped",
+        "transcoding_updated",
+    ):
+        info.pop(stale_key, None)
     tmp = info_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(info, indent=2))
     os.replace(tmp, info_path)

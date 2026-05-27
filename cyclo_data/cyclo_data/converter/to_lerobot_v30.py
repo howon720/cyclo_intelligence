@@ -47,8 +47,6 @@ LeRobot v3.0 Dataset Structure:
 """
 
 import json
-import os
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -73,7 +71,7 @@ from .base_converter import (
     _convert_rosbag_worker,
     _resolve_conversion_worker_count,
 )
-from .video_sync import _ffmpeg, _ffmpeg_threads_arg, _h264_encoder
+from .video_sync import _ffmpeg, _ffmpeg_threads_arg
 
 
 CODEBASE_VERSION_V30 = "v3.0"
@@ -105,6 +103,9 @@ class EpisodeMetadata:
     episode_index: int
     length: int
     tasks: List[str]
+    recording_mode: str = "single"
+    full_episode_index: Optional[int] = None
+    subtask_instructions: List[str] = field(default_factory=list)
 
     # Data file location
     data_chunk_index: int = 0
@@ -124,6 +125,7 @@ class EpisodeMetadata:
             "episode_index": self.episode_index,
             "length": self.length,
             "tasks": self.tasks,
+            "recording_mode": self.recording_mode,
             "data/chunk_index": self.data_chunk_index,
             "data/file_index": self.data_file_index,
             "dataset_from_index": self.dataset_from_index,
@@ -131,6 +133,10 @@ class EpisodeMetadata:
             "meta/episodes/chunk_index": 0,
             "meta/episodes/file_index": 0,
         }
+        if self.full_episode_index is not None:
+            result["full_episode_index"] = self.full_episode_index
+        if self.subtask_instructions:
+            result["subtask_instructions"] = self.subtask_instructions
 
         # Add video metadata per camera
         for camera_key, video_info in self.video_metadata.items():
@@ -187,6 +193,9 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         self._pending_video_files: Dict[
             str, List[Tuple[Path, float]]
         ] = {}  # camera -> [(path, duration)]
+
+    def _video_feature_key(self, camera_name: str) -> str:
+        return f"observation.images.rgb.{camera_name}"
 
     def convert_multiple_rosbags(self, bag_paths: List[Path]) -> bool:
         """
@@ -295,12 +304,20 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             self._log_error("No episodes were successfully converted")
             return False
 
-        return self.write_from_episodes(episodes_data)
+        success = self.write_from_episodes(episodes_data)
+        if success:
+            self._cleanup_output_temp_dirs()
+            self._cleanup_source_synced_cache([Path(path) for path in bag_paths])
+        return success
 
     def write_from_episodes(self, episodes_data: List[EpisodeData]) -> bool:
         """Write a v3.0 dataset from already parsed episodes."""
         if not episodes_data:
             self._log_error("No episodes were provided for LeRobot v3.0 writing")
+            return False
+        episodes_data = self.prepare_episodes_for_writing(episodes_data)
+        if not episodes_data:
+            self._log_error("No complete episodes remained after subtask stitching")
             return False
 
         output_dir = Path(self.config.output_dir)
@@ -326,6 +343,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
 
         self._build_features(episodes_data)
         self._collect_tasks(episodes_data)
+        self._collect_task_names(episodes_data)
 
         self._write_aggregated_data(episodes_data)
 
@@ -338,15 +356,19 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         # Phase 6: Write tasks (Parquet)
         self._write_tasks_parquet()
 
-        # Phase 7: Write global stats
+        # Phase 7: Write optional subtask metadata/annotations
+        self._write_subtasks_parquet(output_dir, episodes_data)
+        self._write_subtask_annotations(output_dir, episodes_data)
+
+        # Phase 8: Write global stats
         self._write_global_stats()
 
-        # Phase 8: Write info.json
+        # Phase 9: Write info.json
         self._write_info_json_v30()
         # Root info.json (conversion config snapshot) — same writer as v2.1.
         self._write_root_info_json()
 
-        # Phase 9: Write quality reports (optional)
+        # Phase 10: Write quality reports (optional)
         if self.config.enable_quality_report and self._quality_reports:
             self._write_quality_reports(output_dir)
 
@@ -361,6 +383,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         pending_frames: List[Dict[str, Any]] = []
         pending_size_mb = 0.0
         global_frame_index = 0
+        has_subtask_feature = "subtask_index" in self._features
 
         for episode in episodes_data:
             ep_idx = episode.episode_index
@@ -380,6 +403,13 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                         episode.tasks[0] if episode.tasks else "default_task", 0
                     ),
                 }
+                if has_subtask_feature:
+                    if len(episode.subtask_indices) == num_frames:
+                        frame_data["subtask_index"] = int(
+                            episode.subtask_indices[frame_idx]
+                        )
+                    else:
+                        frame_data["subtask_index"] = 0
 
                 if episode.observation_state:
                     frame_data["observation.state"] = episode.observation_state[
@@ -400,6 +430,9 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                 episode_index=ep_idx,
                 length=num_frames,
                 tasks=episode.tasks,
+                recording_mode=episode.recording_mode,
+                full_episode_index=episode.full_episode_index,
+                subtask_instructions=list(episode.subtask_instructions),
                 data_chunk_index=self._current_data_chunk_idx,
                 data_file_index=self._current_data_file_idx,
                 dataset_from_index=dataset_from_index,
@@ -451,6 +484,9 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             pa.field("index", pa.int64()),
             pa.field("task_index", pa.int64()),
         ]
+        has_subtask_feature = any("subtask_index" in frame for frame in frames)
+        if has_subtask_feature:
+            schema_fields.append(pa.field("subtask_index", pa.int64()))
 
         if state_dim > 0:
             schema_fields.append(
@@ -469,6 +505,13 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             pa.array([f["index"] for f in frames], type=pa.int64()),
             pa.array([f["task_index"] for f in frames], type=pa.int64()),
         ]
+        if has_subtask_feature:
+            arrays.append(
+                pa.array(
+                    [int(f.get("subtask_index", 0)) for f in frames],
+                    type=pa.int64(),
+                )
+            )
 
         if state_dim > 0:
             state_values = [[float(v) for v in f["observation.state"]] for f in frames]
@@ -489,6 +532,8 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             "index": {"dtype": "int64", "_type": "Value"},
             "task_index": {"dtype": "int64", "_type": "Value"},
         }
+        if has_subtask_feature:
+            hf_features["subtask_index"] = {"dtype": "int64", "_type": "Value"}
 
         if state_dim > 0:
             hf_features["observation.state"] = {
@@ -552,7 +597,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         videos: List[Tuple[int, Path, float]],
     ):
         """Concatenate and write videos for a single camera."""
-        camera_key = f"observation.images.{camera_name}"
+        camera_key = self._video_feature_key(camera_name)
 
         chunk_idx = 0
         file_idx = 0
@@ -626,28 +671,6 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
 
         expected_frames = self._expected_aggregated_frame_count(videos)
 
-        if len(videos) == 1:
-            _, source_video, _ = videos[0]
-            if output_path.exists():
-                output_path.unlink()
-            try:
-                os.link(source_video, output_path)
-            except OSError:
-                shutil.copy2(source_video, output_path)
-            try:
-                self._validate_aggregated_video(output_path, expected_frames)
-                self._log_info(
-                    f"Linked single episode video without re-encode: "
-                    f"{output_path.name} ({expected_frames} frames)"
-                )
-                return
-            except RuntimeError as exc:
-                output_path.unlink(missing_ok=True)
-                self._log_warning(
-                    f"Single episode video fast path failed ({exc}); "
-                    "falling back to CFR re-encode"
-                )
-
         # Create concat list file for ffmpeg
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             for _, video_path, _ in videos:
@@ -658,7 +681,6 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             fps = float(self.config.fps)
             fps_str = f"{fps:g}"
             ffmpeg = _ffmpeg()
-            encoder, enc_opts = _h264_encoder(ffmpeg)
             cmd = [
                 ffmpeg,
                 "-y",
@@ -675,8 +697,11 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                 fps_str,
                 "-an",
                 "-c:v",
-                encoder,
-                *enc_opts,
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "23",
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -857,12 +882,24 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         file_path = output_dir / DEFAULT_TASKS_PATH
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
+        task_names = getattr(self, "_task_names_by_task", {})
         tasks_data = [
-            {"task_index": idx, "task": task} for idx, task in self._tasks.items()
+            {
+                "task_index": idx,
+                "task": task,
+                "task_name": task_names.get(task, task),
+            }
+            for idx, task in self._tasks.items()
         ]
 
         if not tasks_data:
-            tasks_data = [{"task_index": 0, "task": "default_task"}]
+            tasks_data = [
+                {
+                    "task_index": 0,
+                    "task": "default_task",
+                    "task_name": "default_task",
+                }
+            ]
 
         df = pd.DataFrame(tasks_data)
         table = pa.Table.from_pandas(df)
@@ -978,6 +1015,11 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             "video_path": DEFAULT_VIDEO_PATH if self.config.use_videos else None,
             "features": features_with_fps,
         }
+        if "subtask_index" in self._features:
+            info["annotation_path"] = (
+                "annotations/chunk-{episode_chunk:03d}/"
+                "episode_{episode_index:06d}.json"
+            )
 
         info_path = output_dir / "meta" / "info.json"
         with open(info_path, "w", encoding="utf-8") as f:

@@ -39,6 +39,7 @@ class BagReader:
         self.logger = logger
         self._topic_type_map: Dict[str, str] = {}
         self._mcap_file: Optional[str] = None
+        self._mcap_files: List[Path] = []
         self._decoder_factory = DecoderFactory()
 
     def _log_info(self, msg: str):
@@ -49,50 +50,56 @@ class BagReader:
         if self.logger:
             self.logger.error(msg)
 
-    def _find_mcap_file(self) -> Optional[str]:
-        """Find the MCAP file to read."""
+    def _find_mcap_files(self) -> List[Path]:
+        """Find the MCAP file(s) to read."""
         # If bag_path is a file, use it directly
         if self.bag_path.is_file() and self.bag_path.suffix == '.mcap':
-            return str(self.bag_path)
+            return [self.bag_path]
 
         # If bag_path is a directory, find the MCAP file
         if self.bag_path.is_dir():
             # Prefer episode.mcap (MP4 converter output)
             episode_mcap = self.bag_path / 'episode.mcap'
             if episode_mcap.exists():
-                return str(episode_mcap)
+                return [episode_mcap]
 
-            # Fall back to any .mcap file
+            # Fall back to all .mcap files. ROSbag2 can split one logical
+            # recording across multiple files; subtask full-episode folders
+            # also keep one MCAP per subtask (for example 0_0, 0_1, 0_2).
             mcap_files = sorted(self.bag_path.glob('*.mcap'))
             if mcap_files:
-                return str(mcap_files[0])
+                return mcap_files
 
-        return None
+        return []
 
     def open(self) -> bool:
         """Open the bag file for reading. Returns True if successful."""
-        self._mcap_file = self._find_mcap_file()
-        if self._mcap_file is None:
+        self._mcap_files = self._find_mcap_files()
+        self._mcap_file = str(self._mcap_files[0]) if self._mcap_files else None
+        if not self._mcap_files:
             self._log_error(f"No MCAP file found in: {self.bag_path}")
             return False
 
         try:
-            # Read topic types from summary
-            with open(self._mcap_file, 'rb') as f:
-                reader = make_reader(f, decoder_factories=[self._decoder_factory])
-                summary = reader.get_summary()
-                if summary is None:
-                    self._log_error(f"Failed to read MCAP summary: {self._mcap_file}")
-                    return False
+            # Read topic types from each summary. Split MCAPs from one logical
+            # episode usually share topics, but unioning keeps this robust.
+            for mcap_file in self._mcap_files:
+                with open(mcap_file, 'rb') as f:
+                    reader = make_reader(f, decoder_factories=[self._decoder_factory])
+                    summary = reader.get_summary()
+                    if summary is None:
+                        self._log_error(f"Failed to read MCAP summary: {mcap_file}")
+                        return False
 
-                for channel_id, channel in summary.channels.items():
-                    schema_id = channel.schema_id
-                    schema = summary.schemas.get(schema_id)
-                    schema_name = schema.name if schema else "unknown"
-                    self._topic_type_map[channel.topic] = schema_name
+                    for channel_id, channel in summary.channels.items():
+                        schema_id = channel.schema_id
+                        schema = summary.schemas.get(schema_id)
+                        schema_name = schema.name if schema else "unknown"
+                        self._topic_type_map[channel.topic] = schema_name
 
             self._log_info(
-                f"Opened MCAP: {self._mcap_file} "
+                f"Opened {len(self._mcap_files)} MCAP file(s): "
+                f"{', '.join(path.name for path in self._mcap_files)} "
                 f"({len(self._topic_type_map)} topics)"
             )
             return True
@@ -117,20 +124,23 @@ class BagReader:
         Yields:
             Tuple of (topic_name, deserialized_message, timestamp_sec)
         """
-        if self._mcap_file is None:
+        if not self._mcap_files:
             self._log_error("MCAP file not opened. Call open() first.")
             return
 
         topic_set = set(topic_filter) if topic_filter else None
 
-        with open(self._mcap_file, 'rb') as f:
-            reader = make_reader(f, decoder_factories=[self._decoder_factory])
-            for schema, channel, message, decoded_msg in reader.iter_decoded_messages(
-                topics=topic_filter
-            ):
-                timestamp_sec = message.log_time / 1e9
-                if decoded_msg is not None:
-                    yield channel.topic, decoded_msg, timestamp_sec
+        for mcap_file in self._mcap_files:
+            with open(mcap_file, 'rb') as f:
+                reader = make_reader(f, decoder_factories=[self._decoder_factory])
+                for schema, channel, message, decoded_msg in reader.iter_decoded_messages(
+                    topics=topic_filter
+                ):
+                    if topic_set and channel.topic not in topic_set:
+                        continue
+                    timestamp_sec = message.log_time / 1e9
+                    if decoded_msg is not None:
+                        yield channel.topic, decoded_msg, timestamp_sec
 
     def read_raw_messages(self) -> Iterator[Tuple[str, bytes, float, str]]:
         """
@@ -139,23 +149,24 @@ class BagReader:
         Yields:
             Tuple of (topic_name, raw_data, timestamp_sec, topic_type)
         """
-        if self._mcap_file is None:
+        if not self._mcap_files:
             self._log_error("MCAP file not opened. Call open() first.")
             return
 
-        with open(self._mcap_file, 'rb') as f:
-            reader = make_reader(f)
-            for schema, channel, message in reader.iter_messages():
-                timestamp_sec = message.log_time / 1e9
-                topic_type = self._topic_type_map.get(channel.topic, "")
-                yield channel.topic, message.data, timestamp_sec, topic_type
+        for mcap_file in self._mcap_files:
+            with open(mcap_file, 'rb') as f:
+                reader = make_reader(f)
+                for schema, channel, message in reader.iter_messages():
+                    timestamp_sec = message.log_time / 1e9
+                    topic_type = self._topic_type_map.get(channel.topic, "")
+                    yield channel.topic, message.data, timestamp_sec, topic_type
 
     def get_time_range(self) -> Tuple[float, float]:
         """Get the time range of the bag file."""
         min_time = float("inf")
         max_time = float("-inf")
 
-        if self._mcap_file is None:
+        if not self._mcap_files:
             return (0.0, 0.0)
 
         for _, _, timestamp_sec, _ in self.read_raw_messages():
@@ -170,6 +181,7 @@ class BagReader:
     def close(self):
         """Close the bag reader."""
         self._mcap_file = None
+        self._mcap_files = []
         self._topic_type_map = {}
 
     def __enter__(self):

@@ -46,10 +46,10 @@ LeRobot v3.0 Dataset (ready for training)
 │   │   └── robot.urdf                       #   Robot URDF
 │   ├── 0_converted/                         # Stage 1 output
 │   │   ├── episode.mcap                     #   MCAP with images removed
-│   │   ├── cam_head_left.mp4                #   MP4 per camera
-│   │   ├── cam_head_right.mp4
-│   │   ├── cam_wrist_left.mp4
-│   │   ├── cam_wrist_right.mp4
+│   │   ├── cam_left_head.mp4                #   MP4 per camera
+│   │   ├── cam_right_head.mp4
+│   │   ├── cam_left_wrist.mp4
+│   │   ├── cam_right_wrist.mp4
 │   │   ├── video_stats.json                 #   Pre-computed video statistics
 │   │   ├── episode_info.json                #   Includes dropped frame info
 │   │   ├── robot.urdf
@@ -71,12 +71,12 @@ LeRobot v3.0 Dataset (ready for training)
 │   │   └── tasks.jsonl                      #   Task list
 │   └── videos/
 │       └── chunk-000/
-│           ├── observation.images.cam_head_left/
+│           ├── observation.images.cam_left_head/
 │           │   ├── episode_000000.mp4
 │           │   └── ...
-│           ├── observation.images.cam_head_right/
-│           ├── observation.images.cam_wrist_left/
-│           └── observation.images.cam_wrist_right/
+│           ├── observation.images.cam_right_head/
+│           ├── observation.images.cam_left_wrist/
+│           └── observation.images.cam_right_wrist/
 │
 └── {robot}_{task}_lerobot_v30/              # Stage 3 output (final)
     ├── data/

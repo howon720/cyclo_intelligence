@@ -15,9 +15,17 @@ uint8 RERECORD = 6
 uint8 SKIP_TASK = 7
 uint8 CANCEL = 8
 uint8 REFRESH_TOPICS = 9
+uint8 START_SEGMENT = 10
+uint8 STOP_SEGMENT = 11
+uint8 DISCARD_SEGMENT = 12
+uint8 FINISH_EPISODE = 13
+uint8 DISCARD_EPISODE = 14
+uint8 SET_TASK_INFO = 15
+uint8 CANCEL_SEGMENT = 16
 
 uint8 command
 TaskInfo task_info
+uint16 segment_index
 # Robot type key (e.g. 'ffw_sg2_rev1', 'omy_f3m'). Drives DataManager's
 # folder naming + save_root resolution. The orchestrator forwarder
 # (Step 3 Part C2d-4) populates this from its node-scoped self.robot_type

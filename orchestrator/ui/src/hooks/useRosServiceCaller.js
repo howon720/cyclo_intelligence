@@ -166,6 +166,27 @@ export function useRosServiceCaller() {
           case 'prepare_session':
             command_enum = TaskCommand.PREPARE_SESSION;
             break;
+          case 'start_segment':
+            command_enum = TaskCommand.START_SEGMENT;
+            break;
+          case 'stop_segment':
+            command_enum = TaskCommand.STOP_SEGMENT;
+            break;
+          case 'discard_segment':
+            command_enum = TaskCommand.DISCARD_SEGMENT;
+            break;
+          case 'finish_episode':
+            command_enum = TaskCommand.FINISH_EPISODE;
+            break;
+          case 'discard_episode':
+            command_enum = TaskCommand.DISCARD_EPISODE;
+            break;
+          case 'set_task_info':
+            command_enum = TaskCommand.SET_TASK_INFO;
+            break;
+          case 'cancel_segment':
+            command_enum = TaskCommand.CANCEL_SEGMENT;
+            break;
           default:
             throw new Error(`Unknown command: ${command}`);
         }
@@ -181,6 +202,11 @@ export function useRosServiceCaller() {
         // Auto-fill taskName and taskInstruction if empty
         let taskName = taskInfo.taskName || '';
         let taskInstruction = (taskInfo.taskInstruction || []).filter(
+          (instruction) => instruction.trim() !== ''
+        );
+        const subtaskInstructionSource =
+          options.subtaskInstruction || taskInfo.subtaskInstruction || [];
+        const subtaskInstruction = subtaskInstructionSource.filter(
           (instruction) => instruction.trim() !== ''
         );
 
@@ -210,10 +236,11 @@ export function useRosServiceCaller() {
 
         const request = {
           task_info: {
-            task_num: String(taskInfo.taskNum || ''),
+            task_num: String(taskInfo.taskNum ?? ''),
             task_name: String(taskName),
             task_type: String(taskType),
             task_instruction: taskInstruction,
+            subtask_instruction: subtaskInstruction,
             policy_path: String(taskInfo.policyPath || ''),
             record_inference_mode: Boolean(taskInfo.recordInferenceMode),
             tags: [],
@@ -228,6 +255,7 @@ export function useRosServiceCaller() {
             service_type: String(taskInfo.serviceType || ''),
           },
           command: Number(command_enum),
+          segment_index: Number(options.segmentIndex || 0),
           // Conversion-only knobs (ignored by the orchestrator unless
           // command == CONVERT_MP4). Default to 0 / false so the wire
           // representation is stable for non-conversion commands.

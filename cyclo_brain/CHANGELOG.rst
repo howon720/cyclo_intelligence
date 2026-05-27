@@ -2,6 +2,11 @@
 Changelog for package cyclo_brain
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.5 (2026-05-26)
+------------------
+* Updated LeRobot and GR00T policy IO mapping to use canonical ``cam_<side>_<part>`` camera names.
+* Contributors: kimtaehyeong99
+
 0.1.4 (2026-05-22)
 ------------------
 * Added the shared two-process policy runtime with ``main-runtime`` and ``engine-process`` services.

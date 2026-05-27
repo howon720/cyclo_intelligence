@@ -29,6 +29,7 @@ const initialState = {
     taskName: '',
     taskType: '',
     taskInstruction: [],
+    subtaskInstruction: [],
     policyPath: '',
     recordInferenceMode: false,
     controlHz: 100,
@@ -64,6 +65,10 @@ const initialState = {
     currentEpisodeNumber: 0,
     currentScenarioNumber: 0,
     currentTaskInstruction: '',
+    currentSubtaskIndex: 0,
+    subtaskCount: 0,
+    currentSubtaskInstruction: '',
+    subtaskInstructions: [],
     userId: '',
     usedStorageSize: 0,
     totalStorageSize: 0,
@@ -94,6 +99,11 @@ const initialState = {
     totalReceived: 0,
     totalWritten: 0,
   },
+
+  plannedCount: 0,
+  plannedSubTasks: [],
+  slotToServerIdx: [],
+  activeSlotIndex: 0,
 };
 
 const taskSlice = createSlice({
@@ -145,6 +155,37 @@ const taskSlice = createSlice({
     setRecordingMonitor: (state, action) => {
       state.recordingMonitor = action.payload;
     },
+    setPlannedCount: (state, action) => {
+      state.plannedCount = action.payload;
+    },
+    setPlannedSubTasks: (state, action) => {
+      state.plannedSubTasks = action.payload;
+      state.taskInfo.subtaskInstruction = action.payload;
+    },
+    setPlannedSubTaskAt: (state, action) => {
+      const { index, value } = action.payload;
+      if (index >= 0 && index < state.plannedSubTasks.length) {
+        state.plannedSubTasks[index] = value;
+        state.taskInfo.subtaskInstruction = state.plannedSubTasks;
+      }
+    },
+    setSlotToServerIdx: (state, action) => {
+      state.slotToServerIdx = action.payload;
+    },
+    setActiveSlotIndex: (state, action) => {
+      state.activeSlotIndex = action.payload;
+    },
+    resetSegmentPlan: (state) => {
+      state.plannedCount = 0;
+      state.plannedSubTasks = [];
+      state.slotToServerIdx = [];
+      state.activeSlotIndex = 0;
+      state.taskInfo.subtaskInstruction = [];
+    },
+    resetSegmentProgress: (state) => {
+      state.slotToServerIdx = state.plannedSubTasks.map(() => -1);
+      state.activeSlotIndex = 0;
+    },
   },
 });
 
@@ -164,6 +205,13 @@ export const {
   setLastHeartbeatTime,
   setJoystickMode,
   setRecordingMonitor,
+  setPlannedCount,
+  setPlannedSubTasks,
+  setPlannedSubTaskAt,
+  setSlotToServerIdx,
+  setActiveSlotIndex,
+  resetSegmentPlan,
+  resetSegmentProgress,
 } = taskSlice.actions;
 
 export default taskSlice.reducer;

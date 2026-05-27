@@ -197,7 +197,7 @@ class GR00TInference:
         self.robot: Optional[RobotClient] = None
         self._loaded_model_path: Optional[str] = None  # track cached policy path
         self.policy_info: dict = {
-            "video": [],       # e.g. ["cam_head_left", "cam_wrist_left", ...]
+            "video": [],       # e.g. ["cam_left_head", "cam_left_wrist", ...]
             "state": [],       # e.g. ["arm_left", "arm_right"]
             "action": [],      # e.g. ["arm_left", "arm_right"]
             "language": [],    # e.g. ["annotation.human.task_description"]
