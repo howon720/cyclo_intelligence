@@ -16,6 +16,19 @@ Two axes:
 > `zenoh_ros2_sdk/`). The 5 actual ROS 2 packages should be built by
 > pinning `--paths` explicitly.
 
+## Submodule Sync
+
+Policy backends rely on pinned upstream submodules. After cloning
+without `--recurse-submodules`, switching branches, or pulling updates,
+run this from the repository root:
+
+```bash
+git submodule update --init --recursive
+```
+
+This keeps LeRobot, Isaac-GR00T, and zenoh_ros2_sdk at the commits
+expected by Docker builds.
+
 ```
 cyclo_brain/
 ├── sdk/

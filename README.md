@@ -10,6 +10,17 @@ For detailed usage and tutorials, please refer to the documentation below.
 
 ```bash
 git clone --recurse-submodules https://github.com/ROBOTIS-GIT/cyclo_intelligence.git
+cd cyclo_intelligence
+```
+
+### Updating an existing checkout
+
+After switching branches or pulling a new release, sync the pinned
+submodule commits from the repository root:
+
+```bash
+git pull --ff-only
+git submodule update --init --recursive
 ```
 
 ## Folders at a glance
@@ -75,6 +86,10 @@ and data flow.
 - `cyclo_brain/sdk/zenoh_ros2_sdk/` ← [ROBOTIS-GIT/zenoh_ros2_sdk](https://github.com/ROBOTIS-GIT/zenoh_ros2_sdk)
 - `cyclo_brain/policy/lerobot/lerobot/` ← [huggingface/lerobot](https://github.com/huggingface/lerobot)
 - `cyclo_brain/policy/groot/Isaac-GR00T/` ← [NVIDIA/Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T)
+
+These paths are pinned to exact commits by the parent repository. If a
+submodule directory is empty or stale, run
+`git submodule update --init --recursive` before building images.
 
 ## Related
 
