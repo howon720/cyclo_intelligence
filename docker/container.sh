@@ -121,7 +121,7 @@ Flags (any start* command):
 
 Environment:
   GPU_ARCH         default | blackwell   (optional, amd64 only)
-  VERSION          image tag version (default: 0.1.6 for cyclo)
+  VERSION          image tag version (default: 0.1.7 for cyclo)
   ROS_DOMAIN_ID    default 30
 EOF
 }
