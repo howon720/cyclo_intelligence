@@ -214,6 +214,7 @@ class ControlPublisher:
         self._requesting = False
         self._request_sent_at: float = 0.0
         self._seq_id = 0
+        self._drop_chunks_through_seq = 0
 
         # Robot-specific Zenoh/ROS2 handles (created in configure(), torn down
         # in deconfigure()).
@@ -428,12 +429,14 @@ class ControlPublisher:
         self._requesting = False
         self._request_sent_at = 0.0
         self._seq_id = 0
+        self._drop_chunks_through_seq = 0
 
     def _teardown_robot_specific_locked(self) -> None:
         """Close command publishers + chunk sub + trigger pub.
 
         Caller must hold _config_lock.
         """
+        self._clear_pending_actions_locked("teardown")
         for pub in self._command_pubs.values():
             try:
                 pub.close()
@@ -448,6 +451,35 @@ class ControlPublisher:
                 except Exception:
                     pass
                 setattr(self, attr, None)
+
+    def _clear_pending_actions_locked(self, reason: str) -> None:
+        """Drop buffered/sticky actions and any in-flight trigger state.
+
+        Pause/stop must not resume from the old action chunk. The processor
+        falls back to ``last_action`` when its buffer is empty, so clearing only
+        the deque is not enough; use ActionChunkProcessor.clear().
+
+        Caller must hold _config_lock.
+        """
+        if self._processor is not None:
+            buffer_size = self._processor.buffer_size
+            had_last_action = self._processor.last_action is not None
+            self._processor.clear()
+            if buffer_size or had_last_action:
+                logger.info(
+                    f"{reason}: cleared pending actions "
+                    f"(buffer={buffer_size}, last_action={had_last_action})"
+                )
+        if self._requesting:
+            logger.info(
+                f"{reason}: cleared in-flight trigger seq={self._seq_id}"
+            )
+        self._drop_chunks_through_seq = max(
+            self._drop_chunks_through_seq,
+            self._seq_id,
+        )
+        self._requesting = False
+        self._request_sent_at = 0.0
 
     # -- Configure handler ----------------------------------------------------
 
@@ -481,14 +513,15 @@ class ControlPublisher:
                 was_honoring = self._a_honoring
                 self._a_honoring = new_honoring
                 if new_honoring and not was_honoring:
-                    if self._requesting:
-                        logger.info(
-                            f"lifecycle: {state} — clearing stale in-flight "
-                            f"trigger seq={self._seq_id}"
-                        )
-                        self._requesting = False
-                    else:
-                        logger.info(f"lifecycle: {state}")
+                    self._clear_pending_actions_locked(
+                        f"lifecycle: {state}"
+                    )
+                    logger.info(f"lifecycle: {state}")
+                elif not new_honoring:
+                    self._clear_pending_actions_locked(
+                        f"lifecycle: {state or 'non-running'}"
+                    )
+                    logger.info(f"lifecycle: {state}")
                 else:
                     logger.info(f"lifecycle: {state}")
         except Exception as e:
@@ -528,6 +561,10 @@ class ControlPublisher:
                     f"trigger seq={self._seq_id} timed out after "
                     f"{REQUEST_TIMEOUT_S:.1f}s, resetting"
                 )
+                self._drop_chunks_through_seq = max(
+                    self._drop_chunks_through_seq,
+                    self._seq_id,
+                )
                 self._requesting = False
 
             # Process A is paused / stopped / loaded / unloaded — don't
@@ -554,8 +591,22 @@ class ControlPublisher:
         with self._config_lock:
             if not self._configured or self._processor is None:
                 return
+            seq_id = int(getattr(msg, "seq_id", 0))
+            if seq_id <= self._drop_chunks_through_seq:
+                logger.info(
+                    f"chunk rx seq={seq_id} dropped as stale "
+                    f"(drop_through={self._drop_chunks_through_seq})"
+                )
+                if seq_id == self._seq_id:
+                    self._requesting = False
+                return
+            if not self._a_honoring:
+                logger.info(
+                    f"chunk rx seq={seq_id} dropped while inference is paused/stopped"
+                )
+                self._requesting = False
+                return
             try:
-                seq_id = int(getattr(msg, "seq_id", 0))
                 chunk_size = int(msg.chunk_size)
                 action_dim = int(msg.action_dim)
                 data = np.asarray(msg.data, dtype=np.float64)
