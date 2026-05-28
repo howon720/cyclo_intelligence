@@ -237,7 +237,7 @@ class Mp4ConversionWorker:
             except Exception:
                 pass
 
-            grace_timeout = min(max(timeout, 0.0), 1.0)
+            grace_timeout = max(timeout, 0.0)
             if grace_timeout > 0:
                 self.process.join(grace_timeout)
 

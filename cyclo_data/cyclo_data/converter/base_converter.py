@@ -1288,7 +1288,10 @@ class RosbagToLerobotConverterBase:
             if out_path.exists():
                 try:
                     out_mtime = out_path.stat().st_mtime
-                    if all(src.exists() and src.stat().st_mtime <= out_mtime for src in srcs):
+                    if (
+                        all(src.exists() and src.stat().st_mtime <= out_mtime for src in srcs)
+                        and self._video_decodes_successfully(out_path)
+                    ):
                         stitched[camera_name] = out_path
                         continue
                 except OSError:
@@ -1320,6 +1323,11 @@ class RosbagToLerobotConverterBase:
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, check=True,
                 )
+                if not self._video_decodes_successfully(out_path):
+                    out_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"stitched video failed decode validation: {out_path}"
+                    )
                 stitched[camera_name] = out_path
             except Exception as exc:  # noqa: BLE001
                 self._log_warning(
@@ -2715,8 +2723,15 @@ class RosbagToLerobotConverterBase:
                     or not all(p.exists() for p in sidecars)
                 )
             ):
-                prepared[camera] = out_path
-                continue
+                if self._video_decodes_successfully(out_path):
+                    prepared[camera] = out_path
+                    continue
+                self._log_warning(
+                    f"{bag_path.name}: cached segment video is invalid; "
+                    f"rebuilding {out_path}"
+                )
+                out_path.unlink(missing_ok=True)
+                sidecar_out.unlink(missing_ok=True)
 
             list_path: Optional[Path] = None
             try:
@@ -2744,6 +2759,11 @@ class RosbagToLerobotConverterBase:
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, check=True,
                 )
+                if not self._video_decodes_successfully(out_path):
+                    out_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"prepared segment video failed decode validation: {out_path}"
+                    )
 
                 if all(path.exists() for path in sidecars):
                     tables = self._concat_segment_sidecars(sidecars)
@@ -2761,6 +2781,30 @@ class RosbagToLerobotConverterBase:
                     list_path.unlink(missing_ok=True)
 
         return prepared
+
+    @staticmethod
+    def _video_decodes_successfully(video_path: Path) -> bool:
+        """Return True when ffmpeg can decode at least one video frame."""
+        if not video_path.exists() or video_path.stat().st_size <= 0:
+            return False
+        try:
+            from cyclo_data.converter.video_sync import _ffmpeg
+
+            result = subprocess.run(
+                [
+                    _ffmpeg(), "-hide_banner", "-v", "error", "-xerror",
+                    "-i", str(video_path),
+                    "-frames:v", "1",
+                    "-f", "null", "-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30.0,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
 
     def _concat_segment_sidecars(self, sidecars: List[Path]) -> List[pa.Table]:
         """Read segment timestamp sidecars and make frame_index continuous."""

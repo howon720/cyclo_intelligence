@@ -27,17 +27,17 @@ writers (per-episode parquet + JSONL meta).
 LeRobot v2.1 Dataset Structure:
     dataset_name/
     ├── data/
-    │   └── task-{chunk:04d}/
-    │       └── episode_{episode:08d}.parquet
+    │   └── task-{chunk:03d}/
+    │       └── episode_{episode:06d}.parquet
     ├── meta/
     │   ├── info.json
     │   ├── episodes.jsonl
     │   ├── episodes_stats.jsonl
     │   └── tasks.jsonl
     └── videos/
-        └── task-{chunk:04d}/
+        └── task-{chunk:03d}/
             └── observation.images.rgb.{camera}/
-                └── episode_{episode:08d}.mp4
+                └── episode_{episode:06d}.mp4
 """
 
 import json
@@ -66,6 +66,24 @@ from .base_converter import (  # noqa: F401
 
 CODEBASE_VERSION = "v2.1"
 V21_CHUNK_SIZE = 10000
+V21_CHUNK_DIGITS = 3
+V21_EPISODE_DIGITS = 6
+V21_DATA_PATH = "data/task-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+V21_VIDEO_PATH = (
+    "videos/task-{episode_chunk:03d}/{video_key}/"
+    "episode_{episode_index:06d}.mp4"
+)
+V21_ANNOTATION_PATH = (
+    "annotations/task-{episode_chunk:03d}/episode_{episode_index:06d}.json"
+)
+
+
+def _v21_chunk_dir_name(chunk_idx: int) -> str:
+    return f"task-{chunk_idx:0{V21_CHUNK_DIGITS}d}"
+
+
+def _v21_episode_stem(episode_idx: int) -> str:
+    return f"episode_{episode_idx:0{V21_EPISODE_DIGITS}d}"
 
 
 class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
@@ -253,14 +271,14 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         chunk_idx = ep_idx // V21_CHUNK_SIZE
 
         # Create chunk directories
-        data_chunk_dir = output_dir / "data" / f"task-{chunk_idx:04d}"
+        data_chunk_dir = output_dir / "data" / _v21_chunk_dir_name(chunk_idx)
         data_chunk_dir.mkdir(parents=True, exist_ok=True)
 
-        video_chunk_dir = output_dir / "videos" / f"task-{chunk_idx:04d}"
+        video_chunk_dir = output_dir / "videos" / _v21_chunk_dir_name(chunk_idx)
         video_chunk_dir.mkdir(parents=True, exist_ok=True)
 
         # Write parquet file
-        parquet_path = data_chunk_dir / f"episode_{ep_idx:08d}.parquet"
+        parquet_path = data_chunk_dir / f"{_v21_episode_stem(ep_idx)}.parquet"
         self._write_parquet(episode, parquet_path)
 
         # Copy video files. ``_sync_videos_to_grid`` produces
@@ -281,7 +299,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         for camera_name, src_video in episode.video_files.items():
             video_dir = video_chunk_dir / self._video_feature_key(camera_name)
             video_dir.mkdir(parents=True, exist_ok=True)
-            dst_video = video_dir / f"episode_{ep_idx:08d}.mp4"
+            dst_video = video_dir / f"{_v21_episode_stem(ep_idx)}.mp4"
             shutil.copy2(src_video, dst_video)
             self._log_info(f"Copied video: {src_video.name} -> {dst_video}")
 
@@ -465,17 +483,12 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             "chunks_size": V21_CHUNK_SIZE,
             "fps": self.config.fps,
             "splits": {"train": f"0:{self._total_episodes}"},
-            "data_path": "data/task-{episode_chunk:04d}/episode_{episode_index:08d}.parquet",
-            "video_path": "videos/task-{episode_chunk:04d}/{video_key}/episode_{episode_index:08d}.mp4"
-            if self.config.use_videos
-            else None,
+            "data_path": V21_DATA_PATH,
+            "video_path": V21_VIDEO_PATH if self.config.use_videos else None,
             "features": features,
         }
         if "subtask_index" in features:
-            info["annotation_path"] = (
-                "annotations/task-{episode_chunk:04d}/"
-                "episode_{episode_index:08d}.json"
-            )
+            info["annotation_path"] = V21_ANNOTATION_PATH
 
         info_path = output_dir / "meta" / "info.json"
         with open(info_path, "w", encoding="utf-8") as f:
@@ -484,10 +497,10 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         self._log_info(f"Wrote info.json: {info_path}")
 
     def _annotation_chunk_dir_name(self, chunk_idx: int) -> str:
-        return f"task-{chunk_idx:04d}"
+        return _v21_chunk_dir_name(chunk_idx)
 
     def _annotation_episode_filename(self, episode_idx: int) -> str:
-        return f"episode_{episode_idx:08d}.json"
+        return f"{_v21_episode_stem(episode_idx)}.json"
 
     def _episode_chunk_index(self, episode_idx: int) -> int:
         return episode_idx // V21_CHUNK_SIZE
