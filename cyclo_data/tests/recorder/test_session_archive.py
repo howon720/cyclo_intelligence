@@ -67,6 +67,7 @@ def _write_segment(
     subtask_idx: int,
     subtask_total: int,
     with_video: bool = True,
+    subtask_instruction: str | None = None,
 ) -> Path:
     segment = root / str(full_idx) / "segments" / str(subtask_idx)
     segment.mkdir(parents=True, exist_ok=True)
@@ -118,7 +119,7 @@ def _write_segment(
         "subtask_index": subtask_idx,
         "subtask_total": subtask_total,
         "episode_index": subtask_idx,
-        "subtask_instruction": f"subtask {subtask_idx}",
+        "subtask_instruction": subtask_instruction or f"subtask {subtask_idx}",
     }
     if with_video:
         videos = segment / "videos"
@@ -170,3 +171,30 @@ def test_archive_marks_episode_without_videos_not_required(tmp_path):
     assert not (out / "segments").exists()
     info = json.loads((out / "episode_info.json").read_text())
     assert info["transcoding_status"] == "not_required"
+
+
+def test_archive_writes_korean_subtask_instruction_as_utf8(tmp_path):
+    root = tmp_path / "Task_1234_archive_MCAP"
+    manager = _make_manager(root, subtask_total=2)
+    _write_segment(
+        root,
+        full_idx=0,
+        subtask_idx=0,
+        subtask_total=2,
+        with_video=False,
+        subtask_instruction="화장품 집기",
+    )
+    _write_segment(
+        root,
+        full_idx=0,
+        subtask_idx=1,
+        subtask_total=2,
+        with_video=False,
+        subtask_instruction="정리하기",
+    )
+
+    out = manager._archive_full_episode(0)
+
+    raw = (out / "episode_info.json").read_text(encoding="utf-8")
+    assert "화장품 집기" in raw
+    assert "\\ud654" not in raw

@@ -667,7 +667,7 @@ def _patch_status(
     """
     if not info_path.exists():
         # Stub it out — better than failing the whole transcode.
-        info_path.write_text(json.dumps({}))
+        info_path.write_text(json.dumps({}, ensure_ascii=False), encoding="utf-8")
     try:
         with open(info_path) as f:
             info = json.load(f) or {}
@@ -687,5 +687,5 @@ def _patch_status(
     ):
         info.pop(stale_key, None)
     tmp = info_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(info, indent=2))
+    tmp.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, info_path)
