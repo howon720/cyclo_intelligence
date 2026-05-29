@@ -63,7 +63,7 @@ def _atomic_write_text(path, content: str, encoding: str = 'utf-8') -> None:
 
 def _atomic_write_json(path, obj, indent: int = 2) -> None:
     """JSON-serialize and write atomically. See ``_atomic_write_text``."""
-    _atomic_write_text(path, json.dumps(obj, indent=indent))
+    _atomic_write_text(path, json.dumps(obj, indent=indent, ensure_ascii=False))
 
 
 # README building helpers — shared between recording (DataManager._ensure_task_readme),

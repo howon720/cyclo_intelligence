@@ -83,7 +83,10 @@ def write_json(
     p = Path(file_path)
     try:
         safe_mkdir(p.parent)
-        p.write_text(json.dumps(data, indent=indent), encoding='utf-8')
+        p.write_text(
+            json.dumps(data, indent=indent, ensure_ascii=False),
+            encoding='utf-8',
+        )
         return True
     except Exception as e:  # noqa: BLE001
         _logger.error(f'Failed to write JSON {p}: {e}')
@@ -115,7 +118,9 @@ def write_jsonl(objs: Iterable[Dict], path: Union[str, Path]) -> bool:
         safe_mkdir(p.parent)
         with p.open('w', encoding='utf-8') as f:
             for o in objs:
-                f.write(json.dumps(o, separators=(',', ':')) + '\n')
+                f.write(
+                    json.dumps(o, separators=(',', ':'), ensure_ascii=False) + '\n'
+                )
         return True
     except Exception as e:  # noqa: BLE001
         _logger.error(f'Failed to write JSONL {p}: {e}')
