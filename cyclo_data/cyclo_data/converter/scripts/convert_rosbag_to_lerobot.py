@@ -141,6 +141,13 @@ def active_h264_encoder_label() -> str:
     """Return the user-facing active H.264 encoder selection."""
     explicit = os.environ.get("CYCLO_H264_ENCODER")
     if explicit:
+        if explicit.strip().lower() in {
+            "gstreamer",
+            "gst",
+            "jetson_gst",
+            "nvv4l2h264enc",
+        }:
+            return "gstreamer:nvv4l2h264enc"
         return explicit
     profile = os.environ.get("CYCLO_X264_SPEED_PROFILE", "").strip().lower()
     if profile in {"max", "maximum", "max_speed", "fastest"}:
@@ -337,6 +344,9 @@ Examples:
             "auto",
             "software",
             "libx264",
+            "gstreamer",
+            "jetson_gst",
+            "nvv4l2h264enc",
             "h264_nvenc",
             "h264_nvmpi",
             "h264_v4l2m2m",

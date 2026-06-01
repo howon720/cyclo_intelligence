@@ -82,6 +82,11 @@ def _ffmpeg() -> str:
 _H264_ENCODER_CACHE: "dict[tuple[str, ...], list[str]] | None" = {}
 _H264_ENCODER_CACHE_LOCK = threading.Lock()
 _H264_ENCODER_THREAD_LOCAL = threading.local()
+_GSTREAMER_ENCODER_PREFIX = "gstreamer:"
+_GSTREAMER_H264_ENCODER = f"{_GSTREAMER_ENCODER_PREFIX}nvv4l2h264enc"
+_GSTREAMER_H264_ENCODER_OPTS = ["bitrate=5000000"]
+_GSTREAMER_WARNED_REASONS: set[str] = set()
+_GSTREAMER_LD_LIBRARY_PATHS = ("/usr/lib/aarch64-linux-gnu/nvidia",)
 _NVENC_MIN_DIMENSION = 256
 _NVENC_ENCODER_OPTS = [
     "-preset", "p1",
@@ -208,6 +213,10 @@ def _jetson_hardware_encoder_candidates() -> list[tuple[str, list[str]]]:
     ]
 
 
+def _gstreamer_hardware_encoder_candidates() -> list[tuple[str, list[str]]]:
+    return [(_GSTREAMER_H264_ENCODER, list(_GSTREAMER_H264_ENCODER_OPTS))]
+
+
 def _h264_hardware_encoder_candidates() -> list[tuple[str, list[str]]]:
     """Return opt-in hardware encoders in platform-sensitive probe order."""
     if _running_on_jetson():
@@ -237,6 +246,148 @@ def _ffmpeg_threads_arg() -> list[str]:
     except ValueError:
         n = 1
     return ["-threads", str(n)]
+
+
+def _is_gstreamer_encoder(encoder: str) -> bool:
+    return str(encoder).startswith(_GSTREAMER_ENCODER_PREFIX)
+
+
+def _warn_gstreamer_probe(reason: str) -> None:
+    reason = str(reason).strip() or "unknown error"
+    if reason in _GSTREAMER_WARNED_REASONS:
+        return
+    _GSTREAMER_WARNED_REASONS.add(reason)
+    import sys as _sys
+    print(
+        f"video_sync: Jetson GStreamer H.264 probe unavailable: {reason}",
+        file=_sys.stderr,
+    )
+
+
+def _gstreamer_bin(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def _gstreamer_env() -> dict[str, str]:
+    env = os.environ.copy()
+    existing = env.get("LD_LIBRARY_PATH", "")
+    paths = [p for p in _GSTREAMER_LD_LIBRARY_PATHS if Path(p).exists()]
+    if paths:
+        parts = paths + ([existing] if existing else [])
+        env["LD_LIBRARY_PATH"] = ":".join(parts)
+    return env
+
+
+def _gst_inspect_has(plugin: str) -> bool:
+    inspect = _gstreamer_bin("gst-inspect-1.0")
+    if inspect is None:
+        return False
+    try:
+        res = subprocess.run(
+            [inspect, plugin],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_gstreamer_env(),
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _gstreamer_h264_command(
+    *,
+    input_pix_fmt: str,
+    width: int,
+    height: int,
+    fps: int,
+    output_mp4: Path,
+    opts: Sequence[str],
+) -> list[str]:
+    gst = _gstreamer_bin("gst-launch-1.0")
+    if gst is None:
+        raise RuntimeError("gst-launch-1.0 not found")
+
+    pix_fmt = str(input_pix_fmt).lower()
+    if pix_fmt == "yuv420p":
+        gst_format = "i420"
+        convert = ["nvvidconv"]
+    elif pix_fmt == "bgr24":
+        gst_format = "bgr"
+        convert = ["videoconvert", "!", "nvvidconv"]
+    else:
+        raise RuntimeError(f"unsupported GStreamer raw format: {input_pix_fmt}")
+
+    encoder_props = list(opts) if opts else list(_GSTREAMER_H264_ENCODER_OPTS)
+    return [
+        gst, "-q", "-e",
+        "fdsrc", "fd=0",
+        "!", "rawvideoparse",
+        f"format={gst_format}",
+        f"width={int(width)}",
+        f"height={int(height)}",
+        f"framerate={int(fps)}/1",
+        "!", "queue",
+        "!", *convert,
+        "!", "video/x-raw(memory:NVMM),format=NV12",
+        "!", "nvv4l2h264enc",
+        *encoder_props,
+        "!", "h264parse",
+        "!", "qtmux",
+        "!", "filesink", f"location={str(output_mp4)}",
+    ]
+
+
+@lru_cache(maxsize=8)
+def _try_gstreamer_h264_encoder(width: int, height: int, fps: int) -> bool:
+    if _gstreamer_bin("gst-launch-1.0") is None:
+        _warn_gstreamer_probe("gst-launch-1.0 not found")
+        return False
+    required_plugins = (
+        "rawvideoparse",
+        "nvvidconv",
+        "nvv4l2h264enc",
+        "h264parse",
+        "qtmux",
+    )
+    missing = [plugin for plugin in required_plugins if not _gst_inspect_has(plugin)]
+    if missing:
+        _warn_gstreamer_probe(f"missing plugin(s): {', '.join(missing)}")
+        return False
+
+    width = max(256, int(width or 256))
+    height = max(256, int(height or 256))
+    if width % 2:
+        width += 1
+    if height % 2:
+        height += 1
+    frame = bytes(width * height * 3 // 2)
+    with tempfile.TemporaryDirectory(prefix="cyclo_gst_probe_") as tmpdir:
+        out = Path(tmpdir) / "probe.mp4"
+        try:
+            cmd = _gstreamer_h264_command(
+                input_pix_fmt="yuv420p",
+                width=width,
+                height=height,
+                fps=int(fps or 15),
+                output_mp4=out,
+                opts=_GSTREAMER_H264_ENCODER_OPTS,
+            )
+            res = subprocess.run(
+                cmd,
+                input=frame,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                env=_gstreamer_env(),
+            )
+            if res.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                return True
+            stderr = res.stderr.decode(errors="replace")[-300:]
+            _warn_gstreamer_probe(stderr or f"gst-launch rc={res.returncode}")
+        except Exception as exc:
+            _warn_gstreamer_probe(repr(exc))
+    return False
 
 
 @lru_cache(maxsize=4)
@@ -443,6 +594,8 @@ def _try_encoder(ffmpeg: str, encoder: str, opts: list[str]) -> bool:
     # encoders reject tiny 64x64 inputs even though they work for normal camera
     # resolutions; probing too small falsely disables a usable hardware encoder
     # and falls back to libx264.
+    if _is_gstreamer_encoder(encoder):
+        return _try_gstreamer_h264_encoder(256, 256, 15)
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi", "-i", "color=c=black:s=256x256:r=15:d=0.1",
@@ -462,6 +615,7 @@ def _h264_encoder(
     *,
     width: int | None = None,
     height: int | None = None,
+    allow_gstreamer: bool = False,
 ) -> tuple[str, list[str]]:
     """Pick an H.264 encoder + options.
 
@@ -480,7 +634,9 @@ def _h264_encoder(
     Set ``CYCLO_X264_PRESET`` / ``CYCLO_X264_CRF`` / ``CYCLO_X264_QP`` /
     ``CYCLO_X264_TUNE`` / ``CYCLO_X264_GOP`` / ``CYCLO_X264_THREADS`` to
     override the profile without changing conversion call sites.
-    Set ``CYCLO_H264_ENCODER=auto`` to probe hardware encoders first, or
+    Set ``CYCLO_H264_ENCODER=auto`` to probe hardware encoders first,
+    ``CYCLO_H264_ENCODER=gstreamer`` / ``jetson_gst`` / ``nvv4l2h264enc``
+    for Jetson GStreamer where the caller supports it, or
     ``CYCLO_H264_ENCODER=h264_nvenc`` / ``h264_nvmpi`` / ``h264_v4l2m2m`` /
     ``libx264`` to force one explicitly for a host whose measured bottleneck
     differs.
@@ -500,7 +656,20 @@ def _h264_encoder(
     if requested in ("", "default", "libx264", "x264", "software"):
         return _libx264_encoder()
 
+    if requested in ("gstreamer", "gst", "jetson_gst", "nvv4l2h264enc"):
+        if allow_gstreamer and _try_gstreamer_h264_encoder(
+            int(width or 256),
+            int(height or 256),
+            15,
+        ):
+            return _GSTREAMER_H264_ENCODER, list(_GSTREAMER_H264_ENCODER_OPTS)
+        return _libx264_encoder()
+
     if requested == "jetson":
+        if allow_gstreamer:
+            for name, opts in _gstreamer_hardware_encoder_candidates():
+                if _try_encoder(ffmpeg, name, opts):
+                    return name, list(opts)
         for name, opts in _jetson_hardware_encoder_candidates():
             if name == "h264_nvenc" and (
                 width is not None
@@ -513,6 +682,10 @@ def _h264_encoder(
         return _libx264_encoder()
 
     explicit: dict[str, tuple[str, list[str]]] = {
+        "gstreamer": (_GSTREAMER_H264_ENCODER, list(_GSTREAMER_H264_ENCODER_OPTS)),
+        "gst": (_GSTREAMER_H264_ENCODER, list(_GSTREAMER_H264_ENCODER_OPTS)),
+        "jetson_gst": (_GSTREAMER_H264_ENCODER, list(_GSTREAMER_H264_ENCODER_OPTS)),
+        "nvv4l2h264enc": (_GSTREAMER_H264_ENCODER, list(_GSTREAMER_H264_ENCODER_OPTS)),
         "nvenc": ("h264_nvenc", list(_NVENC_ENCODER_OPTS)),
         "nvmpi": ("h264_nvmpi", list(_HW_BITRATE_ENCODER_OPTS)),
         "v4l2m2m": ("h264_v4l2m2m", list(_HW_BITRATE_ENCODER_OPTS)),
@@ -524,7 +697,9 @@ def _h264_encoder(
     })
     if requested in explicit:
         name, opts = explicit[requested]
-        if name == "h264_nvenc" and (
+        if _is_gstreamer_encoder(name) and not allow_gstreamer:
+            name, opts = _libx264_encoder()
+        elif name == "h264_nvenc" and (
             width is not None
             and height is not None
             and min(int(width), int(height)) < _NVENC_MIN_DIMENSION
@@ -558,6 +733,7 @@ def _h264_encoder(
         os.environ.get(_X264_TUNE_ENV, ""),
         os.environ.get(_X264_GOP_ENV, ""),
         os.environ.get(_X264_THREADS_ENV, ""),
+        "gst" if allow_gstreamer else "ffmpeg",
     )
     with _H264_ENCODER_CACHE_LOCK:
         if (
@@ -567,17 +743,18 @@ def _h264_encoder(
             name, *opts = _H264_ENCODER_CACHE[cache_key]
             return name, opts
 
-        candidates = [
-            *_h264_hardware_encoder_candidates(),
-            _libx264_encoder(),
-        ]
+        candidates = []
+        if allow_gstreamer and _running_on_jetson():
+            candidates.extend(_gstreamer_hardware_encoder_candidates())
+        candidates.extend(_h264_hardware_encoder_candidates())
+        candidates.append(_libx264_encoder())
         probe = subprocess.run(
             [ffmpeg, "-hide_banner", "-encoders"],
             capture_output=True, text=True, check=False,
         )
         listed = probe.stdout
         for name, opts in candidates:
-            if name not in listed:
+            if not _is_gstreamer_encoder(name) and name not in listed:
                 continue
             if _try_encoder(ffmpeg, name, opts):
                 if not isinstance(_H264_ENCODER_CACHE, dict):
@@ -1710,22 +1887,37 @@ def _remux_selected_frames_ffmpeg_yuv420_pipe(
         "-pix_fmt", "yuv420p",
         "pipe:1",
     ]
-    encoder, enc_opts = _h264_encoder(ffmpeg, width=width, height=height)
-    encoder_cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
-        *_ffmpeg_threads_arg(),
-        "-f", "rawvideo",
-        "-pix_fmt", "yuv420p",
-        "-s", f"{width}x{height}",
-        "-r", str(int(target_fps)),
-        "-i", "pipe:0",
-        "-c:v", encoder,
-        *enc_opts,
-        "-pix_fmt", "yuv420p",
-        "-r", str(int(target_fps)),
-        "-video_track_timescale", "90000",
-        str(output_mp4),
-    ]
+    encoder, enc_opts = _h264_encoder(
+        ffmpeg,
+        width=width,
+        height=height,
+        allow_gstreamer=True,
+    )
+    if _is_gstreamer_encoder(encoder):
+        encoder_cmd = _gstreamer_h264_command(
+            input_pix_fmt="yuv420p",
+            width=width,
+            height=height,
+            fps=int(target_fps),
+            output_mp4=output_mp4,
+            opts=enc_opts,
+        )
+    else:
+        encoder_cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
+            *_ffmpeg_threads_arg(),
+            "-f", "rawvideo",
+            "-pix_fmt", "yuv420p",
+            "-s", f"{width}x{height}",
+            "-r", str(int(target_fps)),
+            "-i", "pipe:0",
+            "-c:v", encoder,
+            *enc_opts,
+            "-pix_fmt", "yuv420p",
+            "-r", str(int(target_fps)),
+            "-video_track_timescale", "90000",
+            str(output_mp4),
+        ]
 
     decoder: subprocess.Popen | None = None
     encoder_process: subprocess.Popen | None = None
@@ -1747,6 +1939,7 @@ def _remux_selected_frames_ffmpeg_yuv420_pipe(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=_gstreamer_env() if _is_gstreamer_encoder(encoder) else None,
         )
         assert decoder.stdout is not None
         assert encoder_process.stdin is not None
@@ -1783,7 +1976,8 @@ def _remux_selected_frames_ffmpeg_yuv420_pipe(
         )
         rc = encoder_process.wait(timeout=300)
         if rc != 0:
-            raise RuntimeError(f"ffmpeg encode rc={rc}: {stderr[-500:]}")
+            label = "gstreamer encode" if _is_gstreamer_encoder(encoder) else "ffmpeg encode"
+            raise RuntimeError(f"{label} rc={rc}: {stderr[-500:]}")
 
         produced_frames = _validate_stream_encoded_output(
             output_mp4,
@@ -1804,7 +1998,7 @@ def _remux_selected_frames_ffmpeg_yuv420_pipe(
             frame_count=int(produced_frames),
             stats=stats.to_stats(),
             used_fallback=False,
-            mode="stream_encode",
+            mode="gstreamer_encode" if _is_gstreamer_encoder(encoder) else "stream_encode",
             output_height=height,
             output_width=width,
         )
@@ -1856,23 +2050,40 @@ def _remux_selected_frames_ffmpeg_pipe(
         "-pix_fmt", "bgr24",
         "pipe:1",
     ]
-    encoder, enc_opts = _h264_encoder(ffmpeg, width=width, height=height)
-    encoder_cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
-        *_ffmpeg_threads_arg(),
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}",
-        "-r", str(int(target_fps)),
-        "-i", "pipe:0",
-        *_video_filter_args(rotation_deg, image_resize),
-        "-c:v", encoder,
-        *enc_opts,
-        "-pix_fmt", "yuv420p",
-        "-r", str(int(target_fps)),
-        "-video_track_timescale", "90000",
-        str(output_mp4),
-    ]
+    encoder, enc_opts = _h264_encoder(
+        ffmpeg,
+        width=width,
+        height=height,
+        allow_gstreamer=True,
+    )
+    if _is_gstreamer_encoder(encoder) and not rotation_deg and image_resize is None:
+        encoder_cmd = _gstreamer_h264_command(
+            input_pix_fmt="bgr24",
+            width=width,
+            height=height,
+            fps=int(target_fps),
+            output_mp4=output_mp4,
+            opts=enc_opts,
+        )
+    else:
+        if _is_gstreamer_encoder(encoder):
+            encoder, enc_opts = _libx264_encoder()
+        encoder_cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
+            *_ffmpeg_threads_arg(),
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}",
+            "-r", str(int(target_fps)),
+            "-i", "pipe:0",
+            *_video_filter_args(rotation_deg, image_resize),
+            "-c:v", encoder,
+            *enc_opts,
+            "-pix_fmt", "yuv420p",
+            "-r", str(int(target_fps)),
+            "-video_track_timescale", "90000",
+            str(output_mp4),
+        ]
 
     decoder: subprocess.Popen | None = None
     encoder_process: subprocess.Popen | None = None
@@ -1894,6 +2105,7 @@ def _remux_selected_frames_ffmpeg_pipe(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=_gstreamer_env() if _is_gstreamer_encoder(encoder) else None,
         )
         assert decoder.stdout is not None
         assert encoder_process.stdin is not None
@@ -1932,7 +2144,8 @@ def _remux_selected_frames_ffmpeg_pipe(
         )
         rc = encoder_process.wait(timeout=300)
         if rc != 0:
-            raise RuntimeError(f"ffmpeg encode rc={rc}: {stderr[-500:]}")
+            label = "gstreamer encode" if _is_gstreamer_encoder(encoder) else "ffmpeg encode"
+            raise RuntimeError(f"{label} rc={rc}: {stderr[-500:]}")
 
         produced_frames = _validate_stream_encoded_output(
             output_mp4,
@@ -1956,7 +2169,7 @@ def _remux_selected_frames_ffmpeg_pipe(
             frame_count=int(produced_frames),
             stats=stats.to_stats(),
             used_fallback=False,
-            mode="stream_encode",
+            mode="gstreamer_encode" if _is_gstreamer_encoder(encoder) else "stream_encode",
             output_height=output_height,
             output_width=output_width,
         )

@@ -76,6 +76,7 @@ services:
       - ZENOH_ROUTER_PORT=7447
       - ZENOH_CONFIG_OVERRIDE=transport/shared_memory/enabled=true
       - CYCLO_UI_PORT=${CYCLO_UI_PORT:-80}
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-all}
       - PYTHONUNBUFFERED=1
 
     volumes:
