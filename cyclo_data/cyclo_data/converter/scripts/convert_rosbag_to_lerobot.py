@@ -70,6 +70,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -85,14 +86,14 @@ from pathlib import Path
 # inner `cyclo_data/__init__.py`, so `import cyclo_data` finds it.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from cyclo_data.converter.to_lerobot_v21 import (
-    RosbagToLerobotConverter,
-    ConversionConfig,
-)
-from cyclo_data.converter.to_lerobot_v30 import (
-    RosbagToLerobotV30Converter,
-    V30ConversionConfig,
-)
+DEFAULT_DATA_FILE_SIZE_IN_MB = 100
+DEFAULT_VIDEO_FILE_SIZE_IN_MB = 200
+_ROSBAG_SEARCH_PRUNE_DIRS = {
+    ".cyclo_cache",
+    "_direct_aggregate_fallback",
+    "_stitched_subtasks",
+    "_subtask_video_concat",
+}
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -106,8 +107,56 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
+def max_profile_quiet_info() -> bool:
+    """True when max-speed conversion should avoid high-volume info logs."""
+    raw = os.environ.get("CYCLO_CONVERTER_INFO_LOGS")
+    if raw is not None:
+        return raw.strip().lower() not in {"1", "true", "yes", "on"}
+    profile = os.environ.get("CYCLO_X264_SPEED_PROFILE", "").strip().lower()
+    return profile in {"max", "maximum", "max_speed", "fastest"}
+
+
+def apply_speed_profile(speed_profile: str | None) -> None:
+    """Apply an explicit CLI speed profile to the encoder environment."""
+    if not speed_profile:
+        return
+    os.environ["CYCLO_X264_SPEED_PROFILE"] = speed_profile
+
+
+def apply_h264_encoder(h264_encoder: str | None) -> None:
+    """Apply an explicit CLI H.264 encoder selection."""
+    if not h264_encoder:
+        return
+    os.environ["CYCLO_H264_ENCODER"] = h264_encoder
+
+
+def apply_h264_decoder(h264_decoder: str | None) -> None:
+    """Apply an explicit CLI H.264 decoder selection."""
+    if not h264_decoder:
+        return
+    os.environ["CYCLO_H264_DECODER"] = h264_decoder
+
+
+def active_h264_encoder_label() -> str:
+    """Return the user-facing active H.264 encoder selection."""
+    explicit = os.environ.get("CYCLO_H264_ENCODER")
+    if explicit:
+        return explicit
+    profile = os.environ.get("CYCLO_X264_SPEED_PROFILE", "").strip().lower()
+    if profile in {"max", "maximum", "max_speed", "fastest"}:
+        return "auto (max profile)"
+    return "default"
+
+
+def active_h264_decoder_label() -> str:
+    """Return the user-facing active H.264 decoder selection."""
+    return os.environ.get("CYCLO_H264_DECODER", "default")
+
+
 def find_rosbags_in_directory(directory: Path) -> list[Path]:
     """Find all rosbag directories in a given directory."""
+    info_by_path: dict[Path, dict] = {}
+
     def read_info(path: Path) -> dict:
         try:
             info_path = path / "episode_info.json"
@@ -118,7 +167,7 @@ def find_rosbags_in_directory(directory: Path) -> list[Path]:
         return {}
 
     def sort_key(path: Path):
-        info = read_info(path)
+        info = info_by_path[path] if path in info_by_path else read_info(path)
         try:
             full_idx = int(info.get("full_episode_index"))
         except (TypeError, ValueError):
@@ -141,21 +190,25 @@ def find_rosbags_in_directory(directory: Path) -> list[Path]:
             return (10**9, 0, 10**9, str(path))
 
     rosbags = []
-    for item in directory.rglob("*"):
-        if not item.is_dir():
-            continue
-        rel = item.relative_to(directory)
-        if any(
-            part.endswith("_converted")
-            or part in {"_stitched_subtasks", "_subtask_video_concat"}
-            for part in rel.parts
-        ):
-            continue
-
-        if (item / "metadata.yaml").exists() and (
-            any(item.glob("*.mcap")) or any(item.glob("*.db3"))
-        ):
+    for root, dirnames, filenames in os.walk(directory):
+        has_episode_info = "episode_info.json" in filenames
+        has_rosbag = "metadata.yaml" in filenames and any(
+            name.endswith((".mcap", ".db3")) for name in filenames
+        )
+        if has_episode_info or has_rosbag:
+            item = Path(root)
+        if has_episode_info:
+            info_by_path[item] = read_info(item)
+        elif has_rosbag:
+            info_by_path[item] = {}
+        if has_rosbag:
             rosbags.append(item)
+
+        prune = set(_ROSBAG_SEARCH_PRUNE_DIRS)
+        prune.update(name for name in dirnames if name.endswith("_converted"))
+        if has_episode_info or has_rosbag:
+            prune.add("videos")
+        dirnames[:] = [name for name in dirnames if name not in prune]
 
     return sorted(rosbags, key=sort_key)
 
@@ -252,14 +305,66 @@ Examples:
     parser.add_argument(
         "--data-file-size",
         type=int,
-        default=100,
-        help="[v3.0] Target data file size in MB (default: 100)",
+        default=DEFAULT_DATA_FILE_SIZE_IN_MB,
+        help=(
+            "[v3.0] Target data file size in MB "
+            f"(default: {DEFAULT_DATA_FILE_SIZE_IN_MB})"
+        ),
     )
     parser.add_argument(
         "--video-file-size",
         type=int,
-        default=200,
-        help="[v3.0] Target video file size in MB (default: 200)",
+        default=DEFAULT_VIDEO_FILE_SIZE_IN_MB,
+        help=(
+            "[v3.0] Target video file size in MB "
+            f"(default: {DEFAULT_VIDEO_FILE_SIZE_IN_MB})"
+        ),
+    )
+    parser.add_argument(
+        "--speed-profile",
+        choices=["fast", "quality", "max"],
+        default=None,
+        help=(
+            "Video encoder profile. 'fast' is the portable default, "
+            "'quality' keeps the older CRF23 behavior, and 'max' prioritizes "
+            "throughput with the converter's fastest validated profile. "
+            "Defaults to CYCLO_X264_SPEED_PROFILE or 'fast'."
+        ),
+    )
+    parser.add_argument(
+        "--h264-encoder",
+        choices=[
+            "auto",
+            "software",
+            "libx264",
+            "h264_nvenc",
+            "h264_nvmpi",
+            "h264_v4l2m2m",
+            "h264_omx",
+            "jetson",
+        ],
+        default=None,
+        help=(
+            "H.264 encoder selection. Defaults to CYCLO_H264_ENCODER, "
+            "Jetson/Orin auto-probe, or portable libx264 on ordinary hosts."
+        ),
+    )
+    parser.add_argument(
+        "--h264-decoder",
+        choices=[
+            "auto",
+            "software",
+            "h264_cuvid",
+            "h264_nvmpi",
+            "h264_v4l2m2m",
+            "jetson",
+        ],
+        default=None,
+        help=(
+            "H.264 decoder selection for raw-video sync/aggregation. "
+            "Defaults to CYCLO_H264_DECODER, Jetson/Orin auto-probe, or "
+            "portable software decode on ordinary hosts."
+        ),
     )
 
     # Trim and exclude options
@@ -283,6 +388,9 @@ Examples:
     )
 
     args = parser.parse_args()
+    apply_speed_profile(args.speed_profile)
+    apply_h264_encoder(args.h264_encoder)
+    apply_h264_decoder(args.h264_decoder)
 
     # Setup logging
     logger = setup_logging(args.verbose)
@@ -312,14 +420,19 @@ Examples:
     logger.info(f"ROSbag to LeRobot {args.version} Converter")
     logger.info("=" * 60)
     logger.info(f"Input rosbags: {len(bag_paths)}")
-    for i, path in enumerate(bag_paths):
-        logger.info(f"  [{i}] {path}")
+    if args.verbose or not max_profile_quiet_info():
+        for i, path in enumerate(bag_paths):
+            logger.info(f"  [{i}] {path}")
     logger.info(f"Output directory: {args.output}")
     logger.info(f"Repository ID: {args.repo_id}")
     logger.info(f"Target FPS: {args.fps}")
     logger.info(f"Robot type: {args.robot_type}")
     logger.info(f"Apply trim: {not args.no_trim}")
     logger.info(f"Apply exclude regions: {not args.no_exclude}")
+    active_speed_profile = os.environ.get("CYCLO_X264_SPEED_PROFILE", "fast")
+    logger.info(f"Video speed profile: {active_speed_profile}")
+    logger.info(f"H.264 encoder: {active_h264_encoder_label()}")
+    logger.info(f"H.264 decoder: {active_h264_decoder_label()}")
     if args.robot_config:
         logger.info(f"Robot config: {args.robot_config}")
     if args.version == "v3.0":
@@ -328,6 +441,11 @@ Examples:
     logger.info("=" * 60)
 
     if args.version == "v3.0":
+        from cyclo_data.converter.to_lerobot_v30 import (
+            RosbagToLerobotV30Converter,
+            V30ConversionConfig,
+        )
+
         config = V30ConversionConfig(
             repo_id=args.repo_id,
             output_dir=args.output,
@@ -342,6 +460,11 @@ Examples:
         )
         converter = RosbagToLerobotV30Converter(config, logger)
     else:
+        from cyclo_data.converter.to_lerobot_v21 import (
+            ConversionConfig,
+            RosbagToLerobotConverter,
+        )
+
         config = ConversionConfig(
             repo_id=args.repo_id,
             output_dir=args.output,

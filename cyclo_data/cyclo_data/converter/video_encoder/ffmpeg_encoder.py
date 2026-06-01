@@ -107,7 +107,7 @@ class FFmpegEncoder(VideoEncoder):
         total_frames = len(self.buffer)
 
         # Directly construct FFmpeg command. Thread cap honours
-        # CYCLO_FFMPEG_THREADS (default 2) so a parallel-worker
+        # CYCLO_FFMPEG_THREADS (default 1) so a parallel-worker
         # conversion doesn't oversubscribe the host CPUs.
         from cyclo_data.converter.video_sync import _ffmpeg, _ffmpeg_threads_arg
         cmd = [_ffmpeg()]

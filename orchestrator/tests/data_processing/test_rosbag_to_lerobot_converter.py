@@ -18,14 +18,18 @@
 
 """Unit tests for RosbagToLerobotConverter."""
 
+import io
 import json
 import os
 import shutil
+import struct
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -60,6 +64,9 @@ from cyclo_data.converter.to_lerobot_v21 import (
     EpisodeData,
     RosbagToLerobotConverter,
 )
+from cyclo_data.converter import to_lerobot_v21 as v21
+from cyclo_data.converter import base_converter
+from cyclo_data.converter.base_converter import RosbagToLerobotConverterBase
 
 # The host test environment may carry a pandas/numpy ABI mismatch. The v3.0
 # converter only needs pandas for parquet aggregation, not for the video concat
@@ -70,12 +77,16 @@ if "pandas" not in sys.modules:
     pandas_stub.__version__ = "0.0.0"
     sys.modules["pandas"] = pandas_stub
 
+from cyclo_data.converter import to_lerobot_v30 as v30
 from cyclo_data.converter.to_lerobot_v30 import (
+    DEFAULT_VIDEO_PATH,
+    DEFAULT_VIDEO_FILE_SIZE_IN_MB,
     EpisodeMetadata,
     RosbagToLerobotV30Converter,
     V30ConversionConfig,
 )
 from cyclo_data.converter import video_sync
+from cyclo_data.converter.scripts import convert_rosbag_to_lerobot as convert_cli
 
 
 class TestConversionConfig(unittest.TestCase):
@@ -106,6 +117,235 @@ class TestConversionConfig(unittest.TestCase):
         self.assertEqual(config.robot_type, "ai_worker")
         self.assertEqual(config.chunks_size, 500)
         self.assertFalse(config.apply_trim)
+
+
+class TestConvertCliDiscovery(unittest.TestCase):
+    """Tests for input directory rosbag discovery."""
+
+    def test_find_rosbags_prunes_video_cache_and_converted_outputs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bag = root / "2"
+            bag.mkdir()
+            (bag / "metadata.yaml").write_text("rosbag", encoding="utf-8")
+            (bag / "2_0.mcap").write_bytes(b"mcap")
+            (bag / "episode_info.json").write_text(
+                json.dumps({"episode_index": 2}),
+                encoding="utf-8",
+            )
+
+            nested_video_bag = bag / "videos" / "2_0" / "not_a_bag"
+            nested_video_bag.mkdir(parents=True)
+            (nested_video_bag / "metadata.yaml").write_text(
+                "ignore",
+                encoding="utf-8",
+            )
+            (nested_video_bag / "fake.mcap").write_bytes(b"ignore")
+
+            cache_bag = root / ".cyclo_cache" / "cached_bag"
+            cache_bag.mkdir(parents=True)
+            (cache_bag / "metadata.yaml").write_text("ignore", encoding="utf-8")
+            (cache_bag / "fake.mcap").write_bytes(b"ignore")
+
+            converted_bag = root / "old_converted" / "3"
+            converted_bag.mkdir(parents=True)
+            (converted_bag / "metadata.yaml").write_text("ignore", encoding="utf-8")
+            (converted_bag / "fake.mcap").write_bytes(b"ignore")
+
+            found = convert_cli.find_rosbags_in_directory(root)
+
+        self.assertEqual(found, [bag])
+
+    def test_find_rosbags_still_finds_nested_group_dirs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bag = root / "group" / "7"
+            bag.mkdir(parents=True)
+            (bag / "metadata.yaml").write_text("rosbag", encoding="utf-8")
+            (bag / "7_0.mcap").write_bytes(b"mcap")
+
+            found = convert_cli.find_rosbags_in_directory(root)
+
+        self.assertEqual(found, [bag])
+
+
+class TestVideoProbeCaching(unittest.TestCase):
+    """Tests for repeated video metadata probes."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.converter = RosbagToLerobotConverterBase(
+            ConversionConfig(
+                repo_id="test/probe-cache",
+                output_dir=Path(self.temp_dir),
+            )
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def test_get_video_frame_count_caches_by_file_signature(self):
+        video_path = Path(self.temp_dir) / "video.mp4"
+        video_path.write_bytes(b"video")
+        calls = []
+
+        class FakeCapture:
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                return 7
+
+            def release(self):
+                pass
+
+        fake_cv2 = types.SimpleNamespace(
+            CAP_PROP_FRAME_COUNT=1,
+            VideoCapture=lambda path: calls.append(path) or FakeCapture(),
+        )
+
+        with patch.dict(sys.modules, {"cv2": fake_cv2}):
+            first = self.converter._get_video_frame_count(video_path)
+            second = self.converter._get_video_frame_count(video_path)
+
+        self.assertEqual(first, 7)
+        self.assertEqual(second, 7)
+        self.assertEqual(calls, [str(video_path)])
+
+    def test_probe_video_streams_caches_by_file_signature(self):
+        video_path = Path(self.temp_dir) / "video.mp4"
+        video_path.write_bytes(b"video")
+        payload = {"streams": [{"codec_type": "video", "codec_name": "h264"}]}
+
+        with patch.object(
+            base_converter.subprocess,
+            "run",
+            return_value=types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(payload),
+            ),
+        ) as run:
+            first = self.converter._probe_video_streams(video_path)
+            second = self.converter._probe_video_streams(video_path)
+
+        self.assertEqual(first, payload)
+        self.assertEqual(second, payload)
+        run.assert_called_once()
+
+
+class TestFileSignature(unittest.TestCase):
+    """Tests for file signature generation used by caches."""
+
+    def test_file_signature_uses_absolute_path_without_resolve_probe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "file.bin"
+            path.write_bytes(b"data")
+
+            with patch.object(
+                Path,
+                "resolve",
+                side_effect=AssertionError("resolve should not be needed"),
+            ):
+                signature = RosbagToLerobotConverterBase._file_signature(path)
+
+        self.assertEqual(signature["path"], os.path.abspath(os.fspath(path)))
+        self.assertEqual(signature["size"], 4)
+        self.assertIsInstance(signature["mtime_ns"], int)
+
+
+class TestRawCdrExtraction(unittest.TestCase):
+    """Tests for the direct CDR state/action fast parser."""
+
+    @staticmethod
+    def _align(buf: bytearray, alignment: int, origin: int = 4) -> None:
+        while (len(buf) - origin) % alignment:
+            buf.append(0)
+
+    @classmethod
+    def _write_i32(cls, buf: bytearray, value: int) -> None:
+        cls._align(buf, 4)
+        buf.extend(struct.pack("<i", value))
+
+    @classmethod
+    def _write_u32(cls, buf: bytearray, value: int) -> None:
+        cls._align(buf, 4)
+        buf.extend(struct.pack("<I", value))
+
+    @classmethod
+    def _write_string(cls, buf: bytearray, value: str) -> None:
+        raw = value.encode("utf-8") + b"\x00"
+        cls._write_u32(buf, len(raw))
+        buf.extend(raw)
+
+    @classmethod
+    def _write_header(cls, buf: bytearray) -> None:
+        cls._write_i32(buf, 1)
+        cls._write_u32(buf, 2)
+        cls._write_string(buf, "")
+
+    @classmethod
+    def _write_string_sequence(cls, buf: bytearray, values) -> None:
+        cls._write_u32(buf, len(values))
+        for value in values:
+            cls._write_string(buf, value)
+
+    @classmethod
+    def _write_float64_sequence(cls, buf: bytearray, values) -> None:
+        cls._write_u32(buf, len(values))
+        cls._align(buf, 8)
+        for value in values:
+            buf.extend(struct.pack("<d", float(value)))
+
+    def test_parse_raw_cdr_twist(self):
+        buf = bytearray(b"\x00\x01\x00\x00")
+        for value in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]:
+            buf.extend(struct.pack("<d", value))
+
+        positions, names = RosbagToLerobotConverterBase._extract_raw_cdr_positions(
+            "geometry_msgs/msg/Twist",
+            bytes(buf),
+        )
+
+        np.testing.assert_allclose(
+            positions,
+            np.array([1.0, 2.0, 6.0], dtype=np.float32),
+        )
+        self.assertEqual(names, [])
+
+    def test_parse_raw_cdr_joint_state(self):
+        buf = bytearray(b"\x00\x01\x00\x00")
+        self._write_header(buf)
+        self._write_string_sequence(buf, ["joint_a", "joint_b"])
+        self._write_float64_sequence(buf, [0.25, -0.5])
+
+        positions, names = RosbagToLerobotConverterBase._extract_raw_cdr_positions(
+            "sensor_msgs/msg/JointState",
+            bytes(buf),
+        )
+
+        self.assertEqual(names, ["joint_a", "joint_b"])
+        np.testing.assert_allclose(
+            positions,
+            np.array([0.25, -0.5], dtype=np.float32),
+        )
+
+    def test_parse_raw_cdr_joint_trajectory_first_point(self):
+        buf = bytearray(b"\x00\x01\x00\x00")
+        self._write_header(buf)
+        self._write_string_sequence(buf, ["joint_a", "joint_b"])
+        self._write_u32(buf, 1)
+        self._write_float64_sequence(buf, [1.25, 2.5])
+
+        positions, names = RosbagToLerobotConverterBase._extract_raw_cdr_positions(
+            "trajectory_msgs/msg/JointTrajectory",
+            bytes(buf),
+        )
+
+        self.assertEqual(names, ["joint_a", "joint_b"])
+        np.testing.assert_allclose(
+            positions,
+            np.array([1.25, 2.5], dtype=np.float32),
+        )
 
 
 class TestEpisodeData(unittest.TestCase):
@@ -143,6 +383,1235 @@ class TestEpisodeData(unittest.TestCase):
         self.assertEqual(episode.episode_index, 5)
         self.assertEqual(len(episode.timestamps), 3)
         self.assertEqual(episode.length, 3)
+
+
+class TestVideoSyncWorkerPolicy(unittest.TestCase):
+    """Tests for adaptive camera-sync worker defaults."""
+
+    def test_single_episode_can_use_all_camera_workers(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                RosbagToLerobotConverterBase._resolve_video_sync_camera_workers(4),
+                4,
+            )
+
+    def test_multi_episode_divides_global_sync_budget(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_CONVERSION_ACTIVE_WORKERS": "8"},
+            clear=True,
+        ):
+            self.assertEqual(
+                RosbagToLerobotConverterBase._resolve_video_sync_camera_workers(4),
+                1,
+            )
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_CONVERSION_ACTIVE_WORKERS": "4"},
+            clear=True,
+        ):
+            self.assertEqual(
+                RosbagToLerobotConverterBase._resolve_video_sync_camera_workers(4),
+                1,
+            )
+
+    def test_explicit_camera_worker_override_still_wins(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_CONVERSION_ACTIVE_WORKERS": "8",
+                "CYCLO_VIDEO_SYNC_CAMERA_WORKERS": "3",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                RosbagToLerobotConverterBase._resolve_video_sync_camera_workers(4),
+                3,
+            )
+
+    def test_conversion_worker_default_caps_at_four(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            base_converter.os,
+            "cpu_count",
+            return_value=24,
+        ):
+            self.assertEqual(
+                base_converter._resolve_conversion_worker_count(8),
+                4,
+            )
+
+    def test_v21_direct_video_requires_max_profile_or_opt_in(self):
+        config = ConversionConfig(
+            repo_id="test/dataset",
+            output_dir=Path("/tmp/test"),
+            fps=15,
+            use_videos=True,
+        )
+        converter = RosbagToLerobotConverter(config)
+        sources = {"cam": Path("/tmp/cam.mp4")}
+        with patch.object(
+            converter, "_direct_video_sources_for_bag", return_value=sources
+        ):
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertFalse(
+                    converter._can_use_direct_video_output(
+                        [Path("/bags/0"), Path("/bags/1")]
+                    )
+                )
+            with patch.dict(
+                os.environ,
+                {"CYCLO_X264_SPEED_PROFILE": "max"},
+                clear=True,
+            ):
+                self.assertTrue(
+                    converter._can_use_direct_video_output(
+                        [Path("/bags/0"), Path("/bags/1")]
+                    )
+                )
+            with patch.dict(
+                os.environ,
+                {"CYCLO_V21_ENABLE_DIRECT_VIDEO": "1"},
+                clear=True,
+            ):
+                self.assertTrue(
+                    converter._can_use_direct_video_output(
+                        [Path("/bags/0"), Path("/bags/1")]
+                    )
+                )
+
+    def test_v21_direct_video_batch_defaults_and_overrides(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                RosbagToLerobotConverter._direct_video_batch_episodes(),
+                32,
+            )
+            self.assertEqual(
+                RosbagToLerobotConverter._resolve_direct_video_workers(
+                    job_count=20,
+                    camera_count=4,
+                ),
+                5,
+            )
+            self.assertEqual(
+                RosbagToLerobotConverter._resolve_direct_video_cache_workers(
+                    job_count=20,
+                ),
+                1,
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_V21_DIRECT_VIDEO_BATCH_EPISODES": "7",
+                "CYCLO_V21_DIRECT_VIDEO_WORKERS": "9",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                RosbagToLerobotConverter._direct_video_batch_episodes(),
+                7,
+            )
+            self.assertEqual(
+                RosbagToLerobotConverter._resolve_direct_video_workers(
+                    job_count=20,
+                    camera_count=4,
+                ),
+                9,
+            )
+            self.assertEqual(
+                RosbagToLerobotConverter._resolve_direct_video_cache_workers(
+                    job_count=20,
+                ),
+                9,
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_V21_DIRECT_VIDEO_WORKERS": "9",
+                "CYCLO_V21_DIRECT_VIDEO_CACHE_WORKERS": "2",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                RosbagToLerobotConverter._resolve_direct_video_cache_workers(
+                    job_count=20,
+                ),
+                2,
+            )
+
+    def test_v21_direct_video_validation_default_and_override(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(RosbagToLerobotConverter._validate_direct_v21_video())
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertFalse(RosbagToLerobotConverter._validate_direct_v21_video())
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_V21_VALIDATE_DIRECT_VIDEO": "1",
+            },
+            clear=True,
+        ):
+            self.assertTrue(RosbagToLerobotConverter._validate_direct_v21_video())
+        with patch.dict(
+            os.environ,
+            {"CYCLO_V21_VALIDATE_DIRECT_VIDEO": "0"},
+            clear=True,
+        ):
+            self.assertFalse(RosbagToLerobotConverter._validate_direct_v21_video())
+        with patch.dict(
+            os.environ,
+            {"CYCLO_V21_VALIDATE_DIRECT_VIDEO": "yes"},
+            clear=True,
+        ):
+            self.assertTrue(RosbagToLerobotConverter._validate_direct_v21_video())
+
+    def test_v21_direct_video_forces_idr_only_for_nvenc(self):
+        self.assertEqual(
+            RosbagToLerobotConverter._segment_forced_idr_args("h264_nvenc"),
+            ["-forced-idr", "1"],
+        )
+        self.assertEqual(
+            RosbagToLerobotConverter._segment_forced_idr_args("libx264"),
+            [],
+        )
+
+    def test_v21_direct_video_removes_default_x264_all_intra_gop(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                RosbagToLerobotConverter._segment_encoder_opts(
+                    "libx264",
+                    ["-preset", "ultrafast", "-g", "1", "-qp", "51"],
+                ),
+                ["-preset", "ultrafast", "-qp", "51"],
+            )
+        with patch.dict(os.environ, {"CYCLO_X264_GOP": "1"}, clear=True):
+            self.assertEqual(
+                RosbagToLerobotConverter._segment_encoder_opts(
+                    "libx264",
+                    ["-preset", "ultrafast", "-g", "1"],
+                ),
+                ["-preset", "ultrafast", "-g", "1"],
+            )
+        self.assertEqual(
+            RosbagToLerobotConverter._segment_encoder_opts(
+                "h264_nvenc",
+                ["-preset", "p1", "-g", "1"],
+            ),
+            ["-preset", "p1", "-g", "1"],
+        )
+
+    def test_v30_direct_aggregate_removes_default_x264_all_intra_gop(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                RosbagToLerobotV30Converter._direct_aggregate_encoder_opts(
+                    "libx264",
+                    ["-preset", "ultrafast", "-g", "1", "-qp", "51"],
+                ),
+                ["-preset", "ultrafast", "-qp", "51"],
+            )
+        with patch.dict(os.environ, {"CYCLO_X264_GOP": "1"}, clear=True):
+            self.assertEqual(
+                RosbagToLerobotV30Converter._direct_aggregate_encoder_opts(
+                    "libx264",
+                    ["-preset", "ultrafast", "-g", "1"],
+                ),
+                ["-preset", "ultrafast", "-g", "1"],
+            )
+        self.assertEqual(
+            RosbagToLerobotV30Converter._direct_aggregate_encoder_opts(
+                "h264_nvenc",
+                ["-preset", "p1", "-g", "1"],
+            ),
+            ["-preset", "p1", "-g", "1"],
+        )
+
+    def test_v21_direct_video_restores_use_videos_after_parse_error(self):
+        config = ConversionConfig(
+            repo_id="test/dataset",
+            output_dir=Path("/tmp/test"),
+            fps=15,
+            use_videos=True,
+        )
+        converter = RosbagToLerobotConverter(config)
+        with patch.object(
+            converter,
+            "_can_use_direct_video_output",
+            return_value=True,
+        ), patch.object(
+            converter,
+            "_try_load_prepared_episode_for_bag",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertRaises(RuntimeError):
+                converter.convert_multiple_rosbags([Path("/bags/0"), Path("/bags/1")])
+
+        self.assertTrue(converter.config.use_videos)
+
+    def test_v21_direct_video_stores_and_reuses_source_synced_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source_dir = tmp / "source"
+            source_dir.mkdir()
+            source_video = source_dir / "cam.mp4"
+            source_video.write_bytes(b"raw-video")
+            (source_dir / "cam_timestamps.parquet").write_bytes(b"sidecar")
+
+            config = ConversionConfig(
+                repo_id="test/dataset",
+                output_dir=tmp / "out",
+                fps=15,
+                use_videos=True,
+            )
+            converter = RosbagToLerobotConverter(config)
+            converter._direct_v21_video_stats_cache = {}
+            episode = EpisodeData(
+                episode_index=0,
+                length=2,
+                grid_log_times_sec=[0.0, 1.0 / 15.0],
+            )
+            indices = np.asarray([0, 1], dtype=np.int64)
+            encoded = tmp / "encoded.mp4"
+            encoded.write_bytes(b"encoded-video")
+
+            converter._store_direct_v21_synced_cache(
+                episode=episode,
+                camera_name="cam",
+                video_path=source_video,
+                indices=indices,
+                output_path=encoded,
+                stats={"mean": [0.5], "count": [2]},
+                width=640,
+                height=480,
+            )
+
+            cache_video = source_dir / "cam_synced.mp4"
+            cache_sidecar = source_dir / "cam_synced.cache.json"
+            self.assertTrue(cache_video.exists())
+            self.assertTrue(cache_sidecar.exists())
+            self.assertEqual(cache_video.read_bytes(), b"encoded-video")
+            self.assertIn("cam", json.loads((source_dir / "video_stats.json").read_text()))
+
+            with patch.object(
+                converter,
+                "_grid_indices_for_raw_video",
+                return_value=indices,
+            ), patch(
+                "cyclo_data.converter.to_lerobot_v21._validated_video_count"
+            ) as validate:
+                reused = converter._try_reuse_direct_v21_synced_cache(
+                    tmp / "reuse",
+                    episode,
+                    "cam",
+                    source_video,
+                )
+
+            validate.assert_called_once()
+            self.assertIsNotNone(reused)
+            self.assertEqual(Path(reused).read_bytes(), b"encoded-video")
+            self.assertIn((0, "cam"), converter._direct_v21_video_stats_cache)
+
+    def test_v21_direct_video_cache_metadata_hit_skips_grid_scan(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source_dir = tmp / "source"
+            source_dir.mkdir()
+            source_video = source_dir / "cam.mp4"
+            source_video.write_bytes(b"raw-video")
+            (source_dir / "cam_timestamps.parquet").write_bytes(b"sidecar")
+
+            config = ConversionConfig(
+                repo_id="test/dataset",
+                output_dir=tmp / "out",
+                fps=15,
+                use_videos=True,
+            )
+            converter = RosbagToLerobotConverter(config)
+            converter._direct_v21_video_stats_cache = {}
+            episode = EpisodeData(
+                episode_index=0,
+                length=2,
+                grid_log_times_sec=[0.0, 1.0 / 15.0],
+            )
+            indices = np.asarray([0, 1], dtype=np.int64)
+            encoded = tmp / "encoded.mp4"
+            encoded.write_bytes(b"encoded-video")
+
+            converter._store_direct_v21_synced_cache(
+                episode=episode,
+                camera_name="cam",
+                video_path=source_video,
+                indices=indices,
+                output_path=encoded,
+                stats=None,
+                width=640,
+                height=480,
+            )
+
+            with patch.object(
+                converter,
+                "_grid_indices_for_raw_video",
+                side_effect=AssertionError("metadata hit should not scan sidecar"),
+            ), patch(
+                "cyclo_data.converter.to_lerobot_v21._validated_video_count"
+            ) as validate:
+                reused = converter._try_reuse_direct_v21_synced_cache(
+                    tmp / "reuse",
+                    episode,
+                    "cam",
+                    source_video,
+                )
+
+            self.assertIsNotNone(reused)
+            self.assertEqual(Path(reused).read_bytes(), b"encoded-video")
+            self.assertEqual(validate.call_args.kwargs["expected_frames"], 2)
+            with patch.object(
+                RosbagToLerobotConverterBase,
+                "_get_video_info",
+                side_effect=AssertionError("cached direct info expected"),
+            ):
+                info = converter._get_video_info(Path(reused))
+            self.assertEqual(info["video.width"], 640)
+            self.assertEqual(info["video.height"], 480)
+
+    def test_v21_direct_video_cache_validation_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source_dir = tmp / "source"
+            source_dir.mkdir()
+            source_video = source_dir / "cam.mp4"
+            source_video.write_bytes(b"raw-video")
+            (source_dir / "cam_timestamps.parquet").write_bytes(b"sidecar")
+
+            config = ConversionConfig(
+                repo_id="test/dataset",
+                output_dir=tmp / "out",
+                fps=15,
+                use_videos=True,
+            )
+            converter = RosbagToLerobotConverter(config)
+            converter._direct_v21_video_stats_cache = {}
+            episode = EpisodeData(episode_index=0, length=1)
+            indices = np.asarray([0], dtype=np.int64)
+            encoded = tmp / "encoded.mp4"
+            encoded.write_bytes(b"encoded-video")
+            converter._store_direct_v21_synced_cache(
+                episode=episode,
+                camera_name="cam",
+                video_path=source_video,
+                indices=indices,
+                output_path=encoded,
+                stats=None,
+                width=640,
+                height=480,
+            )
+
+            with patch.dict(
+                os.environ,
+                {"CYCLO_V21_VALIDATE_DIRECT_VIDEO": "0"},
+                clear=True,
+            ), patch.object(
+                converter,
+                "_grid_indices_for_raw_video",
+                return_value=indices,
+            ), patch(
+                "cyclo_data.converter.to_lerobot_v21._validated_video_count"
+            ) as validate:
+                reused = converter._try_reuse_direct_v21_synced_cache(
+                    tmp / "reuse",
+                    episode,
+                    "cam",
+                    source_video,
+                )
+
+            self.assertIsNotNone(reused)
+            validate.assert_not_called()
+
+    def test_v21_direct_video_cache_rejects_source_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source_dir = tmp / "source"
+            source_dir.mkdir()
+            source_video = source_dir / "cam.mp4"
+            source_video.write_bytes(b"raw-video")
+            (source_dir / "cam_timestamps.parquet").write_bytes(b"sidecar")
+
+            config = ConversionConfig(
+                repo_id="test/dataset",
+                output_dir=tmp / "out",
+                fps=15,
+                use_videos=True,
+            )
+            converter = RosbagToLerobotConverter(config)
+            converter._direct_v21_video_stats_cache = {}
+            episode = EpisodeData(episode_index=0, length=1)
+            indices = np.asarray([0], dtype=np.int64)
+            encoded = tmp / "encoded.mp4"
+            encoded.write_bytes(b"encoded-video")
+            converter._store_direct_v21_synced_cache(
+                episode=episode,
+                camera_name="cam",
+                video_path=source_video,
+                indices=indices,
+                output_path=encoded,
+                stats=None,
+                width=640,
+                height=480,
+            )
+            source_video.write_bytes(b"changed-video")
+
+            with patch.object(
+                converter,
+                "_grid_indices_for_raw_video",
+                return_value=indices,
+            ), patch(
+                "cyclo_data.converter.to_lerobot_v21._validated_video_count"
+            ) as validate:
+                reused = converter._try_reuse_direct_v21_synced_cache(
+                    tmp / "reuse",
+                    episode,
+                    "cam",
+                    source_video,
+                )
+
+            self.assertIsNone(reused)
+            validate.assert_not_called()
+
+    def test_v21_direct_video_retries_per_file_decoder_after_concat_error(self):
+        config = ConversionConfig(
+            repo_id="test/dataset",
+            output_dir=Path("/tmp/test"),
+            fps=15,
+            use_videos=True,
+        )
+        converter = RosbagToLerobotConverter(config)
+        pairs = [
+            (EpisodeData(episode_index=0), Path("/tmp/cam0.mp4")),
+            (EpisodeData(episode_index=1), Path("/tmp/cam1.mp4")),
+        ]
+        expected = {0: Path("/tmp/out0.mp4"), 1: Path("/tmp/out1.mp4")}
+
+        with patch.object(
+            converter,
+            "_write_direct_camera_segments",
+            side_effect=[
+                v21._DirectConcatDecoderError("concat rejected input"),
+                expected,
+            ],
+        ) as write_batch, patch.object(converter, "_log_warning") as log_warning:
+            result = converter._write_direct_camera_segments_with_retry(
+                Path("/tmp/out"),
+                "cam",
+                pairs,
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(write_batch.call_count, 2)
+        self.assertTrue(write_batch.call_args_list[0].kwargs["use_concat_decoder"])
+        self.assertFalse(write_batch.call_args_list[1].kwargs["use_concat_decoder"])
+        log_warning.assert_called_once()
+
+    def test_v21_concat_decoder_coalesces_contiguous_splice_runs(self):
+        class FakeDecoder:
+            def __init__(self, payload: bytes):
+                self.stdout = io.BytesIO(payload)
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        config = ConversionConfig(
+            repo_id="test/dataset",
+            output_dir=Path("/tmp/test"),
+            fps=15,
+            use_videos=True,
+        )
+        converter = RosbagToLerobotConverter(config)
+        frame_size = 6
+        frames = [bytes([idx]) * frame_size for idx in range(5)]
+        output = io.BytesIO()
+        splice_sizes = []
+
+        def fake_splice(src, dst, size):
+            data = src.read(size)
+            dst.write(data)
+            splice_sizes.append(size)
+            return len(data)
+
+        with patch(
+            "cyclo_data.converter.to_lerobot_v21.subprocess.Popen",
+            return_value=FakeDecoder(b"".join(frames)),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v21._splice_exact",
+            side_effect=fake_splice,
+        ):
+            written = converter._pipe_selected_yuv420_frames_concat_decoder(
+                "ffmpeg",
+                [
+                    (
+                        EpisodeData(episode_index=0),
+                        Path("a.mp4"),
+                        np.array([0, 1, 2, 4]),
+                        5,
+                        None,
+                    ),
+                ],
+                frame_size,
+                output,
+                width=2,
+                height=2,
+            )
+
+        self.assertEqual(written, 4)
+        self.assertEqual(
+            output.getvalue(),
+            frames[0] + frames[1] + frames[2] + frames[4],
+        )
+        self.assertEqual(splice_sizes, [frame_size * 3, frame_size])
+
+    def test_v21_raw_video_grid_mapping_uses_recv_timestamp_order(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            video_path = tmp / "cam.mp4"
+            video_path.write_bytes(b"video")
+            pq.write_table(
+                pa.table({
+                    "frame_index": pa.array([0, 1, 2], type=pa.int32()),
+                    "header_stamp_ns": pa.array([0, 100, 200], type=pa.int64()),
+                    "recv_ns": pa.array([200, 0, 100], type=pa.int64()),
+                }),
+                tmp / "cam_timestamps.parquet",
+            )
+            converter = RosbagToLerobotConverter(
+                ConversionConfig(
+                    repo_id="test/dataset",
+                    output_dir=tmp / "out",
+                    fps=15,
+                    use_videos=True,
+                )
+            )
+            episode = EpisodeData(
+                episode_index=0,
+                length=3,
+                grid_log_times_sec=[0.0, 0.0000001, 0.0000002],
+            )
+
+            indices, source_count = (
+                converter._grid_indices_and_source_count_for_raw_video(
+                    episode,
+                    "cam",
+                    video_path,
+                )
+            )
+
+        self.assertEqual(source_count, 3)
+        self.assertEqual(indices.tolist(), [1, 2, 0])
+
+    def test_conversion_worker_max_profile_caps_at_sixteen(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ), patch.object(
+            base_converter.os,
+            "cpu_count",
+            return_value=32,
+        ):
+            self.assertEqual(
+                base_converter._resolve_conversion_worker_count(53),
+                16,
+            )
+
+    def test_max_profile_suppresses_internal_info_logs_by_default(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertFalse(base_converter._converter_info_logs_enabled())
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_CONVERTER_INFO_LOGS": "1",
+            },
+            clear=True,
+        ):
+            self.assertTrue(base_converter._converter_info_logs_enabled())
+
+    def test_max_profile_quiets_cli_input_listing_by_default(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertTrue(convert_cli.max_profile_quiet_info())
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_CONVERTER_INFO_LOGS": "1",
+            },
+            clear=True,
+        ):
+            self.assertFalse(convert_cli.max_profile_quiet_info())
+
+    def test_cli_speed_profile_sets_encoder_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            convert_cli.apply_speed_profile("max")
+            self.assertEqual(os.environ["CYCLO_X264_SPEED_PROFILE"], "max")
+
+        with patch.dict(os.environ, {"CYCLO_X264_SPEED_PROFILE": "quality"}, clear=True):
+            convert_cli.apply_speed_profile(None)
+            self.assertEqual(os.environ["CYCLO_X264_SPEED_PROFILE"], "quality")
+
+    def test_cli_h264_encoder_sets_encoder_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            convert_cli.apply_h264_encoder("h264_nvenc")
+            self.assertEqual(os.environ["CYCLO_H264_ENCODER"], "h264_nvenc")
+
+        with patch.dict(os.environ, {"CYCLO_H264_ENCODER": "jetson"}, clear=True):
+            convert_cli.apply_h264_encoder(None)
+            self.assertEqual(os.environ["CYCLO_H264_ENCODER"], "jetson")
+
+    def test_cli_h264_decoder_sets_decoder_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            convert_cli.apply_h264_decoder("h264_cuvid")
+            self.assertEqual(os.environ["CYCLO_H264_DECODER"], "h264_cuvid")
+
+        with patch.dict(os.environ, {"CYCLO_H264_DECODER": "jetson"}, clear=True):
+            convert_cli.apply_h264_decoder(None)
+            self.assertEqual(os.environ["CYCLO_H264_DECODER"], "jetson")
+
+    def test_cli_h264_decoder_label_uses_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(convert_cli.active_h264_decoder_label(), "default")
+        with patch.dict(os.environ, {"CYCLO_H264_DECODER": "software"}, clear=True):
+            self.assertEqual(convert_cli.active_h264_decoder_label(), "software")
+
+    def test_cli_h264_encoder_label_mentions_max_auto(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertEqual(
+                convert_cli.active_h264_encoder_label(),
+                "auto (max profile)",
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_H264_ENCODER": "software",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                convert_cli.active_h264_encoder_label(),
+                "software",
+            )
+
+    def test_conversion_worker_env_override_can_exceed_default_cap(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_CONVERSION_MAX_WORKERS": "8"},
+            clear=True,
+        ):
+            self.assertEqual(
+                base_converter._resolve_conversion_worker_count(8),
+                8,
+            )
+
+    def test_video_sync_staging_dir_hashes_source_video_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "bag" / "videos"
+            source.mkdir(parents=True)
+            staging = Path(tmpdir) / "stage"
+            with patch.dict(
+                os.environ,
+                {"CYCLO_VIDEO_SYNC_STAGING_DIR": str(staging)},
+                clear=True,
+            ):
+                out_dir = RosbagToLerobotConverterBase._video_sync_output_dir(
+                    source
+                )
+
+            self.assertTrue(str(out_dir).startswith(str(staging)))
+            self.assertTrue(out_dir.exists())
+            self.assertNotEqual(out_dir, source)
+
+
+class TestCloneOrCopyFile(unittest.TestCase):
+    """Tests for reflink/copy helper used by video writers."""
+
+    def test_same_path_returns_without_copy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "video.mp4"
+            src.write_bytes(b"video")
+
+            with patch.object(
+                Path,
+                "resolve",
+                side_effect=AssertionError("resolve should not be needed"),
+            ), patch.object(
+                base_converter.shutil,
+                "copyfile",
+                side_effect=AssertionError("copy should not run"),
+            ):
+                mode = base_converter._clone_or_copy_file(src, src)
+
+            self.assertEqual(mode, "same_path")
+
+    def test_reflink_failure_falls_back_to_copyfile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src = tmp / "src.mp4"
+            dst = tmp / "dst.mp4"
+            src.write_bytes(b"video")
+
+            fake_fcntl = types.SimpleNamespace(
+                ioctl=MagicMock(side_effect=OSError("no reflink"))
+            )
+            with patch.dict(sys.modules, {"fcntl": fake_fcntl}), patch.object(
+                base_converter.shutil,
+                "copyfile",
+                wraps=base_converter.shutil.copyfile,
+            ) as mock_copy:
+                mode = base_converter._clone_or_copy_file(src, dst)
+
+            self.assertEqual(mode, "copy")
+            mock_copy.assert_called_once()
+            self.assertEqual(dst.read_bytes(), b"video")
+
+    def test_reflink_failure_is_memoized_by_device_pair(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src = tmp / "src.mp4"
+            dst_a = tmp / "dst-a.mp4"
+            dst_b = tmp / "dst-b.mp4"
+            src.write_bytes(b"video")
+
+            unsupported_dev_pairs = set(
+                base_converter._REFLINK_UNSUPPORTED_DEV_PAIRS
+            )
+            base_converter._REFLINK_UNSUPPORTED_DEV_PAIRS.clear()
+            fake_fcntl = types.SimpleNamespace(
+                ioctl=MagicMock(side_effect=OSError("no reflink"))
+            )
+            try:
+                with patch.dict(sys.modules, {"fcntl": fake_fcntl}), patch.object(
+                    base_converter.shutil,
+                    "copyfile",
+                    wraps=base_converter.shutil.copyfile,
+                ) as mock_copy:
+                    first = base_converter._clone_or_copy_file(src, dst_a)
+                    second = base_converter._clone_or_copy_file(src, dst_b)
+            finally:
+                base_converter._REFLINK_UNSUPPORTED_DEV_PAIRS.clear()
+                base_converter._REFLINK_UNSUPPORTED_DEV_PAIRS.update(
+                    unsupported_dev_pairs
+                )
+
+            self.assertEqual(first, "copy")
+            self.assertEqual(second, "copy")
+            fake_fcntl.ioctl.assert_called_once()
+            self.assertEqual(mock_copy.call_count, 2)
+
+    def test_hardlink_mode_uses_os_link(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src = tmp / "src.mp4"
+            dst = tmp / "dst.mp4"
+            src.write_bytes(b"video")
+
+            with patch.dict(os.environ, {"CYCLO_VIDEO_COPY_MODE": "hardlink"}):
+                mode = base_converter._clone_or_copy_file(src, dst)
+
+            self.assertEqual(mode, "hardlink")
+            self.assertEqual(dst.read_bytes(), b"video")
+            self.assertEqual(src.stat().st_ino, dst.stat().st_ino)
+
+
+class TestEpisodeExtractCache(unittest.TestCase):
+    """Tests for persistent state/action extraction cache."""
+
+    def test_cache_path_changes_when_source_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            mcap = bag / "episode.mcap"
+            mcap.write_bytes(b"one")
+            converter = RosbagToLerobotConverterBase(
+                ConversionConfig(repo_id="test", output_dir=bag / "out", fps=15)
+            )
+
+            first = converter._episode_extract_cache_path(bag, None, [])
+            mcap.write_bytes(b"two")
+            second = converter._episode_extract_cache_path(bag, None, [])
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertNotEqual(first, second)
+
+    def test_extract_joint_data_uses_cache_before_opening_bag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "episode.mcap").write_bytes(b"fake")
+            config = ConversionConfig(repo_id="test", output_dir=bag / "out", fps=15)
+            writer = RosbagToLerobotConverterBase(config)
+            writer._state_joint_names = ["joint_a"]
+            writer._action_joint_names = ["joint_b"]
+            cached = EpisodeData(
+                episode_index=1,
+                timestamps=[0.0],
+                observation_state=[np.array([1.0], dtype=np.float32)],
+                action=[np.array([2.0], dtype=np.float32)],
+                video_files={"cam": Path("raw.mp4")},
+                source_path=Path("source"),
+                length=1,
+            )
+            cache_path = writer._episode_extract_cache_path(bag, None, [])
+            self.assertIsNotNone(cache_path)
+            writer._store_episode_extract_cache(
+                cache_path,
+                episode=cached,
+                staleness_metrics={},
+            )
+
+            reader = RosbagToLerobotConverterBase(config)
+            with patch(
+                "cyclo_data.converter.base_converter.BagReader.open",
+                side_effect=AssertionError("cache miss"),
+            ):
+                episode = reader._extract_joint_data(bag, 7, None, [])
+
+            self.assertIsNotNone(episode)
+            self.assertEqual(episode.episode_index, 7)
+            self.assertEqual(episode.length, 1)
+            self.assertEqual(episode.video_files, {})
+            self.assertIsNone(episode.source_path)
+            self.assertEqual(reader._state_joint_names, ["joint_a"])
+            self.assertEqual(reader._action_joint_names, ["joint_b"])
+
+    def test_extract_cache_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "episode.mcap").write_bytes(b"fake")
+            converter = RosbagToLerobotConverterBase(
+                ConversionConfig(repo_id="test", output_dir=bag / "out", fps=15)
+            )
+
+            with patch.dict(os.environ, {"CYCLO_EXTRACT_CACHE_DISABLE": "1"}):
+                self.assertIsNone(
+                    converter._episode_extract_cache_path(bag, None, [])
+                )
+
+
+class TestPreparedEpisodeCache(unittest.TestCase):
+    """Tests for fully prepared episode cache."""
+
+    def _make_cached_episode(self, bag: Path) -> EpisodeData:
+        video_dir = bag / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        synced = video_dir / "cam_left_head_synced.mp4"
+        synced.write_bytes(b"synced")
+        return EpisodeData(
+            episode_index=1,
+            timestamps=[0.0],
+            observation_state=[np.array([1.0], dtype=np.float32)],
+            action=[np.array([2.0], dtype=np.float32)],
+            video_files={"cam_left_head": synced},
+            tasks=["cached task"],
+            length=1,
+        )
+
+    def test_convert_single_uses_prepared_cache_before_extract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "episode.mcap").write_bytes(b"fake")
+            config = ConversionConfig(repo_id="test", output_dir=bag / "out", fps=15)
+            writer = RosbagToLerobotConverterBase(config)
+            episode = self._make_cached_episode(bag)
+            cache_path = writer._prepared_episode_cache_path(bag, {}, None, [])
+            self.assertIsNotNone(cache_path)
+            writer._store_prepared_episode_cache(cache_path, episode)
+            self.assertEqual(
+                episode._cyclo_prepared_cache_signature["path"],
+                str(cache_path),
+            )
+
+            reader = RosbagToLerobotConverterBase(config)
+            with patch.object(
+                reader,
+                "_extract_joint_data",
+                side_effect=AssertionError("prepared cache miss"),
+            ):
+                loaded = reader.convert_single_rosbag(bag, 7)
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.episode_index, 7)
+            self.assertIsNone(loaded.full_episode_index)
+            self.assertEqual(loaded.length, 1)
+            self.assertEqual(loaded.tasks, ["cached task"])
+            self.assertEqual(
+                loaded._cyclo_prepared_cache_signature["path"],
+                str(cache_path),
+            )
+            self.assertEqual(
+                loaded.video_files["cam_left_head"].name,
+                "cam_left_head_synced.mp4",
+            )
+
+    def test_prepared_cache_rejects_changed_synced_video(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "episode.mcap").write_bytes(b"fake")
+            config = ConversionConfig(repo_id="test", output_dir=bag / "out", fps=15)
+            writer = RosbagToLerobotConverterBase(config)
+            episode = self._make_cached_episode(bag)
+            cache_path = writer._prepared_episode_cache_path(bag, {}, None, [])
+            self.assertIsNotNone(cache_path)
+            writer._store_prepared_episode_cache(cache_path, episode)
+
+            episode.video_files["cam_left_head"].write_bytes(b"changed")
+            reader = RosbagToLerobotConverterBase(config)
+            self.assertIsNone(
+                reader._load_prepared_episode_cache(
+                    cache_path,
+                    episode_index=1,
+                    bag_path=bag,
+                )
+            )
+
+    def test_parent_can_load_prepared_cache_without_worker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "episode.mcap").write_bytes(b"fake")
+            config = ConversionConfig(repo_id="test", output_dir=bag / "out", fps=15)
+            writer = RosbagToLerobotConverterBase(config)
+            writer._state_joint_names = ["joint_a"]
+            writer._action_joint_names = ["joint_b"]
+            episode = self._make_cached_episode(bag)
+            cache_path = writer._prepared_episode_cache_path(bag, {}, None, [])
+            self.assertIsNotNone(cache_path)
+            writer._store_prepared_episode_cache(cache_path, episode)
+
+            reader = RosbagToLerobotConverterBase(config)
+            loaded = reader._try_load_prepared_episode_for_bag(bag, 3)
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.episode_index, 3)
+            self.assertEqual(loaded.length, 1)
+            self.assertEqual(reader._state_joint_names, ["joint_a"])
+            self.assertEqual(reader._action_joint_names, ["joint_b"])
+
+    def test_synced_cache_identity_ignores_metadata(self):
+        cached = {
+            "target_fps": 15,
+            "frame_count": 2,
+            "frame_indices_sha256": "abc",
+            "output_height": 480,
+            "output_width": 640,
+        }
+        desired = {
+            "target_fps": 15,
+            "frame_count": 2,
+            "frame_indices_sha256": "abc",
+        }
+
+        self.assertTrue(
+            RosbagToLerobotConverterBase._synced_cache_identity_matches(
+                cached, desired
+            )
+        )
+
+    def test_prepared_cache_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "episode.mcap").write_bytes(b"fake")
+            converter = RosbagToLerobotConverterBase(
+                ConversionConfig(repo_id="test", output_dir=bag / "out", fps=15)
+            )
+
+            with patch.dict(
+                os.environ,
+                {"CYCLO_PREPARED_EPISODE_CACHE_DISABLE": "1"},
+            ):
+                self.assertIsNone(
+                    converter._prepared_episode_cache_path(bag, {}, None, [])
+                )
+
+
+class TestVideoDisabledFastPath(unittest.TestCase):
+    """Tests for skipping video work when videos are disabled."""
+
+    def test_convert_single_skips_video_discovery_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "episode.mcap").write_bytes(b"fake")
+            converter = RosbagToLerobotConverterBase(
+                ConversionConfig(
+                    repo_id="test",
+                    output_dir=bag / "out",
+                    fps=15,
+                    use_videos=False,
+                )
+            )
+            extracted = EpisodeData(
+                episode_index=0,
+                timestamps=[0.0],
+                observation_state=[np.array([1.0], dtype=np.float32)],
+                action=[np.array([2.0], dtype=np.float32)],
+                length=1,
+            )
+
+            with patch.object(
+                converter, "_extract_joint_data", return_value=extracted
+            ), patch.object(
+                converter,
+                "_find_video_files",
+                side_effect=AssertionError("video discovery should be skipped"),
+            ):
+                episode = converter.convert_single_rosbag(bag, 0)
+
+            self.assertIsNotNone(episode)
+            self.assertEqual(episode.video_files, {})
+
+    def test_archived_segments_skip_video_work_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "0_0.mcap").write_bytes(b"fake")
+            (bag / "episode_info.json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "sub_task_instruction": "segment",
+                                "frame_duration": [0.0, 0.1],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            converter = RosbagToLerobotConverterBase(
+                ConversionConfig(
+                    repo_id="test",
+                    output_dir=bag / "out",
+                    fps=10,
+                    use_videos=False,
+                )
+            )
+            segment_episode = EpisodeData(
+                episode_index=0,
+                timestamps=[0.0],
+                observation_state=[np.array([1.0], dtype=np.float32)],
+                action=[np.array([2.0], dtype=np.float32)],
+                length=1,
+            )
+
+            with patch.object(
+                converter, "_extract_joint_data", return_value=segment_episode
+            ), patch.object(
+                converter,
+                "_find_segment_video_files",
+                side_effect=AssertionError("segment video discovery should be skipped"),
+            ), patch.object(
+                converter,
+                "_stitch_subtask_videos",
+                side_effect=AssertionError("video stitching should be skipped"),
+            ):
+                episode = converter.convert_single_rosbag(bag, 0)
+
+            self.assertIsNotNone(episode)
+            self.assertEqual(episode.video_files, {})
+            self.assertEqual(episode.length, 1)
+
+    def test_single_archived_segment_reuses_episode_without_stitching(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            (bag / "0_0.mcap").write_bytes(b"fake")
+            video_path = bag / "videos" / "0_0" / "cam_left_head_synced.mp4"
+            video_path.parent.mkdir(parents=True)
+            video_path.write_bytes(b"mp4")
+            (bag / "episode_info.json").write_text(
+                json.dumps(
+                    {
+                        "task_instruction": "main task",
+                        "task_name": "task",
+                        "segments": [
+                            {
+                                "sub_task_instruction": "single segment",
+                                "frame_duration": [0.0, 0.2],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            converter = RosbagToLerobotConverterBase(
+                ConversionConfig(
+                    repo_id="test",
+                    output_dir=bag / "out",
+                    fps=10,
+                    use_videos=True,
+                )
+            )
+            segment_episode = EpisodeData(
+                episode_index=99,
+                timestamps=[0.0, 0.1],
+                observation_state=[
+                    np.array([1.0], dtype=np.float32),
+                    np.array([2.0], dtype=np.float32),
+                ],
+                action=[
+                    np.array([3.0], dtype=np.float32),
+                    np.array([4.0], dtype=np.float32),
+                ],
+                length=2,
+                video_files={"cam_left_head": video_path},
+            )
+
+            def sync_segment(_mcap_path, episode):
+                episode.video_files = {"cam_left_head": video_path}
+                return episode
+
+            with patch.object(
+                converter, "_extract_joint_data", return_value=segment_episode
+            ), patch.object(
+                converter,
+                "_find_segment_video_files",
+                return_value={"cam_left_head": video_path},
+            ), patch.object(
+                converter, "_sync_videos_to_grid", side_effect=sync_segment
+            ), patch.object(
+                converter,
+                "_stitch_subtask_videos",
+                side_effect=AssertionError("single segment should not stitch"),
+            ):
+                episode = converter.convert_single_rosbag(bag, 7)
+
+            self.assertIs(episode, segment_episode)
+            self.assertEqual(episode.episode_index, 7)
+            self.assertEqual(episode.length, 2)
+            self.assertEqual(episode.video_files, {"cam_left_head": video_path})
+            self.assertEqual(episode.subtask_indices, [0, 0])
+            self.assertEqual(
+                episode.subtask_segments[0]["sub_task_instruction"],
+                "single segment",
+            )
 
 
 class TestSubtaskStitching(unittest.TestCase):
@@ -378,11 +1847,307 @@ class TestRosbagToLerobotConverter(unittest.TestCase):
         self.assertEqual(self.converter._features["observation.state"]["shape"], (3,))
         self.assertEqual(self.converter._features["action"]["shape"], (3,))
 
+    def test_get_video_info_uses_synced_cache_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "cam_left_head_synced.mp4"
+            video_path.write_bytes(b"video")
+            video_path.with_name(video_path.stem + ".cache.json").write_text(
+                json.dumps({
+                    "target_fps": self.converter.config.fps,
+                    "output_height": 480,
+                    "output_width": 640,
+                    "output_codec": "h264",
+                    "output_pix_fmt": "yuv420p",
+                    "has_audio": False,
+                }),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                self.converter,
+                "_get_video_dimensions",
+                side_effect=AssertionError("dimensions should come from cache"),
+            ), patch(
+                "cyclo_data.converter.base_converter.subprocess.run",
+                side_effect=AssertionError("ffprobe should not run"),
+            ):
+                info = self.converter._get_video_info(video_path)
+
+        self.assertEqual(info["video.height"], 480)
+        self.assertEqual(info["video.width"], 640)
+        self.assertEqual(info["video.codec"], "h264")
+        self.assertEqual(info["video.pix_fmt"], "yuv420p")
+
     def test_v21_video_feature_key_uses_rgb_prefix(self):
         self.assertEqual(
             self.converter._video_feature_key("cam_left_head"),
             "observation.images.rgb.cam_left_head",
         )
+
+    @patch("cyclo_data.converter.base_converter.subprocess.run")
+    def test_segment_video_prepare_uses_stream_copy_when_compatible(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            list_path = tmp / "concat.txt"
+            list_path.write_text("", encoding="utf-8")
+            srcs = [tmp / "a.mp4", tmp / "b.mp4"]
+            for src in srcs:
+                src.write_bytes(b"mp4")
+            out_path = tmp / "out.mp4"
+
+            def fake_run(cmd, *args, **kwargs):
+                out_path.write_bytes(b"copy")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            mock_run.side_effect = fake_run
+            with patch.object(
+                self.converter,
+                "_segment_copy_compatibility",
+                return_value=(5, 300_000_000),
+            ), patch.object(
+                self.converter, "_get_video_frame_count", return_value=5
+            ), patch.object(
+                self.converter, "_video_decodes_successfully", return_value=True
+            ):
+                result = self.converter._try_prepare_segment_video_copy(
+                    "ffmpeg", list_path, srcs, out_path
+                )
+
+            cmd = mock_run.call_args.args[0]
+            self.assertTrue(result)
+            self.assertIn("-c:v", cmd)
+            self.assertIn("copy", cmd)
+
+    @patch("cyclo_data.converter.base_converter.subprocess.run")
+    def test_segment_video_copy_skips_tiny_clips(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            list_path = tmp / "concat.txt"
+            srcs = [tmp / "a.mp4"]
+            srcs[0].write_bytes(b"mp4")
+            out_path = tmp / "out.mp4"
+
+            with patch.object(
+                self.converter,
+                "_segment_copy_compatibility",
+                return_value=(5, 1),
+            ):
+                result = self.converter._try_prepare_segment_video_copy(
+                    "ffmpeg", list_path, srcs, out_path
+                )
+
+            self.assertFalse(result)
+            mock_run.assert_not_called()
+
+    @patch("cyclo_data.converter.base_converter.subprocess.run")
+    def test_single_subtask_stitch_reuses_synced_video(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "cam_left_head_synced.mp4"
+            video_path.write_bytes(b"mp4")
+            episode = EpisodeData(
+                episode_index=0,
+                video_files={"cam_left_head": video_path},
+            )
+
+            stitched = self.converter._stitch_subtask_videos(0, [episode])
+
+            self.assertEqual(stitched, {"cam_left_head": video_path})
+            mock_run.assert_not_called()
+
+    @patch("cyclo_data.converter.base_converter.subprocess.run")
+    def test_multi_subtask_stitch_tries_stream_copy(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            video_a = tmp / "a.mp4"
+            video_b = tmp / "b.mp4"
+            video_a.write_bytes(b"a")
+            video_b.write_bytes(b"b")
+            episodes = [
+                EpisodeData(episode_index=0, video_files={"cam_left_head": video_a}),
+                EpisodeData(episode_index=0, video_files={"cam_left_head": video_b}),
+            ]
+
+            with patch.object(
+                self.converter,
+                "_try_prepare_segment_video_copy",
+                return_value=True,
+            ) as mock_copy:
+                stitched = self.converter._stitch_subtask_videos(0, episodes)
+
+            self.assertIn("cam_left_head", stitched)
+            self.assertTrue(stitched["cam_left_head"].name.endswith(".mp4"))
+            mock_copy.assert_called_once()
+            mock_run.assert_not_called()
+
+    def test_synced_video_cache_is_kept_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            synced = tmp / "cam_left_head_synced.mp4"
+            cache = tmp / "cam_left_head_synced.cache.json"
+            synced.write_bytes(b"mp4")
+            cache.write_text("{}", encoding="utf-8")
+
+            with patch.dict(os.environ, {}, clear=True):
+                removed = self.converter._cleanup_source_synced_cache([tmp])
+
+            self.assertEqual(removed, 0)
+            self.assertTrue(synced.exists())
+            self.assertTrue(cache.exists())
+
+    def test_synced_video_cache_cleanup_can_be_forced(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            synced = tmp / "cam_left_head_synced.mp4"
+            cache = tmp / "cam_left_head_synced.cache.json"
+            synced.write_bytes(b"mp4")
+            cache.write_text("{}", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {"CYCLO_VIDEO_SYNC_CLEAN_CACHE": "1"},
+                clear=True,
+            ):
+                removed = self.converter._cleanup_source_synced_cache([tmp])
+
+            self.assertEqual(removed, 2)
+            self.assertFalse(synced.exists())
+            self.assertFalse(cache.exists())
+
+    def test_stitched_video_stats_merge_without_decode(self):
+        left = {
+            "min": [[[0.0]], [[0.1]], [[0.2]]],
+            "max": [[[0.4]], [[0.5]], [[0.6]]],
+            "mean": [[[0.2]], [[0.3]], [[0.4]]],
+            "std": [[[0.1]], [[0.1]], [[0.1]]],
+            "count": [10],
+        }
+        right = {
+            "min": [[[0.1]], [[0.0]], [[0.3]]],
+            "max": [[[0.8]], [[0.7]], [[0.9]]],
+            "mean": [[[0.6]], [[0.5]], [[0.7]]],
+            "std": [[[0.2]], [[0.2]], [[0.2]]],
+            "count": [10],
+        }
+
+        merged = self.converter._merge_video_stats([left, right])
+
+        self.assertEqual(merged["count"], [20])
+        self.assertEqual(merged["min"], [[[0.0]], [[0.0]], [[0.2]]])
+        self.assertEqual(merged["max"], [[[0.8]], [[0.7]], [[0.9]]])
+        np.testing.assert_allclose(
+            np.asarray(merged["mean"]).reshape(3),
+            np.array([0.4, 0.4, 0.55]),
+        )
+
+    def test_stitched_video_stats_are_cached_from_source_stats(self):
+        source_stats = {
+            "min": [[[0.0]], [[0.0]], [[0.0]]],
+            "max": [[[1.0]], [[1.0]], [[1.0]]],
+            "mean": [[[0.5]], [[0.5]], [[0.5]]],
+            "std": [[[0.1]], [[0.1]], [[0.1]]],
+            "count": [5],
+        }
+        out_path = Path(self.temp_dir) / "stitched.mp4"
+
+        with patch.object(
+            self.converter,
+            "_load_precomputed_video_stats",
+            return_value=source_stats,
+        ) as mock_load, patch.object(
+            self.converter,
+            "_store_video_stats_cached",
+        ) as mock_store:
+            self.converter._store_stitched_video_stats_from_sources(
+                out_path,
+                "cam_left_head",
+                [Path("a.mp4"), Path("b.mp4")],
+            )
+
+        self.assertEqual(mock_load.call_count, 2)
+        mock_store.assert_called_once()
+
+    def test_video_stats_samples_zero_skips_lazy_decode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "cam_left_head_synced.mp4"
+            video_path.write_bytes(b"mp4")
+
+            with patch.dict(
+                os.environ,
+                {"CYCLO_VIDEO_STATS_SAMPLES": "0"},
+            ), patch.object(
+                self.converter,
+                "_load_precomputed_video_stats",
+                return_value=None,
+            ), patch.dict(
+                sys.modules,
+                {"cv2": None},
+            ):
+                self.assertIsNone(
+                    self.converter._compute_video_stats(
+                        video_path,
+                        "cam_left_head",
+                    )
+                )
+
+    def test_segment_copy_eligibility_rejects_non_h264_and_audio(self):
+        h264_stream = {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "has_b_frames": 0,
+            "width": 64,
+            "height": 48,
+            "pix_fmt": "yuv420p",
+            "avg_frame_rate": "15/1",
+            "time_base": "1/15360",
+        }
+
+        with patch.object(
+            self.converter,
+            "_probe_video_streams",
+            return_value={"streams": [h264_stream]},
+        ), patch.object(
+            self.converter, "_get_video_frame_count", return_value=2
+        ):
+            self.assertTrue(
+                self.converter._segment_videos_support_copy_concat(
+                    [Path("a.mp4"), Path("b.mp4")]
+                )
+            )
+
+        with patch.object(
+            self.converter,
+            "_probe_video_streams",
+            return_value={
+                "streams": [
+                    {**h264_stream, "codec_name": "mjpeg"},
+                ]
+            },
+        ), patch.object(
+            self.converter, "_get_video_frame_count", return_value=2
+        ):
+            self.assertFalse(
+                self.converter._segment_videos_support_copy_concat(
+                    [Path("a.mp4")]
+                )
+            )
+
+        with patch.object(
+            self.converter,
+            "_probe_video_streams",
+            return_value={
+                "streams": [
+                    h264_stream,
+                    {"codec_type": "audio", "codec_name": "aac"},
+                ]
+            },
+        ), patch.object(
+            self.converter, "_get_video_frame_count", return_value=2
+        ):
+            self.assertFalse(
+                self.converter._segment_videos_support_copy_concat(
+                    [Path("a.mp4")]
+                )
+            )
 
     def test_v21_parquet_omits_frame_index(self):
         episode = EpisodeData(
@@ -426,6 +2191,134 @@ class TestRosbagToLerobotConverter(unittest.TestCase):
         self.assertNotIn("frame_index", table.column_names)
         self.assertEqual(str(table.schema.field("timestamp").type), "double")
 
+    def test_v21_episode_parquet_reuses_source_cache_on_repeat(self):
+        source_dir = Path(self.temp_dir) / "source_episode"
+        source_dir.mkdir()
+        (source_dir / "episode_info.json").write_text("{}", encoding="utf-8")
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0, 1.0 / 15.0],
+            observation_state=[
+                np.array([1.0], dtype=np.float32),
+                np.array([2.0], dtype=np.float32),
+            ],
+            action=[
+                np.array([3.0], dtype=np.float32),
+                np.array([4.0], dtype=np.float32),
+            ],
+            tasks=["task"],
+            length=2,
+            source_path=source_dir,
+        )
+        self.converter._features = {}
+        self.converter._task_to_index = {"task": 0}
+        self.converter._write_episode(episode)
+
+        first_path = (
+            Path(self.temp_dir)
+            / "data/chunk-000/episode_000000.parquet"
+        )
+        original_bytes = first_path.read_bytes()
+        self.assertTrue(
+            list(
+                (
+                    source_dir
+                    / ".cyclo_cache"
+                    / "episode_parquet_v21"
+                ).glob("*/manifest.json")
+            )
+        )
+
+        second_output = Path(self.temp_dir) / "second_output"
+        self.converter.config.output_dir = second_output
+        self.converter._total_frames = 0
+        self.converter._total_episodes = 0
+        self.converter._episodes = {}
+        self.converter._episodes_stats = {}
+
+        with patch.object(
+            self.converter,
+            "_write_parquet",
+            side_effect=AssertionError("cache miss"),
+        ):
+            self.converter._write_episode(episode)
+
+        second_path = (
+            second_output
+            / "data/chunk-000/episode_000000.parquet"
+        )
+        self.assertEqual(second_path.read_bytes(), original_bytes)
+
+    def test_v21_parquet_cache_key_uses_prepared_cache_signature(self):
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0],
+            observation_state=[np.array([1.0], dtype=np.float32)],
+            action=[np.array([2.0], dtype=np.float32)],
+            tasks=["task"],
+            length=1,
+        )
+        episode._cyclo_prepared_cache_signature = {
+            "path": "/tmp/prepared.pickle",
+            "size": 10,
+            "mtime_ns": 20,
+        }
+        self.converter._task_to_index = {"task": 0}
+
+        with patch.object(
+            self.converter,
+            "_array_cache_signature",
+            side_effect=AssertionError("prepared cache should skip array hashing"),
+        ):
+            cache_key = self.converter._v21_episode_parquet_cache_key(
+                episode,
+                global_start_index=0,
+                has_subtask_feature=False,
+            )
+
+        self.assertEqual(
+            cache_key["episode"]["prepared_cache"]["path"],
+            "/tmp/prepared.pickle",
+        )
+        self.assertNotIn("observation_state", cache_key["episode"])
+
+    def test_v21_subtasks_parquet_reuses_source_cache_on_repeat(self):
+        source_dir = Path(self.temp_dir) / "source_episode"
+        source_dir.mkdir()
+        (source_dir / "episode_info.json").write_text("{}", encoding="utf-8")
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0],
+            observation_state=[np.array([1.0], dtype=np.float32)],
+            action=[np.array([2.0], dtype=np.float32)],
+            tasks=["task"],
+            length=1,
+            source_path=source_dir,
+            subtask_instructions=["Pick"],
+        )
+        self.converter._write_subtasks_parquet(Path(self.temp_dir), [episode])
+
+        subtasks_path = Path(self.temp_dir) / "meta/subtasks.parquet"
+        original_bytes = subtasks_path.read_bytes()
+        self.assertTrue(
+            list(
+                (
+                    source_dir
+                    / ".cyclo_cache"
+                    / "subtasks_parquet_v21"
+                ).glob("*/manifest.json")
+            )
+        )
+
+        subtasks_path.unlink()
+        with patch(
+            "cyclo_data.converter.to_lerobot_v21.pq.write_table",
+            side_effect=AssertionError("cache miss"),
+        ):
+            self.converter._write_subtasks_parquet(Path(self.temp_dir), [episode])
+
+        self.assertEqual(subtasks_path.read_bytes(), original_bytes)
+
     def test_v21_subtask_annotations_are_frame_based(self):
         episode = EpisodeData(
             episode_index=0,
@@ -446,7 +2339,7 @@ class TestRosbagToLerobotConverter(unittest.TestCase):
 
         annotation_path = (
             Path(self.temp_dir)
-            / "annotations/task-0000/episode_00000000.json"
+            / "annotations/chunk-000/episode_000000.json"
         )
         with open(annotation_path, encoding="utf-8") as f:
             payload = json.load(f)
@@ -485,6 +2378,46 @@ class TestRosbagToLerobotConverter(unittest.TestCase):
         np.testing.assert_array_almost_equal(
             stats["observation.state"]["mean"], [3.0, 4.0]
         )
+
+    def test_direct_v21_episode_stats_use_per_episode_video_cache(self):
+        video_dir = Path(self.temp_dir) / "videos/chunk-000/cam_left_head"
+        video_dir.mkdir(parents=True)
+        ep0_video = video_dir / "episode_000000.mp4"
+        ep1_video = video_dir / "episode_000001.mp4"
+        ep0_video.write_bytes(b"mp4")
+        ep1_video.write_bytes(b"mp4")
+        ep0_stats = {"mean": [[[0.1]], [[0.2]], [[0.3]]], "count": [2]}
+        ep1_stats = {"mean": [[[0.7]], [[0.8]], [[0.9]]], "count": [3]}
+
+        self.converter._direct_v21_video_output = True
+        self.converter._direct_v21_video_stats_cache = {
+            (0, "cam_left_head"): ep0_stats,
+            (1, "cam_left_head"): ep1_stats,
+        }
+        episode0 = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0, 1.0],
+            length=2,
+            video_files={"cam_left_head": ep0_video},
+        )
+        episode1 = EpisodeData(
+            episode_index=1,
+            timestamps=[0.0, 1.0, 2.0],
+            length=3,
+            video_files={"cam_left_head": ep1_video},
+        )
+
+        with patch.object(
+            self.converter,
+            "_compute_video_stats",
+            side_effect=AssertionError("direct cache should be used"),
+        ):
+            stats0 = self.converter._compute_episode_stats(episode0)
+            stats1 = self.converter._compute_episode_stats(episode1)
+
+        feature_key = "observation.images.rgb.cam_left_head"
+        self.assertIs(stats0[feature_key], ep0_stats)
+        self.assertIs(stats1[feature_key], ep1_stats)
 
     def test_serialize_stats(self):
         stats = {
@@ -703,14 +2636,14 @@ class TestInfoJsonGeneration(unittest.TestCase):
         self.assertEqual(info["total_episodes"], 5)
         self.assertEqual(info["total_frames"], 500)
         self.assertIn("features", info)
-        self.assertEqual(info["chunks_size"], 10000)
+        self.assertEqual(info["chunks_size"], 1000)
         self.assertEqual(
             info["data_path"],
-            "data/task-{episode_chunk:04d}/episode_{episode_index:08d}.parquet",
+            "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         )
         self.assertEqual(
             info["video_path"],
-            "videos/task-{episode_chunk:04d}/{video_key}/episode_{episode_index:08d}.mp4",
+            "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
         )
         self.assertNotIn("frame_index", info["features"])
         self.assertEqual(info["features"]["timestamp"]["dtype"], "float64")
@@ -814,11 +2747,1963 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
             "observation.images.rgb.cam_left_head",
         )
 
+    def test_v30_video_info_describes_generated_aggregate(self):
+        with patch.object(
+            self.converter,
+            "_get_video_dimensions",
+            return_value=(480, 640),
+        ):
+            info = self.converter._get_video_info(self.input_a)
+
+        self.assertEqual(info["video.fps"], 15.0)
+        self.assertEqual(info["video.codec"], "h264")
+        self.assertEqual(info["video.pix_fmt"], "yuv420p")
+        self.assertFalse(info["has_audio"])
+
+    def test_v30_video_info_uses_aggregate_cache_dimensions_without_probe(self):
+        self.converter._aggregated_video_cache_path(self.input_a).write_text(
+            json.dumps({"output_width": 640, "output_height": 480}),
+            encoding="utf-8",
+        )
+
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            side_effect=AssertionError("video probe should not run"),
+        ), patch.object(
+            self.converter,
+            "_get_video_dimensions",
+            side_effect=AssertionError("OpenCV fallback should not run"),
+        ):
+            info = self.converter._get_video_info(self.input_a)
+
+        self.assertEqual(info["video.height"], 480)
+        self.assertEqual(info["video.width"], 640)
+
+    def test_quick_video_dimensions_are_cached_per_converter(self):
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            return_value=(640, 480),
+        ) as quick_dims, patch.object(
+            Path,
+            "resolve",
+            side_effect=AssertionError("resolve should not be needed"),
+        ):
+            first = self.converter._quick_video_dimensions_cached(self.input_a)
+            second = self.converter._quick_video_dimensions_cached(self.input_a)
+
+        self.assertEqual(first, (640, 480))
+        self.assertEqual(second, (640, 480))
+        quick_dims.assert_called_once()
+
+    def test_v30_default_video_file_size_keeps_portable_default(self):
+        self.assertEqual(DEFAULT_VIDEO_FILE_SIZE_IN_MB, 200)
+        self.assertEqual(
+            V30ConversionConfig(
+                repo_id="test/default",
+                output_dir=Path(self.temp_dir) / "default",
+            ).video_file_size_in_mb,
+            200,
+        )
+
+    def test_v30_data_flush_accepts_numpy_state_action_columns(self):
+        frames = [
+            {
+                "timestamp": 0.0,
+                "frame_index": 0,
+                "episode_index": 0,
+                "index": 0,
+                "task_index": 0,
+                "observation.state": np.array([1.0, 2.0], dtype=np.float32),
+                "action": np.array([0.1, 0.2], dtype=np.float32),
+            },
+            {
+                "timestamp": 1.0 / 15.0,
+                "frame_index": 1,
+                "episode_index": 0,
+                "index": 1,
+                "task_index": 0,
+                "observation.state": np.array([3.0, 4.0], dtype=np.float32),
+                "action": np.array([0.3, 0.4], dtype=np.float32),
+            },
+        ]
+
+        self.converter._flush_data_file(Path(self.temp_dir), frames)
+
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(
+            Path(self.temp_dir) / "data/chunk-000/file-000.parquet"
+        )
+        self.assertEqual(table.num_rows, 2)
+        self.assertEqual(
+            table.column("observation.state").to_pylist(),
+            [[1.0, 2.0], [3.0, 4.0]],
+        )
+
+    def test_v30_aggregated_data_subtask_column_does_not_need_features(self):
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0, 1.0 / 15.0],
+            observation_state=[
+                np.array([1.0], dtype=np.float32),
+                np.array([2.0], dtype=np.float32),
+            ],
+            action=[
+                np.array([3.0], dtype=np.float32),
+                np.array([4.0], dtype=np.float32),
+            ],
+            tasks=["task"],
+            length=2,
+            subtask_indices=[7, 8],
+        )
+        self.converter._features = {}
+        self.converter._task_to_index = {"task": 0}
+        self.converter._write_aggregated_data([episode])
+
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(
+            Path(self.temp_dir) / "data/chunk-000/file-000.parquet"
+        )
+        self.assertIn("subtask_index", table.column_names)
+        self.assertEqual(table.column("subtask_index").to_pylist(), [7, 8])
+
+    def test_v30_aggregated_data_reuses_source_cache_on_repeat(self):
+        source_dir = Path(self.temp_dir) / "source_episode"
+        source_dir.mkdir()
+        (source_dir / "episode_info.json").write_text("{}", encoding="utf-8")
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0, 1.0 / 15.0],
+            observation_state=[
+                np.array([1.0], dtype=np.float32),
+                np.array([2.0], dtype=np.float32),
+            ],
+            action=[
+                np.array([3.0], dtype=np.float32),
+                np.array([4.0], dtype=np.float32),
+            ],
+            tasks=["task"],
+            length=2,
+            source_path=source_dir,
+        )
+        self.converter._tasks = {0: "task"}
+        self.converter._task_to_index = {"task": 0}
+        self.converter._episode_metadata_list = []
+        self.converter._write_aggregated_data([episode])
+
+        data_path = Path(self.temp_dir) / "data/chunk-000/file-000.parquet"
+        original_bytes = data_path.read_bytes()
+        self.assertTrue(
+            list(
+                (
+                    source_dir
+                    / ".cyclo_cache"
+                    / "data_aggregate_v30"
+                ).glob("*/manifest.json")
+            )
+        )
+
+        data_path.unlink()
+        self.converter._episode_metadata_list = []
+        self.converter._episode_metadata_by_index = {}
+        self.converter._total_episodes = 0
+        self.converter._total_frames = 0
+
+        with patch.object(
+            self.converter,
+            "_flush_episode_data_file",
+            side_effect=AssertionError("cache miss"),
+        ):
+            self.converter._write_aggregated_data([episode])
+
+        self.assertEqual(data_path.read_bytes(), original_bytes)
+        self.assertEqual(self.converter._total_episodes, 1)
+        self.assertEqual(self.converter._total_frames, 2)
+        self.assertEqual(len(self.converter._episode_metadata_list), 1)
+        self.assertEqual(
+            self.converter._episode_metadata_list[0].stats["observation.state/min"],
+            [1.0],
+        )
+
+    def test_v30_data_cache_key_uses_prepared_cache_signature(self):
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0],
+            observation_state=[np.array([1.0], dtype=np.float32)],
+            action=[np.array([2.0], dtype=np.float32)],
+            tasks=["task"],
+            length=1,
+        )
+        episode._cyclo_prepared_cache_signature = {
+            "path": "/tmp/prepared.pickle",
+            "size": 10,
+            "mtime_ns": 20,
+        }
+        self.converter._tasks = {0: "task"}
+        self.converter._task_to_index = {"task": 0}
+
+        with patch.object(
+            self.converter,
+            "_array_cache_signature",
+            side_effect=AssertionError("prepared cache should skip array hashing"),
+        ):
+            cache_key = self.converter._data_aggregate_cache_key(
+                [episode],
+                has_subtask_feature=False,
+            )
+
+        self.assertEqual(
+            cache_key["episodes"][0]["prepared_cache"]["path"],
+            "/tmp/prepared.pickle",
+        )
+        self.assertNotIn("observation_state", cache_key["episodes"][0])
+
+    def test_v30_episodes_parquet_reuses_source_cache_on_repeat(self):
+        source_dir = Path(self.temp_dir) / "source_episode"
+        source_dir.mkdir()
+        (source_dir / "episode_info.json").write_text("{}", encoding="utf-8")
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0],
+            observation_state=[np.array([1.0], dtype=np.float32)],
+            action=[np.array([2.0], dtype=np.float32)],
+            tasks=["task"],
+            length=1,
+            source_path=source_dir,
+        )
+        self.converter._tasks = {0: "task"}
+        self.converter._task_to_index = {"task": 0}
+        self.converter._episode_metadata_list = []
+        self.converter._write_aggregated_data([episode])
+        self.converter._write_episodes_parquet([episode])
+
+        episodes_path = (
+            Path(self.temp_dir)
+            / "meta/episodes/chunk-000/file-000.parquet"
+        )
+        original_bytes = episodes_path.read_bytes()
+        self.assertTrue(
+            list(
+                (
+                    source_dir
+                    / ".cyclo_cache"
+                    / "episodes_parquet_v30"
+                ).glob("*/manifest.json")
+            )
+        )
+
+        episodes_path.unlink()
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30.pq.write_table",
+            side_effect=AssertionError("cache miss"),
+        ):
+            self.converter._write_episodes_parquet([episode])
+
+        self.assertEqual(episodes_path.read_bytes(), original_bytes)
+
+    def test_v30_tasks_parquet_reuses_source_cache_on_repeat(self):
+        source_dir = Path(self.temp_dir) / "source_episode"
+        source_dir.mkdir()
+        (source_dir / "episode_info.json").write_text("{}", encoding="utf-8")
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0],
+            observation_state=[np.array([1.0], dtype=np.float32)],
+            action=[np.array([2.0], dtype=np.float32)],
+            tasks=["task"],
+            length=1,
+            source_path=source_dir,
+        )
+        self.converter._tasks = {0: "task"}
+        self.converter._task_to_index = {"task": 0}
+        self.converter._task_names_by_task = {"task": "Task"}
+        self.converter._episode_metadata_list = []
+        self.converter._write_aggregated_data([episode])
+        self.converter._write_tasks_parquet([episode])
+
+        tasks_path = Path(self.temp_dir) / "meta/tasks.parquet"
+        original_bytes = tasks_path.read_bytes()
+        self.assertTrue(
+            list(
+                (
+                    source_dir
+                    / ".cyclo_cache"
+                    / "tasks_parquet_v30"
+                ).glob("*/manifest.json")
+            )
+        )
+
+        tasks_path.unlink()
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30.pq.write_table",
+            side_effect=AssertionError("cache miss"),
+        ):
+            self.converter._write_tasks_parquet([episode])
+
+        self.assertEqual(tasks_path.read_bytes(), original_bytes)
+
+    def test_v30_subtasks_parquet_reuses_source_cache_on_repeat(self):
+        source_dir = Path(self.temp_dir) / "source_episode"
+        source_dir.mkdir()
+        (source_dir / "episode_info.json").write_text("{}", encoding="utf-8")
+        episode = EpisodeData(
+            episode_index=0,
+            timestamps=[0.0],
+            observation_state=[np.array([1.0], dtype=np.float32)],
+            action=[np.array([2.0], dtype=np.float32)],
+            tasks=["task"],
+            length=1,
+            source_path=source_dir,
+            subtask_instructions=["Pick"],
+        )
+        self.converter._tasks = {0: "task"}
+        self.converter._task_to_index = {"task": 0}
+        self.converter._episode_metadata_list = []
+        self.converter._write_aggregated_data([episode])
+        self.converter._write_subtasks_parquet(Path(self.temp_dir), [episode])
+
+        subtasks_path = Path(self.temp_dir) / "meta/subtasks.parquet"
+        original_bytes = subtasks_path.read_bytes()
+        self.assertTrue(
+            list(
+                (
+                    source_dir
+                    / ".cyclo_cache"
+                    / "subtasks_parquet_v30"
+                ).glob("*/manifest.json")
+            )
+        )
+
+        subtasks_path.unlink()
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30.pq.write_table",
+            side_effect=AssertionError("cache miss"),
+        ):
+            self.converter._write_subtasks_parquet(Path(self.temp_dir), [episode])
+
+        self.assertEqual(subtasks_path.read_bytes(), original_bytes)
+
+    def test_direct_aggregate_cache_key_reuses_supplied_video_probe(self):
+        sidecar = Path(self.temp_dir) / "cam_left_head_timestamps.parquet"
+        sidecar.touch()
+        episode_by_index = {
+            0: EpisodeData(episode_index=0, length=2, grid_log_times_sec=[0, 1]),
+            1: EpisodeData(episode_index=1, length=3, grid_log_times_sec=[0, 1, 2]),
+        }
+
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            side_effect=AssertionError("dimensions should be supplied"),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._h264_encoder",
+            side_effect=AssertionError("encoder should be supplied"),
+        ), patch.dict(os.environ, {}, clear=True):
+            cache_key = self.converter._direct_aggregated_video_cache_key(
+                [(0, self.input_a, 0.0), (1, self.input_b, 0.0)],
+                expected_frames=5,
+                episode_by_index=episode_by_index,
+                camera_name="cam_left_head",
+                ffmpeg="ffmpeg",
+                width=64,
+                height=48,
+                encoder="libx264",
+                encoder_opts=["-preset", "ultrafast"],
+            )
+
+        self.assertEqual(cache_key["encoder"], "libx264")
+        self.assertEqual(cache_key["encoder_opts"], ["-preset", "ultrafast"])
+        self.assertEqual(cache_key["output_width"], 64)
+        self.assertEqual(cache_key["output_height"], 48)
+        self.assertNotIn("source_frame_count_validation", cache_key)
+
+    def test_direct_aggregate_cache_key_records_output_dimensions(self):
+        cache_key = self.converter._direct_aggregated_video_cache_key(
+            [],
+            expected_frames=0,
+            episode_by_index={},
+            camera_name="cam_left_head",
+            width=640,
+            height=480,
+            encoder="h264_nvenc",
+            encoder_opts=["-preset", "fast"],
+            content_key={
+                "version": 1,
+                "mode": "direct_v3_raw_sidecar",
+                "target_fps": 15.0,
+                "expected_frames": 0,
+                "inputs": [],
+            },
+        )
+
+        self.assertEqual(cache_key["output_width"], 640)
+        self.assertEqual(cache_key["output_height"], 480)
+
+    def test_max_direct_output_cache_hit_can_skip_encoder_probe(self):
+        sidecar = Path(self.temp_dir) / "cam_left_head_timestamps.parquet"
+        sidecar.touch()
+        episode_by_index = {
+            0: EpisodeData(episode_index=0, length=2, grid_log_times_sec=[0, 1]),
+            1: EpisodeData(episode_index=1, length=3, grid_log_times_sec=[0, 1, 2]),
+        }
+        videos = [(0, self.input_a, 0.0), (1, self.input_b, 0.0)]
+        camera_key = "observation.images.rgb.cam_left_head"
+        output_path = Path(self.temp_dir) / DEFAULT_VIDEO_PATH.format(
+            video_key=camera_key,
+            chunk_index=0,
+            file_index=0,
+        )
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"cached-video")
+        with patch.dict(os.environ, {"CYCLO_X264_SPEED_PROFILE": "max"}, clear=True):
+            content_key = self.converter._direct_aggregated_video_content_cache_key(
+                videos,
+                5,
+                episode_by_index,
+                "cam_left_head",
+            )
+        cached_key = {
+            **content_key,
+            "encoder": "h264_nvenc",
+            "encoder_opts": ["-preset", "p1"],
+        }
+        self.converter._aggregated_video_cache_path(output_path).write_text(
+            json.dumps(cached_key),
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            return_value=(640, 480),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._h264_encoder",
+            side_effect=AssertionError("encoder probe should be skipped"),
+        ):
+            self.converter._write_direct_aggregated_video(
+                Path(self.temp_dir),
+                camera_key,
+                0,
+                0,
+                videos,
+                episode_by_index,
+            )
+
+    def test_max_direct_source_cache_hit_can_skip_encoder_probe(self):
+        sidecar = Path(self.temp_dir) / "cam_left_head_timestamps.parquet"
+        sidecar.touch()
+        episode_by_index = {
+            0: EpisodeData(episode_index=0, length=2, grid_log_times_sec=[0, 1]),
+            1: EpisodeData(episode_index=1, length=3, grid_log_times_sec=[0, 1, 2]),
+        }
+        videos = [(0, self.input_a, 0.0), (1, self.input_b, 0.0)]
+        with patch.dict(os.environ, {"CYCLO_X264_SPEED_PROFILE": "max"}, clear=True):
+            content_key = self.converter._direct_aggregated_video_content_cache_key(
+                videos,
+                5,
+                episode_by_index,
+                "cam_left_head",
+            )
+        cached_key = {
+            **content_key,
+            "encoder": "h264_nvenc",
+            "encoder_opts": ["-preset", "p1"],
+        }
+        source_paths = self.converter._direct_source_aggregate_cache_paths(
+            videos,
+            cached_key,
+        )
+        self.assertIsNotNone(source_paths)
+        source_video, source_meta = source_paths
+        source_video.parent.mkdir(parents=True)
+        source_video.write_bytes(b"cached-video")
+        source_meta.write_text(json.dumps(cached_key), encoding="utf-8")
+        camera_key = "observation.images.rgb.cam_left_head"
+        output_path = Path(self.temp_dir) / DEFAULT_VIDEO_PATH.format(
+            video_key=camera_key,
+            chunk_index=0,
+            file_index=0,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            return_value=(640, 480),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._h264_encoder",
+            side_effect=AssertionError("encoder probe should be skipped"),
+        ):
+            self.converter._write_direct_aggregated_video(
+                Path(self.temp_dir),
+                camera_key,
+                0,
+                0,
+                videos,
+                episode_by_index,
+            )
+
+        self.assertEqual(output_path.read_bytes(), b"cached-video")
+        self.assertFalse(
+            self.converter._aggregated_video_cache_path(output_path).exists()
+        )
+
+    def test_explicit_h264_encoder_disables_probe_free_direct_cache_reuse(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_H264_ENCODER": "software",
+            },
+            clear=True,
+        ):
+            self.assertFalse(
+                self.converter._can_reuse_direct_cache_without_encoder_probe()
+            )
+
+    def test_direct_source_aggregate_cache_can_be_disabled(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_V30_DISABLE_SOURCE_AGGREGATE_CACHE": "1"},
+        ):
+            self.assertIsNone(
+                self.converter._direct_source_aggregate_cache_paths(
+                    [(0, self.input_a, 0.0)],
+                    {"key": "value"},
+                )
+            )
+
+    def test_direct_source_aggregate_cache_paths_use_common_source_root(self):
+        with patch.object(
+            Path,
+            "resolve",
+            side_effect=AssertionError("resolve should not be needed"),
+        ):
+            cache_paths = self.converter._direct_source_aggregate_cache_paths(
+                [(0, self.input_a, 0.0), (1, self.input_b, 0.0)],
+                {"key": "value"},
+            )
+
+        self.assertIsNotNone(cache_paths)
+        video_cache, meta_cache = cache_paths
+        self.assertEqual(
+            video_cache.parent,
+            Path(self.temp_dir) / ".cyclo_cache" / "direct_aggregate_v30",
+        )
+        self.assertEqual(video_cache.suffix, ".mp4")
+        self.assertTrue(meta_cache.name.endswith(".cache.json"))
+
+    def test_direct_source_aggregate_cache_dir_is_cached_per_video_batch(self):
+        videos = [(0, self.input_a, 0.0), (1, self.input_b, 0.0)]
+
+        with patch.object(
+            self.converter,
+            "_direct_source_video_cache_root",
+            wraps=self.converter._direct_source_video_cache_root,
+        ) as root:
+            first = self.converter._direct_source_aggregate_cache_dir(videos)
+            second = self.converter._direct_source_aggregate_cache_dir(videos)
+
+        self.assertEqual(first, second)
+        self.assertEqual(root.call_count, len(videos))
+
+    def test_direct_source_aggregate_cache_uses_dataset_root_for_task_folder(self):
+        dataset = Path(self.temp_dir) / "task"
+        ep_a = dataset / "0"
+        ep_b = dataset / "1"
+        video_a = ep_a / "videos" / "0_0" / "cam_left_head.mp4"
+        video_b = ep_b / "videos" / "1_0" / "cam_left_head.mp4"
+        video_a.parent.mkdir(parents=True)
+        video_b.parent.mkdir(parents=True)
+        video_a.touch()
+        video_b.touch()
+        (ep_a / "episode_info.json").write_text("{}", encoding="utf-8")
+        (ep_b / "episode_info.json").write_text("{}", encoding="utf-8")
+
+        cache_paths = self.converter._direct_source_aggregate_cache_paths(
+            [(0, video_a, 0.0)],
+            {"key": "value"},
+        )
+
+        self.assertIsNotNone(cache_paths)
+        video_cache, _ = cache_paths
+        self.assertEqual(
+            video_cache.parent,
+            dataset / ".cyclo_cache" / "direct_aggregate_v30",
+        )
+
+    def test_direct_source_video_cache_root_is_cached_per_source_video(self):
+        dataset = Path(self.temp_dir) / "task"
+        ep_a = dataset / "0"
+        ep_b = dataset / "1"
+        video_a = ep_a / "videos" / "0_0" / "cam_left_head.mp4"
+        video_a.parent.mkdir(parents=True)
+        video_a.touch()
+        (ep_a / "episode_info.json").write_text("{}", encoding="utf-8")
+        ep_b.mkdir(parents=True)
+        sibling_info = ep_b / "episode_info.json"
+        sibling_info.write_text("{}", encoding="utf-8")
+
+        with patch.object(
+            Path,
+            "resolve",
+            side_effect=AssertionError("resolve should not be needed"),
+        ):
+            first = self.converter._direct_source_video_cache_root(video_a)
+            sibling_info.unlink()
+            second = self.converter._direct_source_video_cache_root(video_a)
+
+        self.assertEqual(first, dataset)
+        self.assertEqual(second, dataset)
+
+    def test_direct_source_video_cache_root_scans_dataset_once(self):
+        dataset = Path(self.temp_dir) / "task"
+        ep_a = dataset / "0"
+        ep_b = dataset / "1"
+        video_a = ep_a / "videos" / "0_0" / "cam_left_head.mp4"
+        video_b = ep_b / "videos" / "1_0" / "cam_left_head.mp4"
+        video_a.parent.mkdir(parents=True)
+        video_b.parent.mkdir(parents=True)
+        video_a.touch()
+        video_b.touch()
+        (ep_a / "episode_info.json").write_text("{}", encoding="utf-8")
+        (ep_b / "episode_info.json").write_text("{}", encoding="utf-8")
+        original_iterdir = Path.iterdir
+        calls = 0
+
+        def counted_iterdir(path):
+            nonlocal calls
+            if path == dataset:
+                calls += 1
+            return original_iterdir(path)
+
+        with patch.object(Path, "iterdir", counted_iterdir):
+            first = self.converter._direct_source_video_cache_root(video_a)
+            second = self.converter._direct_source_video_cache_root(video_b)
+
+        self.assertEqual(first, dataset)
+        self.assertEqual(second, dataset)
+        self.assertEqual(calls, 1)
+
+    def test_direct_source_aggregate_cache_keeps_standalone_bag_root(self):
+        bag = Path(self.temp_dir) / "single"
+        video = bag / "videos" / "0_0" / "cam_left_head.mp4"
+        video.parent.mkdir(parents=True)
+        video.touch()
+        (bag / "episode_info.json").write_text("{}", encoding="utf-8")
+
+        cache_paths = self.converter._direct_source_aggregate_cache_paths(
+            [(0, video, 0.0)],
+            {"key": "value"},
+        )
+
+        self.assertIsNotNone(cache_paths)
+        video_cache, _ = cache_paths
+        self.assertEqual(
+            video_cache.parent,
+            bag / ".cyclo_cache" / "direct_aggregate_v30",
+        )
+
+    def test_direct_source_aggregate_cache_population_is_opt_in(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(
+                self.converter._populate_direct_source_aggregate_cache()
+            )
+
+        for value in ["1", "true", "yes", "on", "write"]:
+            with patch.dict(
+                os.environ,
+                {"CYCLO_V30_POPULATE_SOURCE_AGGREGATE_CACHE": value},
+                clear=True,
+            ):
+                self.assertTrue(
+                    self.converter._populate_direct_source_aggregate_cache()
+                )
+
+    def test_direct_source_cache_copy_auto_enables_for_max_hardware_encoders(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            for encoder in (
+                "h264_nvenc",
+                "h264_nvmpi",
+                "h264_v4l2m2m",
+                "h264_omx",
+            ):
+                self.assertTrue(
+                    self.converter._allow_direct_source_aggregate_cache_copy(
+                        encoder,
+                    )
+                )
+            self.assertFalse(
+                self.converter._allow_direct_source_aggregate_cache_copy(
+                    "libx264",
+                )
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_V30_POPULATE_SOURCE_AGGREGATE_CACHE": "0",
+            },
+            clear=True,
+        ):
+            self.assertFalse(
+                self.converter._allow_direct_source_aggregate_cache_copy(
+                    "h264_nvenc",
+                )
+            )
+
+    def test_direct_source_aggregate_cache_reuse_copies_to_output(self):
+        cache_dir = Path(self.temp_dir) / ".cyclo_cache" / "direct_aggregate_v30"
+        source_video = cache_dir / "cached.mp4"
+        source_meta = cache_dir / "cached.cache.json"
+        source_video.parent.mkdir(parents=True)
+        source_video.write_bytes(b"aggregate")
+        cache_key = {
+            "key": "value",
+            "output_width": 640,
+            "output_height": 480,
+            "inputs": [{"video": {"path": str(self.input_a)}}],
+        }
+        source_meta.write_text(json.dumps(cache_key), encoding="utf-8")
+        output_path = Path(self.temp_dir) / "out" / "file.mp4"
+        output_cache = output_path.with_name(output_path.name + ".cache.json")
+        self.converter._validate_aggregated_video = MagicMock()
+
+        reused = self.converter._try_reuse_direct_source_aggregate_cache(
+            source_video,
+            source_meta,
+            output_path,
+            output_cache,
+            cache_key,
+            expected_frames=5,
+            require_decode=False,
+        )
+
+        self.assertTrue(reused)
+        self.assertEqual(output_path.read_bytes(), b"aggregate")
+        self.assertEqual(
+            json.loads(output_cache.read_text(encoding="utf-8")),
+            cache_key,
+        )
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            side_effect=AssertionError("video probe should not run"),
+        ):
+            info = self.converter._get_video_info(output_path)
+        self.assertEqual(info["video.width"], 640)
+        self.assertEqual(info["video.height"], 480)
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            side_effect=AssertionError("source video probe should not run"),
+        ):
+            source_info = self.converter._get_video_info(self.input_a)
+        self.assertEqual(source_info["video.width"], 640)
+        self.assertEqual(source_info["video.height"], 480)
+
+    def test_max_source_aggregate_reuse_skips_output_cache_by_default(self):
+        cache_dir = Path(self.temp_dir) / ".cyclo_cache" / "direct_aggregate_v30"
+        source_video = cache_dir / "cached.mp4"
+        source_meta = cache_dir / "cached.cache.json"
+        source_video.parent.mkdir(parents=True)
+        source_video.write_bytes(b"aggregate")
+        cache_key = {
+            "key": "value",
+            "output_width": 640,
+            "output_height": 480,
+        }
+        source_meta.write_text(json.dumps(cache_key), encoding="utf-8")
+        output_path = Path(self.temp_dir) / "out" / "file.mp4"
+        output_cache = output_path.with_name(output_path.name + ".cache.json")
+        self.converter._validate_aggregated_video = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            reused = self.converter._try_reuse_direct_source_aggregate_cache(
+                source_video,
+                source_meta,
+                output_path,
+                output_cache,
+                cache_key,
+                expected_frames=5,
+                require_decode=False,
+            )
+
+        self.assertTrue(reused)
+        self.assertEqual(output_path.read_bytes(), b"aggregate")
+        self.assertFalse(output_cache.exists())
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            side_effect=AssertionError("video probe should not run"),
+        ):
+            info = self.converter._get_video_info(output_path)
+        self.assertEqual(info["video.width"], 640)
+        self.assertEqual(info["video.height"], 480)
+
+    def test_max_source_aggregate_reuse_output_cache_can_be_forced(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_V30_WRITE_SOURCE_REUSE_OUTPUT_CACHE": "1",
+            },
+            clear=True,
+        ):
+            self.assertTrue(
+                self.converter._write_output_cache_for_source_reuse()
+            )
+
+    def test_direct_source_aggregate_cache_can_skip_validation(self):
+        cache_dir = Path(self.temp_dir) / ".cyclo_cache" / "direct_aggregate_v30"
+        source_video = cache_dir / "cached.mp4"
+        source_meta = cache_dir / "cached.cache.json"
+        source_video.parent.mkdir(parents=True)
+        source_video.write_bytes(b"aggregate")
+        cache_key = {"key": "value"}
+        source_meta.write_text(json.dumps(cache_key), encoding="utf-8")
+        output_path = Path(self.temp_dir) / "out" / "file.mp4"
+        output_cache = output_path.with_name(output_path.name + ".cache.json")
+        self.converter._validate_aggregated_video = MagicMock(
+            side_effect=AssertionError("validation should be skipped")
+        )
+
+        reused = self.converter._try_reuse_direct_source_aggregate_cache(
+            source_video,
+            source_meta,
+            output_path,
+            output_cache,
+            cache_key,
+            expected_frames=5,
+            require_decode=False,
+            validate=False,
+        )
+
+        self.assertTrue(reused)
+        self.assertEqual(output_path.read_bytes(), b"aggregate")
+
+    def test_aggregate_output_cache_can_skip_validation(self):
+        output_path = Path(self.temp_dir) / "out" / "file.mp4"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"aggregate")
+        cache_path = output_path.with_name(output_path.name + ".cache.json")
+        cache_key = {"key": "value"}
+        cache_path.write_text(json.dumps(cache_key), encoding="utf-8")
+        self.converter._validate_aggregated_video = MagicMock(
+            side_effect=AssertionError("validation should be skipped")
+        )
+
+        reused = self.converter._try_reuse_aggregated_video_cache(
+            output_path,
+            cache_path,
+            cache_key,
+            expected_frames=5,
+            require_decode=False,
+            validate=False,
+        )
+
+        self.assertTrue(reused)
+
+    def test_direct_source_aggregate_cache_store_writes_video_and_metadata(self):
+        output_path = Path(self.temp_dir) / "out.mp4"
+        output_path.write_bytes(b"aggregate")
+        source_video = (
+            Path(self.temp_dir)
+            / ".cyclo_cache"
+            / "direct_aggregate_v30"
+            / "cached.mp4"
+        )
+        source_meta = source_video.with_name("cached.cache.json")
+        cache_key = {"key": "value"}
+
+        self.converter._store_direct_source_aggregate_cache(
+            output_path,
+            source_video,
+            source_meta,
+            cache_key,
+        )
+
+        self.assertEqual(source_video.read_bytes(), b"aggregate")
+        self.assertEqual(
+            json.loads(source_meta.read_text(encoding="utf-8")),
+            cache_key,
+        )
+
+    def test_direct_source_aggregate_cache_store_writes_content_index(self):
+        output_path = Path(self.temp_dir) / "out.mp4"
+        output_path.write_bytes(b"aggregate")
+        source_video = (
+            Path(self.temp_dir)
+            / ".cyclo_cache"
+            / "direct_aggregate_v30"
+            / "cached.mp4"
+        )
+        source_meta = source_video.with_name("cached.cache.json")
+        videos = [(0, self.input_a, 0.0), (1, self.input_b, 0.0)]
+        content_key = {"mode": "direct_v3_raw_sidecar", "inputs": [1, 2]}
+        cache_key = {**content_key, "encoder": "h264_nvenc"}
+
+        self.converter._store_direct_source_aggregate_cache(
+            output_path,
+            source_video,
+            source_meta,
+            cache_key,
+            videos=videos,
+            content_key=content_key,
+        )
+
+        index_path = self.converter._direct_source_aggregate_content_index_path(
+            videos,
+            content_key,
+        )
+        self.assertIsNotNone(index_path)
+        self.assertTrue(index_path.exists())
+        with patch.object(
+            Path,
+            "glob",
+            side_effect=AssertionError("content index should avoid cache scan"),
+        ):
+            self.assertEqual(
+                self.converter._find_direct_source_aggregate_cache_by_content(
+                    videos,
+                    content_key,
+                ),
+                (source_video, source_meta, cache_key),
+            )
+
+    def test_direct_source_aggregate_cache_store_can_skip_copy_fallback(self):
+        output_path = Path(self.temp_dir) / "out.mp4"
+        output_path.write_bytes(b"aggregate")
+        source_video = (
+            Path(self.temp_dir)
+            / ".cyclo_cache"
+            / "direct_aggregate_v30"
+            / "cached.mp4"
+        )
+        source_meta = source_video.with_name("cached.cache.json")
+
+        with patch.object(
+            self.converter,
+            "_clone_or_copy_no_hardlink",
+            return_value=None,
+        ):
+            self.converter._store_direct_source_aggregate_cache(
+                output_path,
+                source_video,
+                source_meta,
+                {"key": "value"},
+                allow_copy=False,
+            )
+
+        self.assertFalse(source_video.exists())
+        self.assertFalse(source_meta.exists())
+
+    def test_direct_source_cache_allow_copy_false_still_uses_reflink(self):
+        output_path = Path(self.temp_dir) / "out.mp4"
+        output_path.write_bytes(b"aggregate")
+        source_video = Path(self.temp_dir) / "cached.mp4"
+
+        fake_fcntl = types.SimpleNamespace(ioctl=MagicMock(return_value=None))
+        unsupported_dev_pairs = set(v30._REFLINK_UNSUPPORTED_DEV_PAIRS)
+        v30._REFLINK_UNSUPPORTED_DEV_PAIRS.clear()
+        try:
+            with patch.dict(sys.modules, {"fcntl": fake_fcntl}), patch.object(
+                v30.shutil,
+                "copyfile",
+                side_effect=AssertionError("byte copy fallback should not run"),
+            ):
+                mode = self.converter._clone_or_copy_no_hardlink(
+                    output_path,
+                    source_video,
+                    allow_copy=False,
+                )
+        finally:
+            v30._REFLINK_UNSUPPORTED_DEV_PAIRS.clear()
+            v30._REFLINK_UNSUPPORTED_DEV_PAIRS.update(unsupported_dev_pairs)
+
+        self.assertEqual(mode, "reflink")
+        fake_fcntl.ioctl.assert_called_once()
+
+    def test_video_aggregation_workers_scale_with_jobs(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CYCLO_VIDEO_AGG_CAMERA_WORKERS", None)
+            os.environ.pop("CYCLO_X264_SPEED_PROFILE", None)
+            with patch(
+                "cyclo_data.converter.to_lerobot_v30.os.cpu_count",
+                return_value=8,
+            ):
+                self.assertEqual(
+                    self.converter._resolve_video_aggregation_workers(
+                        camera_count=4,
+                        job_count=4,
+                    ),
+                    4,
+                )
+                self.assertEqual(
+                    self.converter._resolve_video_aggregation_workers(
+                        camera_count=4,
+                        job_count=18,
+                    ),
+                    4,
+                )
+            with patch(
+                "cyclo_data.converter.to_lerobot_v30.os.cpu_count",
+                return_value=12,
+            ):
+                self.assertEqual(
+                    self.converter._resolve_video_aggregation_workers(
+                        camera_count=4,
+                        job_count=18,
+                    ),
+                    5,
+                )
+            with patch.dict(
+                os.environ,
+                {"CYCLO_X264_SPEED_PROFILE": "max"},
+            ), patch(
+                "cyclo_data.converter.to_lerobot_v30.os.cpu_count",
+                return_value=12,
+            ):
+                self.assertEqual(
+                    self.converter._resolve_video_aggregation_workers(
+                        camera_count=4,
+                        job_count=18,
+                    ),
+                    6,
+                )
+            with patch.dict(
+                os.environ,
+                {"CYCLO_X264_SPEED_PROFILE": "max"},
+            ), patch(
+                "cyclo_data.converter.to_lerobot_v30.os.cpu_count",
+                return_value=32,
+            ):
+                self.assertEqual(
+                    self.converter._resolve_video_aggregation_workers(
+                        camera_count=4,
+                        job_count=18,
+                    ),
+                    8,
+                )
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_VIDEO_AGG_CAMERA_WORKERS": "8"},
+        ):
+            self.assertEqual(
+                self.converter._resolve_video_aggregation_workers(
+                    camera_count=4,
+                    job_count=18,
+                ),
+                8,
+            )
+
+    def test_video_aggregation_workers_use_one_for_full_source_cache_hit(self):
+        jobs = [
+            ("observation.images.rgb.cam_left_head", 0, 0, [(0, self.input_a, 0.0)]),
+            ("observation.images.rgb.cam_right_head", 0, 0, [(1, self.input_b, 0.0)]),
+        ]
+        matches = {
+            (camera_key, chunk_idx, file_idx): (
+                Path(self.temp_dir) / f"{camera_key}.mp4",
+                Path(self.temp_dir) / f"{camera_key}.cache.json",
+                {"key": camera_key},
+            )
+            for camera_key, chunk_idx, file_idx, _ in jobs
+        }
+        self.converter._direct_video_aggregation = True
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertEqual(
+                self.converter._resolve_video_aggregation_workers_for_jobs(
+                    camera_count=2,
+                    jobs=jobs,
+                    source_cache_matches=matches,
+                ),
+                1,
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_VIDEO_AGG_CAMERA_WORKERS": "2",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                self.converter._resolve_video_aggregation_workers_for_jobs(
+                    camera_count=2,
+                    jobs=jobs,
+                    source_cache_matches=matches,
+                ),
+                2,
+            )
+
+    def test_warm_direct_video_encoder_populates_probe_cache_once(self):
+        jobs = [
+            (
+                "observation.images.rgb.cam_left_head",
+                0,
+                0,
+                [(0, self.input_a, 0.0)],
+            )
+        ]
+
+        with patch.object(
+            self.converter,
+            "_quick_video_dimensions_cached",
+            return_value=(640, 480),
+        ) as dims, patch(
+            "cyclo_data.converter.to_lerobot_v30._ffmpeg",
+            return_value="ffmpeg",
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._h264_encoder",
+            return_value=("libx264", ["-preset", "ultrafast"]),
+        ) as encoder:
+            self.converter._warm_direct_video_encoder(jobs)
+
+        dims.assert_called_once_with(self.input_a)
+        encoder.assert_called_once_with("ffmpeg", width=640, height=480)
+
+    def test_max_speed_profile_trusts_sidecar_frame_count_by_default(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertTrue(self.converter._trust_sidecar_frame_count())
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_V30_TRUST_SIDECAR_FRAME_COUNT": "0",
+            },
+            clear=True,
+        ):
+            self.assertFalse(self.converter._trust_sidecar_frame_count())
+
+    def test_max_speed_profile_skips_direct_output_validation_by_default(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertFalse(
+                self.converter._direct_aggregate_requires_output_validation()
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_V30_VALIDATE_DIRECT_AGGREGATE": "1",
+            },
+            clear=True,
+        ):
+            self.assertTrue(
+                self.converter._direct_aggregate_requires_output_validation()
+            )
+
+    def test_grid_indices_for_raw_video_maps_recv_sidecar(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        video_dir = Path(self.temp_dir) / "videos"
+        video_dir.mkdir()
+        video_path = video_dir / "cam_left_head.mp4"
+        video_path.touch()
+        pq.write_table(
+            pa.table({"recv_ns": [1_000_000_000, 2_000_000_000, 4_000_000_000]}),
+            video_dir / "cam_left_head_timestamps.parquet",
+        )
+        episode = EpisodeData(
+            episode_index=0,
+            length=7,
+            grid_log_times_sec=[0.5, 1.0, 1.5, 2.0, 3.999, 4.0, 5.0],
+        )
+
+        indices = self.converter._grid_indices_for_raw_video(
+            episode,
+            "cam_left_head",
+            video_path,
+        )
+
+        np.testing.assert_array_equal(indices, np.array([0, 0, 0, 1, 1, 2, 2]))
+
+    def test_direct_video_aggregation_rejects_resize(self):
+        self.converter.config.image_resize = (240, 320)
+
+        self.assertFalse(
+            self.converter._can_use_direct_video_aggregation(
+                [Path(self.temp_dir) / "bag"]
+            )
+        )
+
+    def test_write_aggregated_videos_uses_direct_writer_when_enabled(self):
+        self.converter._direct_video_aggregation = True
+        episodes = [
+            EpisodeData(
+                episode_index=0,
+                timestamps=[0.0, 1 / 15],
+                observation_state=[np.array([1.0]), np.array([2.0])],
+                action=[np.array([1.0]), np.array([2.0])],
+                video_files={"cam_left_head": self.input_a},
+                tasks=["task"],
+                length=2,
+            ),
+            EpisodeData(
+                episode_index=1,
+                timestamps=[0.0, 1 / 15, 2 / 15],
+                observation_state=[np.array([1.0])] * 3,
+                action=[np.array([1.0])] * 3,
+                video_files={"cam_left_head": self.input_b},
+                tasks=["task"],
+                length=3,
+            ),
+        ]
+
+        with patch.object(
+            self.converter,
+            "_write_direct_aggregated_video",
+        ) as mock_direct, patch.object(
+            self.converter,
+            "_concatenate_videos",
+            side_effect=AssertionError("concat path should not run"),
+        ):
+            self.converter._write_aggregated_videos(episodes)
+
+        mock_direct.assert_called_once()
+        args = mock_direct.call_args.args
+        self.assertEqual(args[1], "observation.images.rgb.cam_left_head")
+        self.assertEqual([item[0] for item in args[4]], [0, 1])
+
+    def test_write_aggregated_videos_runs_largest_jobs_first(self):
+        self.converter._direct_video_aggregation = True
+        episodes = [
+            EpisodeData(
+                episode_index=0,
+                timestamps=[0.0, 1 / 15],
+                observation_state=[np.array([1.0]), np.array([2.0])],
+                action=[np.array([1.0]), np.array([2.0])],
+                video_files={"cam_small": self.input_a},
+                tasks=["task"],
+                length=2,
+            ),
+            EpisodeData(
+                episode_index=1,
+                timestamps=[0.0] * 10,
+                observation_state=[np.array([1.0])] * 10,
+                action=[np.array([1.0])] * 10,
+                video_files={"cam_large": self.input_b},
+                tasks=["task"],
+                length=10,
+            ),
+        ]
+
+        with patch.object(
+            self.converter,
+            "_plan_video_batches",
+            side_effect=[
+                [(0, 0, [(0, self.input_a, 0.0)])],
+                [(0, 0, [(1, self.input_b, 0.0)])],
+            ],
+        ), patch.object(
+            self.converter,
+            "_resolve_video_aggregation_workers",
+            return_value=1,
+        ), patch.object(
+            self.converter,
+            "_write_direct_aggregated_video",
+        ) as mock_direct, patch.object(
+            self.converter,
+            "_update_video_metadata",
+        ):
+            self.converter._write_aggregated_videos(episodes)
+
+        self.assertEqual(mock_direct.call_args_list[0].args[4][0][0], 1)
+        self.assertEqual(mock_direct.call_args_list[1].args[4][0][0], 0)
+
+    def test_write_aggregated_videos_prioritizes_larger_source_bytes(self):
+        self.converter._direct_video_aggregation = True
+        self.input_a.write_bytes(b"a")
+        self.input_b.write_bytes(b"b" * 1024)
+        episodes = [
+            EpisodeData(
+                episode_index=0,
+                timestamps=[0.0] * 20,
+                observation_state=[np.array([1.0])] * 20,
+                action=[np.array([1.0])] * 20,
+                video_files={"cam_many_frames": self.input_a},
+                tasks=["task"],
+                length=20,
+            ),
+            EpisodeData(
+                episode_index=1,
+                timestamps=[0.0],
+                observation_state=[np.array([1.0])],
+                action=[np.array([1.0])],
+                video_files={"cam_big_source": self.input_b},
+                tasks=["task"],
+                length=1,
+            ),
+        ]
+
+        with patch.object(
+            self.converter,
+            "_plan_video_batches",
+            side_effect=[
+                [(0, 0, [(0, self.input_a, 0.0)])],
+                [(0, 0, [(1, self.input_b, 0.0)])],
+            ],
+        ), patch.object(
+            self.converter,
+            "_resolve_video_aggregation_workers",
+            return_value=1,
+        ), patch.object(
+            self.converter,
+            "_write_direct_aggregated_video",
+        ) as mock_direct, patch.object(
+            self.converter,
+            "_update_video_metadata",
+        ):
+            self.converter._write_aggregated_videos(episodes)
+
+        self.assertEqual(mock_direct.call_args_list[0].args[4][0][0], 1)
+        self.assertEqual(mock_direct.call_args_list[1].args[4][0][0], 0)
+
+    def test_direct_aggregate_uses_concat_decoder_when_counts_match(self):
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.stderr = io.BytesIO()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        episode_by_index = {
+            0: EpisodeData(episode_index=0, length=2, grid_log_times_sec=[0, 1]),
+            1: EpisodeData(episode_index=1, length=3, grid_log_times_sec=[0, 1, 2]),
+        }
+        videos = [
+            (0, self.input_a, 0.0),
+            (1, self.input_b, 0.0),
+        ]
+
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            return_value=(64, 48),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._h264_encoder",
+            return_value=("libx264", ["-preset", "ultrafast"]),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._validated_video_count",
+            return_value=5,
+        ) as mock_validate, patch.object(
+            self.converter,
+            "_direct_aggregated_video_cache_key",
+            return_value={},
+        ), patch.object(
+            self.converter,
+            "_try_reuse_aggregated_video_cache",
+            return_value=False,
+        ) as mock_reuse, patch.object(
+            self.converter,
+            "_write_aggregated_video_cache",
+        ), patch.object(
+            self.converter,
+            "_store_direct_source_aggregate_cache",
+        ) as mock_store_source_cache, patch.object(
+            self.converter,
+            "_try_reuse_direct_source_aggregate_cache",
+            return_value=False,
+        ) as mock_source_reuse, patch.object(
+            self.converter,
+            "_grid_indices_and_source_count_for_raw_video",
+            side_effect=[
+                (np.array([0, 1]), 2),
+                (np.array([0, 1, 2]), 3),
+            ],
+        ), patch.object(
+            self.converter,
+            "_get_video_frame_count",
+            side_effect=[2, 3],
+        ), patch.object(
+            self.converter,
+            "_pipe_selected_yuv420_frames_concat_decoder",
+            return_value=5,
+        ) as mock_concat, patch.object(
+            self.converter,
+            "_pipe_selected_yuv420_frames",
+            side_effect=AssertionError("per-video decoder should not run"),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30.subprocess.Popen",
+            return_value=FakeProcess(),
+        ):
+            self.converter._write_direct_aggregated_video(
+                Path(self.temp_dir),
+                "observation.images.rgb.cam_left_head",
+                0,
+                0,
+                videos,
+                episode_by_index,
+            )
+
+        mock_concat.assert_called_once()
+        self.assertTrue(mock_reuse.call_args.kwargs["require_decode"])
+        self.assertTrue(mock_reuse.call_args.kwargs["validate"])
+        self.assertTrue(mock_source_reuse.call_args.kwargs["validate"])
+        self.assertTrue(mock_validate.call_args.kwargs["require_decode"])
+        mock_store_source_cache.assert_called_once()
+        self.assertFalse(mock_store_source_cache.call_args.kwargs["allow_copy"])
+
+    def test_concat_decoder_drains_skipped_frames_and_preserves_duplicates(self):
+        class FakeDecoder:
+            def __init__(self, payload: bytes):
+                self.stdout = io.BytesIO(payload)
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        frame_size = 6
+        frames = [bytes([idx]) * frame_size for idx in range(8)]
+        output = io.BytesIO()
+
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30.subprocess.Popen",
+            return_value=FakeDecoder(b"".join(frames)),
+        ):
+            written = self.converter._pipe_selected_yuv420_frames_concat_decoder(
+                "ffmpeg",
+                [
+                    (0, Path("a.mp4"), np.array([0, 2, 2]), 5, None),
+                    (1, Path("b.mp4"), np.array([1]), 3, None),
+                ],
+                frame_size,
+                output,
+                width=2,
+                height=2,
+            )
+
+        self.assertEqual(written, 4)
+        self.assertEqual(
+            output.getvalue(),
+            frames[0] + frames[2] + frames[2] + frames[6],
+        )
+
+    def test_concat_decoder_coalesces_contiguous_splice_runs(self):
+        class FakeDecoder:
+            def __init__(self, payload: bytes):
+                self.stdout = io.BytesIO(payload)
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        frame_size = 6
+        frames = [bytes([idx]) * frame_size for idx in range(5)]
+        output = io.BytesIO()
+        splice_sizes = []
+
+        def fake_splice(src, dst, size):
+            data = src.read(size)
+            dst.write(data)
+            splice_sizes.append(size)
+            return len(data)
+
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30.subprocess.Popen",
+            return_value=FakeDecoder(b"".join(frames)),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._splice_exact",
+            side_effect=fake_splice,
+        ):
+            written = self.converter._pipe_selected_yuv420_frames_concat_decoder(
+                "ffmpeg",
+                [(0, Path("a.mp4"), np.array([0, 1, 2, 4]), 5, None)],
+                frame_size,
+                output,
+                width=2,
+                height=2,
+            )
+
+        self.assertEqual(written, 4)
+        self.assertEqual(
+            output.getvalue(),
+            frames[0] + frames[1] + frames[2] + frames[4],
+        )
+        self.assertEqual(splice_sizes, [frame_size * 3, frame_size])
+
+    def test_concat_select_plan_groups_unique_source_runs(self):
+        runs, expr = self.converter._selected_yuv420_concat_plan(
+            [
+                (0, Path("a.mp4"), np.array([0, 2, 2]), 5, None),
+                (1, Path("b.mp4"), np.array([1, 2]), 3, None),
+            ]
+        )
+
+        self.assertEqual(
+            [(idx, count) for idx, count, _, _ in runs],
+            [(0, 1), (2, 2), (6, 1), (7, 1)],
+        )
+        self.assertEqual(expr, "eq(n\\,0)+eq(n\\,2)+between(n\\,6\\,7)")
+
+    def test_concat_select_decoder_expands_selected_frames(self):
+        class FakeDecoder:
+            def __init__(self, payload: bytes):
+                self.stdout = io.BytesIO(payload)
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        frame_size = 6
+        selected_frames = [bytes([idx]) * frame_size for idx in (0, 2, 6)]
+        output = io.BytesIO()
+
+        with patch(
+            "cyclo_data.converter.to_lerobot_v30.subprocess.Popen",
+            return_value=FakeDecoder(b"".join(selected_frames)),
+        ):
+            written = self.converter._pipe_selected_yuv420_frames_concat_select_decoder(
+                "ffmpeg",
+                [
+                    (0, Path("a.mp4"), np.array([0, 2, 2]), 5, None),
+                    (1, Path("b.mp4"), np.array([1]), 3, None),
+                ],
+                frame_size,
+                output,
+                width=2,
+                height=2,
+            )
+
+        self.assertEqual(written, 4)
+        self.assertEqual(
+            output.getvalue(),
+            selected_frames[0] + selected_frames[1] + selected_frames[1]
+            + selected_frames[2],
+        )
+
+    def test_concat_select_decoder_falls_back_when_expression_too_large(self):
+        output = io.BytesIO()
+        with patch.dict(
+            os.environ,
+            {"CYCLO_V30_SELECT_DECODER_MAX_EXPR": "1"},
+        ), patch.object(
+            self.converter,
+            "_pipe_selected_yuv420_frames_concat_decoder",
+            return_value=3,
+        ) as fallback:
+            written = self.converter._pipe_selected_yuv420_frames_concat_select_decoder(
+                "ffmpeg",
+                [(0, Path("a.mp4"), np.array([0, 2, 2]), 5, None)],
+                6,
+                output,
+                width=2,
+                height=2,
+            )
+
+        self.assertEqual(written, 3)
+        fallback.assert_called_once()
+
+    def test_direct_aggregate_synced_fallback_forces_software_encoder(self):
+        episode_by_index = {
+            0: EpisodeData(episode_index=0, length=2, grid_log_times_sec=[0, 1]),
+            1: EpisodeData(episode_index=1, length=3, grid_log_times_sec=[0, 1, 2]),
+        }
+        videos = [(0, self.input_a, 0.0), (1, self.input_b, 0.0)]
+        encoders = []
+
+        def fake_remux(src, indices, out_path, target_fps):
+            encoder, _ = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+            encoders.append(encoder)
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(out_path).write_bytes(b"video")
+
+        def fake_concat(*args, **kwargs):
+            encoder, _ = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+            encoders.append(encoder)
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_H264_ENCODER": "auto"},
+            clear=True,
+        ), patch.object(
+            video_sync, "_running_on_jetson", return_value=True
+        ), patch.object(
+            video_sync, "_try_encoder", return_value=True
+        ) as mock_try_encoder, patch.object(
+            self.converter,
+            "_grid_indices_for_raw_video",
+            return_value=np.array([0, 1]),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30.remux_selected_frames",
+            side_effect=fake_remux,
+        ), patch.object(
+            self.converter,
+            "_concatenate_videos",
+            side_effect=fake_concat,
+        ):
+            self.converter._write_direct_aggregate_synced_fallback(
+                Path(self.temp_dir),
+                "observation.images.rgb.cam_left_head",
+                0,
+                0,
+                videos,
+                episode_by_index,
+            )
+
+        self.assertEqual(encoders, ["libx264", "libx264", "libx264"])
+        mock_try_encoder.assert_not_called()
+
+    def test_concat_decoder_splices_non_sampled_frames_when_stats_enabled(self):
+        class FakeDecoder:
+            def __init__(self, payload: bytes):
+                self.stdout = io.BytesIO(payload)
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        frame_size = 6
+        frames = [bytes([idx]) * frame_size for idx in range(4)]
+        output = io.BytesIO()
+        stats = video_sync._StreamingRgbStats()
+        splice_calls = []
+
+        def fake_splice(src, dst, size):
+            data = src.read(size)
+            dst.write(data)
+            splice_calls.append(data)
+            return len(data)
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_VIDEO_STATS_SAMPLES": "2"},
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30.subprocess.Popen",
+            return_value=FakeDecoder(b"".join(frames)),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._splice_exact",
+            side_effect=fake_splice,
+        ):
+            written = self.converter._pipe_selected_yuv420_frames_concat_decoder(
+                "ffmpeg",
+                [(0, Path("a.mp4"), np.array([0, 1, 2, 3]), 4, stats)],
+                frame_size,
+                output,
+                width=2,
+                height=2,
+            )
+
+        self.assertEqual(written, 4)
+        self.assertEqual(output.getvalue(), b"".join(frames))
+        self.assertEqual(splice_calls, [frames[1], frames[2]])
+        self.assertEqual(stats.frame_count, 2)
+
+    def test_direct_aggregate_can_trust_sidecar_frame_count(self):
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.stderr = io.BytesIO()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        episode_by_index = {
+            0: EpisodeData(episode_index=0, length=2, grid_log_times_sec=[0, 1]),
+            1: EpisodeData(episode_index=1, length=3, grid_log_times_sec=[0, 1, 2]),
+        }
+        videos = [(0, self.input_a, 0.0), (1, self.input_b, 0.0)]
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_V30_TRUST_SIDECAR_FRAME_COUNT": "1"},
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            return_value=(64, 48),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._h264_encoder",
+            return_value=("libx264", ["-preset", "ultrafast"]),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._validated_video_count",
+            return_value=5,
+        ) as mock_validate, patch.object(
+            self.converter,
+            "_direct_aggregated_video_cache_key",
+            return_value={},
+        ), patch.object(
+            self.converter,
+            "_try_reuse_aggregated_video_cache",
+            return_value=False,
+        ) as mock_reuse, patch.object(
+            self.converter,
+            "_write_aggregated_video_cache",
+        ), patch.object(
+            self.converter,
+            "_store_direct_source_aggregate_cache",
+        ), patch.object(
+            self.converter,
+            "_try_reuse_direct_source_aggregate_cache",
+            return_value=False,
+        ) as mock_source_reuse, patch.object(
+            self.converter,
+            "_grid_indices_and_source_count_for_raw_video",
+            side_effect=[
+                (np.array([0, 1]), 2),
+                (np.array([0, 1, 2]), 3),
+            ],
+        ), patch.object(
+            self.converter,
+            "_get_video_frame_count",
+            side_effect=AssertionError("frame count should come from sidecar"),
+        ), patch.object(
+            self.converter,
+            "_pipe_selected_yuv420_frames_concat_decoder",
+            return_value=5,
+        ) as mock_concat, patch(
+            "cyclo_data.converter.to_lerobot_v30.subprocess.Popen",
+            return_value=FakeProcess(),
+        ):
+            self.converter._write_direct_aggregated_video(
+                Path(self.temp_dir),
+                "observation.images.rgb.cam_left_head",
+                0,
+                0,
+                videos,
+                episode_by_index,
+            )
+
+        mock_concat.assert_called_once()
+        self.assertFalse(mock_reuse.call_args.kwargs["require_decode"])
+        self.assertFalse(mock_reuse.call_args.kwargs["validate"])
+        self.assertFalse(mock_source_reuse.call_args.kwargs["validate"])
+        mock_validate.assert_not_called()
+
+    def test_direct_aggregate_retries_per_file_decoder_after_concat_error(self):
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.running = True
+
+            def wait(self, timeout=None):
+                self.running = False
+                return 0
+
+            def poll(self):
+                return None if self.running else 0
+
+            def kill(self):
+                self.running = False
+
+        episode_by_index = {
+            0: EpisodeData(episode_index=0, length=2, grid_log_times_sec=[0, 1]),
+            1: EpisodeData(episode_index=1, length=3, grid_log_times_sec=[0, 1, 2]),
+        }
+        videos = [(0, self.input_a, 0.0), (1, self.input_b, 0.0)]
+
+        def fake_per_file_decode(ffmpeg, video_path, indices, *args, **kwargs):
+            return int(len(indices))
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_V30_TRUST_SIDECAR_FRAME_COUNT": "1"},
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._quick_video_dimensions",
+            return_value=(64, 48),
+        ), patch(
+            "cyclo_data.converter.to_lerobot_v30._h264_encoder",
+            return_value=("libx264", ["-preset", "ultrafast"]),
+        ), patch.object(
+            self.converter,
+            "_direct_aggregated_video_cache_key",
+            return_value={},
+        ), patch.object(
+            self.converter,
+            "_try_reuse_aggregated_video_cache",
+            return_value=False,
+        ), patch.object(
+            self.converter,
+            "_write_aggregated_video_cache",
+        ), patch.object(
+            self.converter,
+            "_direct_source_aggregate_cache_paths",
+            return_value=None,
+        ), patch.object(
+            self.converter,
+            "_grid_indices_and_source_count_for_raw_video",
+            side_effect=[
+                (np.array([0, 1]), 2),
+                (np.array([0, 1, 2]), 3),
+                (np.array([0, 1]), 2),
+                (np.array([0, 1, 2]), 3),
+            ],
+        ), patch.object(
+            self.converter,
+            "_pipe_selected_yuv420_frames_concat_decoder",
+            side_effect=RuntimeError("concat rejected input"),
+        ) as mock_concat, patch.object(
+            self.converter,
+            "_pipe_selected_yuv420_frames",
+            side_effect=fake_per_file_decode,
+        ) as mock_per_file, patch.object(
+            self.converter,
+            "_write_direct_aggregate_synced_fallback",
+        ) as mock_fallback, patch.object(
+            self.converter,
+            "_log_warning",
+        ) as mock_warning, patch(
+            "cyclo_data.converter.to_lerobot_v30.subprocess.Popen",
+            side_effect=lambda *args, **kwargs: FakeProcess(),
+        ):
+            self.converter._write_direct_aggregated_video(
+                Path(self.temp_dir),
+                "observation.images.rgb.cam_left_head",
+                0,
+                0,
+                videos,
+                episode_by_index,
+            )
+
+        mock_concat.assert_called_once()
+        self.assertEqual(mock_per_file.call_count, 2)
+        mock_fallback.assert_not_called()
+        mock_warning.assert_called_once()
+
+    def test_convert_multiple_uses_parent_prepared_cache_without_pool(self):
+        bag_a = Path(self.temp_dir) / "bag_a"
+        bag_b = Path(self.temp_dir) / "bag_b"
+        bag_a.mkdir()
+        bag_b.mkdir()
+        cached = [
+            EpisodeData(
+                episode_index=0,
+                timestamps=[0.0],
+                observation_state=[np.array([1.0], dtype=np.float32)],
+                action=[np.array([2.0], dtype=np.float32)],
+                tasks=["task"],
+                length=1,
+            ),
+            EpisodeData(
+                episode_index=1,
+                timestamps=[0.0],
+                observation_state=[np.array([3.0], dtype=np.float32)],
+                action=[np.array([4.0], dtype=np.float32)],
+                tasks=["task"],
+                length=1,
+            ),
+        ]
+
+        with patch.object(
+            self.converter,
+            "_try_load_prepared_episode_for_bag",
+            side_effect=lambda _path, idx: cached[idx],
+        ), patch.object(
+            self.converter,
+            "write_from_episodes",
+            return_value=True,
+        ) as mock_write, patch(
+            "concurrent.futures.ProcessPoolExecutor",
+            side_effect=AssertionError("process pool should be skipped"),
+        ):
+            success = self.converter.convert_multiple_rosbags([bag_a, bag_b])
+
+        self.assertTrue(success)
+        mock_write.assert_called_once()
+        written = mock_write.call_args.args[0]
+        self.assertEqual([ep.episode_index for ep in written], [0, 1])
+
     @patch("cyclo_data.converter.to_lerobot_v30.subprocess.run")
-    def test_concatenate_videos_uses_cfr_reencode(self, mock_run):
+    def test_concatenate_videos_reuses_valid_aggregate_cache(self, mock_run):
+        output_path = (
+            Path(self.temp_dir)
+            / "videos"
+            / "observation.images.rgb.cam_left_head"
+            / "chunk-000"
+            / "file-000.mp4"
+        )
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"aggregate")
+        cache_key = self.converter._aggregated_video_cache_key(
+            [(0, self.input_a, 0.0), (1, self.input_b, 0.0)],
+            expected_frames=5,
+        )
+        self.converter._aggregated_video_cache_path(output_path).write_text(
+            json.dumps(cache_key),
+            encoding="utf-8",
+        )
+        self.converter._validate_aggregated_video = MagicMock()
+
+        self.converter._concatenate_videos(
+            Path(self.temp_dir),
+            "observation.images.rgb.cam_left_head",
+            0,
+            0,
+            [(0, self.input_a, 0.0), (1, self.input_b, 0.0)],
+        )
+
+        mock_run.assert_not_called()
+        self.converter._validate_aggregated_video.assert_called_once()
+
+    @patch("cyclo_data.converter.to_lerobot_v30._h264_encoder")
+    @patch("cyclo_data.converter.to_lerobot_v30.subprocess.run")
+    def test_concatenate_videos_falls_back_to_cfr_reencode(
+        self, mock_run, mock_encoder
+    ):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
+        mock_encoder.return_value = ("libx264", ["-preset", "ultrafast", "-crf", "23"])
+        self.converter._videos_support_copy_concat = MagicMock(return_value=False)
         self.converter._get_video_frame_count = MagicMock(return_value=5)
         self.converter._probe_video_fps = MagicMock(return_value=15.0)
+        self.converter._video_decodes_successfully = MagicMock(return_value=True)
 
         self.converter._concatenate_videos(
             Path(self.temp_dir),
@@ -837,10 +4722,33 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
         self.assertNotIn("copy", cmd)
 
     @patch("cyclo_data.converter.to_lerobot_v30.subprocess.run")
-    def test_single_video_also_uses_reencode_path(self, mock_run):
+    def test_concatenate_videos_uses_stream_copy_when_compatible(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
-        self.converter._get_video_frame_count = MagicMock(return_value=2)
-        self.converter._probe_video_fps = MagicMock(return_value=15.0)
+        self.converter._videos_support_copy_concat = MagicMock(return_value=True)
+        self.converter._validate_aggregated_video = MagicMock()
+        self.converter._video_decodes_successfully = MagicMock(return_value=True)
+
+        self.converter._concatenate_videos(
+            Path(self.temp_dir),
+            "observation.images.rgb.cam_left_head",
+            0,
+            0,
+            [(0, self.input_a, 0.0), (1, self.input_b, 0.0)],
+        )
+
+        cmd = mock_run.call_args.args[0]
+        self.assertIn("-c:v", cmd)
+        self.assertIn("copy", cmd)
+        self.assertNotIn("libx264", cmd)
+
+    @patch("cyclo_data.converter.to_lerobot_v30._clone_or_copy_file")
+    @patch("cyclo_data.converter.to_lerobot_v30.subprocess.run")
+    def test_single_compatible_video_uses_direct_copy(
+        self, mock_run, mock_clone
+    ):
+        self.converter._videos_support_copy_concat = MagicMock(return_value=True)
+        self.converter._validate_aggregated_video = MagicMock()
+        self.converter._video_decodes_successfully = MagicMock(return_value=True)
 
         self.converter._concatenate_videos(
             Path(self.temp_dir),
@@ -850,13 +4758,146 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
             [(0, self.input_a, 0.0)],
         )
 
-        cmd = mock_run.call_args.args[0]
-        self.assertIn("libx264", cmd)
-        self.assertNotIn("copy", cmd)
+        mock_clone.assert_called_once()
+        mock_run.assert_not_called()
 
+    def test_single_video_copy_validation_keeps_same_path_input(self):
+        same_path = self.input_a
+        same_path.write_bytes(b"video")
+        self.converter._validate_aggregated_video = MagicMock(
+            side_effect=RuntimeError("bad copy")
+        )
+
+        result = self.converter._copy_single_compatible_video(
+            same_path, same_path, expected_frames=1
+        )
+
+        self.assertFalse(result)
+        self.assertTrue(same_path.exists())
+
+    def test_trusted_synced_outputs_skip_per_input_ffprobe(self):
+        input_a = Path(self.temp_dir) / "cam_left_head_synced.mp4"
+        input_b = Path(self.temp_dir) / "cam_left_head_2_synced.mp4"
+        input_a.write_bytes(b"video-a")
+        input_b.write_bytes(b"video-b")
+        for path, frames in ((input_a, 2), (input_b, 3)):
+            path.with_name(path.stem + ".cache.json").write_text(
+                json.dumps({"target_fps": 15, "frame_count": frames}),
+                encoding="utf-8",
+            )
+
+        with patch.object(
+            self.converter,
+            "_get_video_dimensions",
+            return_value=(480, 640),
+        ), patch.object(
+            self.converter, "_probe_video_streams"
+        ) as mock_probe, patch.object(
+            self.converter, "_get_video_frame_count"
+        ) as mock_count:
+            self.assertTrue(
+                self.converter._videos_support_copy_concat(
+                    [(0, input_a, 0.0), (1, input_b, 0.0)]
+                )
+            )
+
+        mock_probe.assert_not_called()
+        mock_count.assert_not_called()
+        self.assertEqual(
+            json.loads(input_a.with_name(input_a.stem + ".cache.json").read_text())[
+                "output_height"
+            ],
+            480,
+        )
+
+    def test_trusted_synced_outputs_use_cached_dimensions(self):
+        input_a = Path(self.temp_dir) / "cam_left_head_synced.mp4"
+        input_b = Path(self.temp_dir) / "cam_left_head_2_synced.mp4"
+        input_a.write_bytes(b"video-a")
+        input_b.write_bytes(b"video-b")
+        for path, frames in ((input_a, 2), (input_b, 3)):
+            path.with_name(path.stem + ".cache.json").write_text(
+                json.dumps({
+                    "target_fps": 15,
+                    "frame_count": frames,
+                    "output_height": 480,
+                    "output_width": 640,
+                }),
+                encoding="utf-8",
+            )
+
+        with patch.object(
+            self.converter,
+            "_get_video_dimensions",
+            side_effect=AssertionError("dimensions should come from cache"),
+        ), patch.object(
+            self.converter, "_probe_video_streams"
+        ) as mock_probe:
+            self.assertTrue(
+                self.converter._videos_support_copy_concat(
+                    [(0, input_a, 0.0), (1, input_b, 0.0)]
+                )
+            )
+
+        mock_probe.assert_not_called()
+
+    def test_trusted_synced_outputs_reject_dimension_mismatch(self):
+        input_a = Path(self.temp_dir) / "cam_left_head_synced.mp4"
+        input_b = Path(self.temp_dir) / "cam_left_head_2_synced.mp4"
+        input_a.write_bytes(b"video-a")
+        input_b.write_bytes(b"video-b")
+        for path, frames in ((input_a, 2), (input_b, 3)):
+            path.with_name(path.stem + ".cache.json").write_text(
+                json.dumps({"target_fps": 15, "frame_count": frames}),
+                encoding="utf-8",
+            )
+
+        with patch.object(
+            self.converter,
+            "_get_video_dimensions",
+            side_effect=[(480, 640), (720, 1280)],
+        ), patch.object(
+            self.converter, "_probe_video_streams"
+        ) as mock_probe:
+            self.assertFalse(
+                self.converter._videos_support_copy_concat(
+                    [(0, input_a, 0.0), (1, input_b, 0.0)]
+                )
+            )
+
+        mock_probe.assert_not_called()
+
+    @patch("cyclo_data.converter.to_lerobot_v30._h264_encoder")
     @patch("cyclo_data.converter.to_lerobot_v30.subprocess.run")
-    def test_ffmpeg_failure_raises_with_stderr(self, mock_run):
+    def test_stream_copy_validation_failure_reencodes(
+        self, mock_run, mock_encoder
+    ):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        mock_encoder.return_value = ("libx264", ["-preset", "ultrafast", "-crf", "23"])
+        self.converter._videos_support_copy_concat = MagicMock(return_value=True)
+        self.converter._validate_aggregated_video = MagicMock(
+            side_effect=[RuntimeError("bad copy"), None]
+        )
+
+        self.converter._concatenate_videos(
+            Path(self.temp_dir),
+            "observation.images.rgb.cam_left_head",
+            0,
+            0,
+            [(0, self.input_a, 0.0), (1, self.input_b, 0.0)],
+        )
+
+        copy_cmd = mock_run.call_args_list[0].args[0]
+        fallback_cmd = mock_run.call_args_list[1].args[0]
+        self.assertIn("copy", copy_cmd)
+        self.assertIn("libx264", fallback_cmd)
+
+    @patch("cyclo_data.converter.to_lerobot_v30._h264_encoder")
+    @patch("cyclo_data.converter.to_lerobot_v30.subprocess.run")
+    def test_ffmpeg_failure_raises_with_stderr(self, mock_run, mock_encoder):
         mock_run.return_value = MagicMock(returncode=1, stderr="bad concat")
+        mock_encoder.return_value = ("libx264", ["-preset", "ultrafast", "-crf", "23"])
+        self.converter._videos_support_copy_concat = MagicMock(return_value=False)
 
         with self.assertRaisesRegex(RuntimeError, "bad concat"):
             self.converter._concatenate_videos(
@@ -968,6 +5009,1050 @@ class TestVideoSyncTempResources(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "requires at least 20"):
                     video_sync._check_tmp_free_space(parent)
 
+    def test_h264_encoder_defaults_to_libx264(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(video_sync, "_try_encoder") as mock_try_encoder:
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertEqual(
+            opts,
+            ["-preset", "ultrafast", "-crf", "32", "-tune", "zerolatency"],
+        )
+        mock_try_encoder.assert_not_called()
+
+    def test_h264_encoder_thread_local_software_override_skips_probe(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_H264_ENCODER": "auto"},
+            clear=True,
+        ), patch.object(
+            video_sync, "_running_on_jetson", return_value=True
+        ), patch.object(
+            video_sync, "_try_encoder", return_value=True
+        ) as mock_try_encoder:
+            with video_sync._force_h264_software_encoder():
+                encoder, opts = video_sync._h264_encoder(
+                    "ffmpeg",
+                    width=640,
+                    height=480,
+                )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertIn("-preset", opts)
+        mock_try_encoder.assert_not_called()
+
+    def test_h264_encoder_quality_profile_restores_legacy_crf(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "quality"},
+            clear=True,
+        ), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(video_sync, "_try_encoder") as mock_try_encoder:
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertEqual(opts, ["-preset", "ultrafast", "-crf", "23"])
+        mock_try_encoder.assert_not_called()
+
+    def test_h264_encoder_max_speed_profile_auto_selects_hardware(self):
+        probe_result = types.SimpleNamespace(
+            stdout=" V....D h264_nvenc\n V....D libx264\n",
+            returncode=0,
+        )
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(
+            video_sync, "_H264_ENCODER_CACHE", None
+        ), patch.object(
+            video_sync.subprocess, "run", return_value=probe_result
+        ), patch.object(
+            video_sync, "_try_encoder", return_value=True
+        ):
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "h264_nvenc")
+        self.assertIn("p1", opts)
+        self.assertIn("constqp", opts)
+        self.assertIn("51", opts)
+
+    def test_h264_encoder_max_speed_software_fallback_uses_fastest_qp(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_H264_ENCODER": "software",
+            },
+            clear=True,
+        ), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(video_sync, "_try_encoder") as mock_try_encoder:
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertEqual(
+            opts,
+            [
+                "-preset", "ultrafast",
+                "-qp", "51",
+                "-tune", "zerolatency",
+                "-g", "1",
+                "-threads", "1",
+            ],
+        )
+        mock_try_encoder.assert_not_called()
+
+    def test_h264_encoder_honors_x264_qp_env(self):
+        env = {
+            "CYCLO_X264_PRESET": "superfast",
+            "CYCLO_X264_QP": "45",
+            "CYCLO_X264_CRF": "28",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(video_sync, "_try_encoder") as mock_try_encoder:
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertEqual(
+            opts,
+            ["-preset", "superfast", "-qp", "45", "-tune", "zerolatency"],
+        )
+        mock_try_encoder.assert_not_called()
+
+    def test_h264_encoder_honors_x264_gop_env(self):
+        env = {
+            "CYCLO_X264_SPEED_PROFILE": "max",
+            "CYCLO_H264_ENCODER": "software",
+            "CYCLO_X264_GOP": "120",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(video_sync, "_try_encoder") as mock_try_encoder:
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+        )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertIn("-g", opts)
+        self.assertEqual(opts[opts.index("-g") + 1], "120")
+        mock_try_encoder.assert_not_called()
+
+    def test_h264_encoder_honors_x264_threads_env(self):
+        env = {
+            "CYCLO_H264_ENCODER": "software",
+            "CYCLO_X264_THREADS": "2",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(video_sync, "_try_encoder") as mock_try_encoder:
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertEqual(opts[-2:], ["-threads", "2"])
+        mock_try_encoder.assert_not_called()
+
+    def test_h264_encoder_auto_cache_keys_x264_threads_env(self):
+        probe_result = subprocess.CompletedProcess(
+            args=["ffmpeg", "-encoders"],
+            returncode=0,
+            stdout=" V....D libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
+            stderr="",
+        )
+
+        def fake_try_encoder(ffmpeg, encoder, opts):
+            return encoder == "libx264"
+
+        with patch.object(video_sync, "_H264_ENCODER_CACHE", {}), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(
+            video_sync.subprocess,
+            "run",
+            return_value=probe_result,
+        ), patch.object(
+            video_sync,
+            "_h264_hardware_encoder_candidates",
+            return_value=[],
+        ), patch.object(
+            video_sync,
+            "_try_encoder",
+            side_effect=fake_try_encoder,
+        ) as mock_try_encoder:
+            with patch.dict(
+                os.environ,
+                {
+                    "CYCLO_X264_SPEED_PROFILE": "max",
+                    "CYCLO_X264_THREADS": "2",
+                },
+                clear=True,
+            ):
+                first_encoder, first_opts = video_sync._h264_encoder(
+                    "ffmpeg",
+                    width=640,
+                    height=480,
+                )
+            with patch.dict(
+                os.environ,
+                {
+                    "CYCLO_X264_SPEED_PROFILE": "max",
+                    "CYCLO_X264_THREADS": "3",
+                },
+                clear=True,
+            ):
+                second_encoder, second_opts = video_sync._h264_encoder(
+                    "ffmpeg",
+                    width=640,
+                    height=480,
+                )
+
+        self.assertEqual(first_encoder, "libx264")
+        self.assertEqual(second_encoder, "libx264")
+        self.assertEqual(first_opts[-2:], ["-threads", "2"])
+        self.assertEqual(second_opts[-2:], ["-threads", "3"])
+        self.assertEqual(mock_try_encoder.call_count, 2)
+
+    def test_h264_encoder_honors_x264_tuning_env(self):
+        env = {
+            "CYCLO_X264_PRESET": "superfast",
+            "CYCLO_X264_CRF": "28",
+            "CYCLO_X264_TUNE": "zerolatency",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(video_sync, "_try_encoder") as mock_try_encoder:
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertEqual(
+            opts,
+            ["-preset", "superfast", "-crf", "28", "-tune", "zerolatency"],
+        )
+        mock_try_encoder.assert_not_called()
+
+    def test_h264_encoder_fallback_uses_x264_tuning_env(self):
+        env = {
+            "CYCLO_H264_ENCODER": "h264_nvenc",
+            "CYCLO_X264_PRESET": "veryfast",
+            "CYCLO_X264_CRF": "30",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            video_sync, "_try_encoder", return_value=False
+        ):
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+        )
+
+        self.assertEqual(encoder, "libx264")
+        self.assertEqual(
+            opts,
+            ["-preset", "veryfast", "-crf", "30", "-tune", "zerolatency"],
+        )
+
+    def test_h264_encoder_auto_can_select_nvenc_for_real_dimensions(self):
+        probe_result = types.SimpleNamespace(
+            stdout=" V....D h264_nvenc\n V....D libx264\n",
+            returncode=0,
+        )
+        with patch.dict(os.environ, {"CYCLO_H264_ENCODER": "auto"}, clear=True), \
+            patch.object(video_sync, "_H264_ENCODER_CACHE", None), \
+            patch.object(video_sync.subprocess, "run", return_value=probe_result), \
+            patch.object(video_sync, "_try_encoder", return_value=True):
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "h264_nvenc")
+        self.assertIn("p1", opts)
+        self.assertIn("vbr", opts)
+        self.assertIn("23", opts)
+
+    def test_h264_encoder_auto_cache_is_speed_profile_specific(self):
+        probe_result = types.SimpleNamespace(
+            stdout=" V....D h264_nvenc\n V....D libx264\n",
+            returncode=0,
+        )
+        cache: Dict[Tuple[str, ...], List[str]] = {}
+        with patch.object(video_sync, "_H264_ENCODER_CACHE", cache), patch.object(
+            video_sync.subprocess,
+            "run",
+            return_value=probe_result,
+        ), patch.object(video_sync, "_try_encoder", return_value=True):
+            with patch.dict(
+                os.environ,
+                {"CYCLO_X264_SPEED_PROFILE": "max"},
+                clear=True,
+            ):
+                _, max_opts = video_sync._h264_encoder(
+                    "ffmpeg",
+                    width=640,
+                    height=480,
+                )
+            with patch.dict(
+                os.environ,
+                {"CYCLO_H264_ENCODER": "auto"},
+                clear=True,
+            ):
+                _, normal_opts = video_sync._h264_encoder(
+                    "ffmpeg",
+                    width=640,
+                    height=480,
+                )
+
+        self.assertIn("constqp", max_opts)
+        self.assertIn("vbr", normal_opts)
+
+    def test_h264_encoder_auto_probe_is_cached(self):
+        probe_result = types.SimpleNamespace(
+            stdout=" V....D h264_nvenc\n V....D libx264\n",
+            returncode=0,
+        )
+        cache: Dict[Tuple[str, ...], List[str]] = {}
+        with patch.dict(os.environ, {"CYCLO_H264_ENCODER": "auto"}, clear=True), \
+            patch.object(video_sync, "_H264_ENCODER_CACHE", cache), \
+            patch.object(video_sync.subprocess, "run", return_value=probe_result) as mock_run, \
+            patch.object(video_sync, "_try_encoder", return_value=True):
+            first = video_sync._h264_encoder("ffmpeg", width=640, height=480)
+            second = video_sync._h264_encoder("ffmpeg", width=640, height=480)
+
+        self.assertEqual(first, second)
+        mock_run.assert_called_once()
+
+    def test_h264_encoder_auto_can_select_jetson_nvmpi(self):
+        probe_result = types.SimpleNamespace(
+            stdout=" V..... h264_nvmpi\n V....D libx264\n",
+            returncode=0,
+        )
+        with patch.dict(os.environ, {"CYCLO_H264_ENCODER": "auto"}, clear=True), \
+            patch.object(video_sync, "_H264_ENCODER_CACHE", None), \
+            patch.object(video_sync.subprocess, "run", return_value=probe_result), \
+            patch.object(video_sync, "_try_encoder", return_value=True):
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "h264_nvmpi")
+        self.assertEqual(opts, ["-b:v", "5M"])
+
+    def test_h264_encoder_defaults_to_auto_on_jetson(self):
+        probe_result = types.SimpleNamespace(
+            stdout=" V....D h264_nvenc\n V..... h264_nvmpi\n V....D libx264\n",
+            returncode=0,
+        )
+        with patch.dict(os.environ, {}, clear=True), \
+            patch.object(video_sync, "_running_on_jetson", return_value=True), \
+            patch.object(video_sync, "_H264_ENCODER_CACHE", None), \
+            patch.object(video_sync.subprocess, "run", return_value=probe_result), \
+            patch.object(video_sync, "_try_encoder", return_value=True):
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "h264_nvmpi")
+        self.assertEqual(opts, ["-b:v", "5M"])
+
+    def test_h264_encoder_can_force_jetson_alias_with_probe_fallback(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_H264_ENCODER": "jetson"},
+            clear=True,
+        ), patch.object(video_sync, "_try_encoder", return_value=True):
+            encoder, opts = video_sync._h264_encoder(
+                "ffmpeg",
+                width=640,
+                height=480,
+            )
+
+        self.assertEqual(encoder, "h264_nvmpi")
+        self.assertEqual(opts, ["-b:v", "5M"])
+
+    def test_h264_encoder_keeps_tiny_outputs_on_libx264(self):
+        with patch.dict(os.environ, {"CYCLO_H264_ENCODER": "auto"}, clear=True), \
+            patch.object(video_sync, "_try_encoder") as mock_try_encoder:
+            encoder, _ = video_sync._h264_encoder(
+                "ffmpeg",
+                width=64,
+                height=48,
+            )
+
+        self.assertEqual(encoder, "libx264")
+        mock_try_encoder.assert_not_called()
+
+    def test_decode_validation_uses_opencv_fast_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "ok.mp4"
+            video_path.write_bytes(b"mp4")
+
+            class FakeCapture:
+                def __init__(self, _path):
+                    pass
+
+                def isOpened(self):
+                    return True
+
+                def read(self):
+                    return True, object()
+
+                def release(self):
+                    pass
+
+            fake_cv2 = types.SimpleNamespace(VideoCapture=FakeCapture)
+            with patch.dict(sys.modules, {"cv2": fake_cv2}), patch.object(
+                video_sync.subprocess,
+                "run",
+                side_effect=AssertionError("ffmpeg should not run"),
+            ):
+                self.assertTrue(
+                    video_sync._video_decodes_successfully(video_path, "ffmpeg")
+                )
+
+    def test_output_validation_uses_opencv_count_fps_decode_fast_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "ok.mp4"
+            video_path.write_bytes(b"mp4")
+
+            class FakeCapture:
+                def __init__(self, _path):
+                    pass
+
+                def isOpened(self):
+                    return True
+
+                def get(self, prop):
+                    if prop == fake_cv2.CAP_PROP_FRAME_COUNT:
+                        return 7
+                    if prop == fake_cv2.CAP_PROP_FPS:
+                        return 15.0
+                    return 0
+
+                def read(self):
+                    return True, object()
+
+                def release(self):
+                    pass
+
+            fake_cv2 = types.SimpleNamespace(
+                VideoCapture=FakeCapture,
+                CAP_PROP_FRAME_COUNT=1,
+                CAP_PROP_FPS=2,
+            )
+            with patch.dict(sys.modules, {"cv2": fake_cv2}), patch.object(
+                video_sync.subprocess,
+                "run",
+                side_effect=AssertionError("ffprobe should not run"),
+            ):
+                count = video_sync._validated_video_count(
+                    output_mp4=video_path,
+                    expected_frames=7,
+                    target_fps=15,
+                    ffmpeg="ffmpeg",
+                    label="streaming",
+                )
+
+            self.assertEqual(count, 7)
+
+    def test_output_validation_can_skip_decode_read(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "ok.mp4"
+            video_path.write_bytes(b"mp4")
+
+            class FakeCapture:
+                def __init__(self, _path):
+                    pass
+
+                def isOpened(self):
+                    return True
+
+                def get(self, prop):
+                    if prop == fake_cv2.CAP_PROP_FRAME_COUNT:
+                        return 7
+                    if prop == fake_cv2.CAP_PROP_FPS:
+                        return 15.0
+                    return 0
+
+                def read(self):
+                    raise AssertionError("decode read should be skipped")
+
+                def release(self):
+                    pass
+
+            fake_cv2 = types.SimpleNamespace(
+                VideoCapture=FakeCapture,
+                CAP_PROP_FRAME_COUNT=1,
+                CAP_PROP_FPS=2,
+            )
+            with patch.dict(sys.modules, {"cv2": fake_cv2}), patch.object(
+                video_sync.subprocess,
+                "run",
+                side_effect=AssertionError("ffprobe should not run"),
+            ):
+                count = video_sync._validated_video_count(
+                    output_mp4=video_path,
+                    expected_frames=7,
+                    target_fps=15,
+                    ffmpeg="ffmpeg",
+                    label="streaming",
+                    require_decode=False,
+                )
+
+            self.assertEqual(count, 7)
+
+    def test_decode_validation_strict_mode_uses_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "ok.mp4"
+            video_path.write_bytes(b"mp4")
+            result = types.SimpleNamespace(returncode=0)
+
+            with patch.dict(
+                os.environ,
+                {"CYCLO_VIDEO_SYNC_STRICT_FFMPEG_DECODE": "1"},
+            ), patch.object(
+                video_sync.subprocess,
+                "run",
+                return_value=result,
+            ) as mock_run:
+                self.assertTrue(
+                    video_sync._video_decodes_successfully(video_path, "ffmpeg")
+                )
+
+            mock_run.assert_called_once()
+
+    def test_capture_advance_grabs_skipped_frames(self):
+        class FakeCapture:
+            def __init__(self):
+                self.grabs = 0
+                self.reads = 0
+
+            def grab(self):
+                self.grabs += 1
+                return True
+
+            def read(self):
+                self.reads += 1
+                return True, np.array([[[self.reads]]], dtype=np.uint8)
+
+        cap = FakeCapture()
+        current_idx, frame, clamped = video_sync._advance_capture_to_index(
+            cap,
+            current_idx=-1,
+            requested_idx=3,
+            last_frame=None,
+            input_name="input.mp4",
+        )
+
+        self.assertEqual(current_idx, 3)
+        self.assertFalse(clamped)
+        self.assertEqual(cap.grabs, 3)
+        self.assertEqual(cap.reads, 1)
+        self.assertEqual(int(frame[0, 0, 0]), 1)
+
+    def test_write_frame_bgr_writes_numpy_buffer_without_tobytes(self):
+        frame = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3)
+        out = io.BytesIO()
+
+        video_sync._write_frame_bgr(out, frame)
+
+        self.assertEqual(out.getvalue(), frame.tobytes())
+
+    def test_write_frame_bytes_uses_fileno_pipe(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(write_fd, "wb", buffering=0) as out:
+                video_sync._write_frame_bytes(out, bytearray(b"abcde"))
+            with os.fdopen(read_fd, "rb", buffering=0) as inp:
+                self.assertEqual(inp.read(), b"abcde")
+        finally:
+            for fd in (read_fd, write_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_write_frame_bytes_falls_back_without_fileno(self):
+        out = io.BytesIO()
+
+        video_sync._write_frame_bytes(out, bytearray(b"abcde"))
+
+        self.assertEqual(out.getvalue(), b"abcde")
+
+    def test_write_repeated_frame_bytes_uses_writev_pipe(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(write_fd, "wb", buffering=0) as out:
+                video_sync._write_repeated_frame_bytes(out, bytearray(b"ab"), 3)
+            with os.fdopen(read_fd, "rb", buffering=0) as inp:
+                self.assertEqual(inp.read(), b"ababab")
+        finally:
+            for fd in (read_fd, write_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_write_repeated_frame_bytes_caches_iov_limit(self):
+        video_sync._writev_iov_batch_limit.cache_clear()
+        with patch.object(video_sync.os, "sysconf", return_value=16) as sysconf:
+            first = video_sync._writev_iov_batch_limit()
+            second = video_sync._writev_iov_batch_limit()
+
+        sysconf.assert_called_once_with("SC_IOV_MAX")
+        self.assertEqual(first, 16)
+        self.assertEqual(second, 16)
+
+    def test_write_repeated_frame_bytes_falls_back_without_fileno(self):
+        out = io.BytesIO()
+
+        video_sync._write_repeated_frame_bytes(out, bytearray(b"ab"), 3)
+
+        self.assertEqual(out.getvalue(), b"ababab")
+
+    def test_contiguous_forward_run_stops_before_duplicate_run(self):
+        self.assertEqual(
+            video_sync._contiguous_forward_run_length(np.array([0, 1, 2, 3]), 0),
+            4,
+        )
+        self.assertEqual(
+            video_sync._contiguous_forward_run_length(np.array([0, 1, 1]), 0),
+            1,
+        )
+        self.assertEqual(
+            video_sync._contiguous_forward_run_length(np.array([0, 1, 2, 2]), 0),
+            2,
+        )
+
+    def test_splice_exact_moves_pipe_bytes(self):
+        if not hasattr(os, "splice"):
+            self.skipTest("os.splice is not available on this platform")
+        src_read, src_write = os.pipe()
+        dst_read, dst_write = os.pipe()
+        try:
+            os.write(src_write, b"abcdef")
+            with os.fdopen(src_read, "rb", buffering=0) as src, os.fdopen(
+                dst_write, "wb", buffering=0
+            ) as dst:
+                moved = video_sync._splice_exact(src, dst, 6)
+            self.assertEqual(moved, 6)
+            self.assertEqual(os.read(dst_read, 6), b"abcdef")
+        finally:
+            for fd in (src_read, src_write, dst_read, dst_write):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_drain_exact_discards_pipe_bytes(self):
+        src_read, src_write = os.pipe()
+        discard_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.write(src_write, b"abcdef")
+            with os.fdopen(src_read, "rb", buffering=0) as src:
+                drained = video_sync._drain_exact(
+                    src,
+                    4,
+                    discard_fd=discard_fd,
+                )
+                self.assertEqual(drained, 4)
+                self.assertEqual(src.read(2), b"ef")
+        finally:
+            for fd in (src_read, src_write, discard_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_read_exact_into_handles_partial_pipe_reads(self):
+        class PartialPipe:
+            def __init__(self, chunks):
+                self.chunks = list(chunks)
+
+            def readinto(self, target):
+                if not self.chunks:
+                    return 0
+                chunk = self.chunks.pop(0)
+                n = min(len(target), len(chunk))
+                target[:n] = chunk[:n]
+                if n < len(chunk):
+                    self.chunks.insert(0, chunk[n:])
+                return n
+
+        buffer = bytearray(5)
+
+        count = video_sync._read_exact_into(
+            PartialPipe([b"ab", b"c", b"de"]),
+            buffer,
+            5,
+        )
+
+        self.assertEqual(count, 5)
+        self.assertEqual(bytes(buffer), b"abcde")
+
+    def test_yuv420_pipe_eligibility(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(
+                video_sync._use_yuv420_pipe(
+                    width=640,
+                    height=480,
+                    rotation_deg=0,
+                    image_resize=None,
+                )
+            )
+            self.assertFalse(
+                video_sync._use_yuv420_pipe(
+                    width=641,
+                    height=480,
+                    rotation_deg=0,
+                    image_resize=None,
+                )
+            )
+            self.assertFalse(
+                video_sync._use_yuv420_pipe(
+                    width=640,
+                    height=480,
+                    rotation_deg=90,
+                    image_resize=None,
+                )
+            )
+        with patch.dict(
+            os.environ,
+            {"CYCLO_VIDEO_SYNC_DISABLE_YUV420_PIPE": "1"},
+        ):
+            self.assertFalse(
+                video_sync._use_yuv420_pipe(
+                    width=640,
+                    height=480,
+                    rotation_deg=0,
+                    image_resize=None,
+                )
+            )
+
+    def test_streaming_prefers_yuv420_ffmpeg_pipe(self):
+        expected = video_sync.VideoSyncResult(
+            frame_count=1,
+            mode="stream_encode",
+            output_height=480,
+            output_width=640,
+        )
+        with patch.dict(os.environ, {}, clear=True), \
+            patch.object(
+                video_sync,
+                "_remux_selected_frames_ffmpeg_yuv420_pipe",
+                return_value=expected,
+            ) as yuv_pipe, \
+            patch.object(
+                video_sync,
+                "_remux_selected_frames_opencv_streaming",
+                side_effect=AssertionError("OpenCV fallback should not run"),
+            ):
+            result = video_sync._remux_selected_frames_streaming(
+                input_mp4=Path("input.mp4"),
+                frame_indices=[0],
+                output_mp4=Path("output.mp4"),
+                target_fps=30,
+                rotation_deg=0,
+                image_resize=None,
+                ffmpeg="ffmpeg",
+            )
+
+        self.assertIs(result, expected)
+        yuv_pipe.assert_called_once()
+
+    def test_streaming_can_disable_yuv420_ffmpeg_pipe(self):
+        expected = video_sync.VideoSyncResult(frame_count=1, mode="stream_encode")
+        with patch.dict(
+            os.environ,
+            {"CYCLO_VIDEO_SYNC_DISABLE_YUV420_PIPE": "1"},
+            clear=True,
+        ), patch.object(
+            video_sync,
+            "_remux_selected_frames_ffmpeg_yuv420_pipe",
+            side_effect=AssertionError("YUV pipe should be skipped"),
+        ), patch.object(
+            video_sync,
+            "_remux_selected_frames_opencv_streaming",
+            return_value=expected,
+        ) as opencv_stream:
+            result = video_sync._remux_selected_frames_streaming(
+                input_mp4=Path("input.mp4"),
+                frame_indices=[0],
+                output_mp4=Path("output.mp4"),
+                target_fps=30,
+                rotation_deg=0,
+                image_resize=None,
+                ffmpeg="ffmpeg",
+            )
+
+        self.assertIs(result, expected)
+        opencv_stream.assert_called_once()
+
+    def test_ffmpeg_threads_default_is_portable_decoder_side_default(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            video_sync.os,
+            "cpu_count",
+            return_value=8,
+        ):
+            self.assertEqual(video_sync._ffmpeg_threads_arg(), ["-threads", "2"])
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            video_sync.os,
+            "cpu_count",
+            return_value=2,
+        ):
+            self.assertEqual(video_sync._ffmpeg_threads_arg(), ["-threads", "1"])
+        with patch.dict(os.environ, {"CYCLO_FFMPEG_THREADS": "4"}, clear=True):
+            self.assertEqual(video_sync._ffmpeg_threads_arg(), ["-threads", "4"])
+
+    def test_h264_decoder_uses_portable_software_default(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ), patch.object(
+            video_sync, "_running_on_jetson", return_value=False
+        ), patch.object(
+            video_sync,
+            "_ffmpeg_supports_h264_cuvid",
+            side_effect=AssertionError("CUVID probe should be skipped"),
+        ), patch.object(video_sync.os, "cpu_count", return_value=8):
+            self.assertEqual(
+                video_sync._ffmpeg_h264_decoder_args("ffmpeg"),
+                ["-threads", "2"],
+            )
+
+    def test_h264_decoder_can_use_cuvid_when_requested(self):
+        with patch.dict(
+            os.environ,
+            {"CYCLO_H264_DECODER": "h264_cuvid"},
+            clear=True,
+        ), patch.object(
+            video_sync,
+            "_ffmpeg_supports_h264_cuvid",
+            return_value=True,
+        ):
+            self.assertEqual(
+                video_sync._ffmpeg_h264_decoder_args("ffmpeg"),
+                ["-c:v", "h264_cuvid"],
+            )
+
+    def test_h264_decoder_defaults_to_jetson_hardware_probe_on_jetson(self):
+        def supports(_ffmpeg, decoder):
+            return decoder == "h264_nvmpi"
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            video_sync, "_running_on_jetson", return_value=True
+        ), patch.object(
+            video_sync,
+            "_ffmpeg_supports_h264_cuvid",
+            side_effect=AssertionError(
+                "Jetson default should try Jetson decoders first"
+            ),
+        ), patch.object(
+            video_sync, "_ffmpeg_supports_h264_decoder", side_effect=supports
+        ):
+            self.assertEqual(
+                video_sync._ffmpeg_h264_decoder_args("ffmpeg"),
+                ["-c:v", "h264_nvmpi"],
+            )
+
+    def test_h264_decoder_jetson_alias_can_use_v4l2m2m_fallback(self):
+        def supports(_ffmpeg, decoder):
+            return decoder == "h264_v4l2m2m"
+
+        with patch.dict(
+            os.environ,
+            {"CYCLO_H264_DECODER": "jetson"},
+            clear=True,
+        ), patch.object(
+            video_sync, "_ffmpeg_supports_h264_decoder", side_effect=supports
+        ):
+            self.assertEqual(
+                video_sync._ffmpeg_h264_decoder_args("ffmpeg"),
+                ["-c:v", "h264_v4l2m2m"],
+            )
+
+    def test_h264_decoder_can_force_software_in_max_profile(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_H264_DECODER": "software",
+            },
+            clear=True,
+        ), patch.object(
+            video_sync,
+            "_ffmpeg_supports_h264_cuvid",
+            side_effect=AssertionError("CUVID probe should be skipped"),
+        ), patch.object(video_sync.os, "cpu_count", return_value=8):
+            self.assertEqual(
+                video_sync._ffmpeg_h264_decoder_args("ffmpeg"),
+                ["-threads", "2"],
+            )
+
+    def test_ffmpeg_pipe_size_is_explicit_host_tuning_knob(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(video_sync._ffmpeg_pipe_size(640 * 480 * 3 // 2), 0)
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertEqual(
+                video_sync._ffmpeg_pipe_size(640 * 480 * 3 // 2),
+                0,
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_FFMPEG_PIPE_SIZE": "1048576",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                video_sync._ffmpeg_pipe_size(640 * 480 * 3 // 2),
+                1_048_576,
+            )
+
+    def test_max_speed_profile_skips_faststart_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(video_sync._mp4_faststart_args(), ["-movflags", "+faststart"])
+        with patch.dict(
+            os.environ,
+            {"CYCLO_X264_SPEED_PROFILE": "max"},
+            clear=True,
+        ):
+            self.assertEqual(video_sync._mp4_faststart_args(), [])
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_MP4_FASTSTART": "1",
+            },
+            clear=True,
+        ):
+            self.assertEqual(video_sync._mp4_faststart_args(), ["-movflags", "+faststart"])
+
+    def test_streaming_rgb_stats_match_numpy_stats(self):
+        samples = [
+            np.array(
+                [
+                    [[0, 10, 20], [30, 40, 50]],
+                    [[60, 70, 80], [90, 100, 110]],
+                ],
+                dtype=np.uint8,
+            ),
+            np.array(
+                [
+                    [[255, 128, 64], [1, 2, 3]],
+                    [[4, 5, 6], [7, 8, 9]],
+                ],
+                dtype=np.uint8,
+            ),
+        ]
+
+        stats = video_sync._stats_from_samples(samples)
+        frames = np.asarray(samples, dtype=np.float32) / 255.0
+
+        self.assertEqual(stats["count"], [2])
+        for channel in range(3):
+            channel_data = frames[:, :, :, channel]
+            self.assertAlmostEqual(
+                stats["mean"][channel][0][0],
+                float(channel_data.mean()),
+                places=7,
+            )
+            self.assertAlmostEqual(
+                stats["std"][channel][0][0],
+                float(channel_data.std()),
+                places=7,
+            )
+            self.assertAlmostEqual(
+                stats["min"][channel][0][0],
+                float(channel_data.min()),
+                places=7,
+            )
+            self.assertAlmostEqual(
+                stats["max"][channel][0][0],
+                float(channel_data.max()),
+                places=7,
+            )
+
+    def test_video_stats_sample_positions_default_and_env(self):
+        with patch.dict(os.environ, {}, clear=True):
+            default_positions = video_sync._video_stats_sample_positions(100)
+        self.assertEqual(len(default_positions), 8)
+        self.assertIn(0, default_positions)
+        self.assertIn(99, default_positions)
+
+        with patch.dict(os.environ, {"CYCLO_VIDEO_STATS_SAMPLES": "0"}):
+            self.assertEqual(video_sync._video_stats_sample_positions(100), set())
+
+        with patch.dict(os.environ, {"CYCLO_VIDEO_STATS_SAMPLES": "5"}):
+            self.assertEqual(
+                len(video_sync._video_stats_sample_positions(100)),
+                5,
+            )
+
+    def test_max_speed_profile_defaults_video_stats_to_zero(self):
+        with patch.dict(os.environ, {"CYCLO_X264_SPEED_PROFILE": "max"}, clear=True):
+            self.assertEqual(
+                base_converter.RosbagToLerobotConverterBase._video_stats_sample_budget(),
+                0,
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "CYCLO_X264_SPEED_PROFILE": "max",
+                "CYCLO_VIDEO_STATS_SAMPLES": "5",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                base_converter.RosbagToLerobotConverterBase._video_stats_sample_budget(),
+                5,
+            )
+
     def test_remux_uses_resolved_temp_parent_before_ffmpeg(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "videos" / "cam_synced.mp4"
@@ -994,6 +6079,12 @@ class TestVideoSyncTempResources(unittest.TestCase):
             with patch.object(
                 video_sync, "_ffmpeg", return_value="ffmpeg"
             ), patch.object(
+                video_sync, "_can_packet_copy_sync", return_value=False
+            ), patch.object(
+                video_sync,
+                "_remux_selected_frames_streaming",
+                side_effect=RuntimeError("stream failed"),
+            ), patch.object(
                 video_sync.tempfile, "TemporaryDirectory", FakeTemporaryDirectory
             ), patch.object(
                 video_sync, "_remux_selected_frames_in_tmp", side_effect=fake_inner
@@ -1006,6 +6097,495 @@ class TestVideoSyncTempResources(unittest.TestCase):
             self.assertEqual(seen["prefix"], "video_sync_")
             self.assertEqual(seen["dir"], out.parent / ".video_sync_tmp")
             self.assertFalse((out.parent / ".video_sync_tmp").exists())
+
+    def test_packet_copy_helper_uses_setts_and_copy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            input_mp4 = tmp / "input.mp4"
+            output_mp4 = tmp / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            commands = []
+
+            def fake_run(cmd, *args, **kwargs):
+                commands.append(list(cmd))
+                output_mp4.write_bytes(b"mp4")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(
+                video_sync.subprocess, "run", side_effect=fake_run
+            ), patch.object(
+                video_sync, "_video_frame_count_and_fps", return_value=(3, 15.0)
+            ), patch.object(
+                video_sync, "_video_decodes_successfully", return_value=True
+            ):
+                result = video_sync._remux_selected_frames_packet_copy(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 1, 2],
+                    output_mp4=output_mp4,
+                    target_fps=15,
+                    ffmpeg="ffmpeg",
+                )
+
+            cmd = commands[0]
+            self.assertEqual(result.mode, "packet_copy")
+            self.assertIn("-c:v", cmd)
+            self.assertIn("copy", cmd)
+            self.assertIn("-bsf:v", cmd)
+            self.assertTrue(any("setts=pts=N*6000" in item for item in cmd))
+            self.assertIn("+faststart", cmd)
+
+    def test_ffmpeg_pipe_stream_uses_passthrough_decode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            input_mp4 = tmp / "input.mp4"
+            output_mp4 = tmp / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            frame0 = bytes([0, 1, 2, 3, 4, 5])
+            frame1 = bytes([6, 7, 8, 9, 10, 11])
+            commands = []
+            encoder_stdin = io.BytesIO()
+
+            class DecoderProcess:
+                def __init__(self):
+                    self.stdout = io.BytesIO(frame0 + frame1)
+                    self.stderr = io.BytesIO()
+
+                def poll(self):
+                    return None
+
+                def kill(self):
+                    pass
+
+            class EncoderStdin:
+                closed = False
+
+                def write(self, data):
+                    encoder_stdin.write(data)
+
+                def close(self):
+                    self.closed = True
+
+            class EncoderProcess:
+                def __init__(self):
+                    self.stdin = EncoderStdin()
+                    self.stderr = io.BytesIO()
+
+                def wait(self, timeout=None):
+                    output_mp4.write_bytes(b"mp4")
+                    return 0
+
+                def poll(self):
+                    return 0
+
+                def kill(self):
+                    pass
+
+            def fake_popen(cmd, *args, **kwargs):
+                commands.append(list(cmd))
+                if "pipe:1" in cmd:
+                    return DecoderProcess()
+                return EncoderProcess()
+
+            with patch.object(
+                video_sync, "_probe_video_stream",
+                return_value={"width": 2, "height": 1},
+            ), patch.object(
+                video_sync,
+                "_ffmpeg_h264_decoder_args",
+                return_value=["-c:v", "h264_nvmpi"],
+            ), patch.object(
+                video_sync.subprocess, "Popen", side_effect=fake_popen
+            ), patch.object(
+                video_sync, "_h264_encoder", return_value=("libx264", [])
+            ), patch.object(
+                video_sync, "_video_frame_count_and_fps", return_value=(2, 15.0)
+            ), patch.object(
+                video_sync, "_video_decodes_successfully", return_value=True
+            ):
+                result = video_sync._remux_selected_frames_ffmpeg_pipe(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 1],
+                    output_mp4=output_mp4,
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+
+            self.assertEqual(result.mode, "stream_encode")
+            self.assertEqual(encoder_stdin.getvalue(), frame0 + frame1)
+            self.assertIn("h264_nvmpi", commands[0])
+            self.assertIn("-fps_mode", commands[0])
+            self.assertIn("passthrough", commands[0])
+
+    def test_yuv420_pipe_uses_configured_h264_decoder(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            input_mp4 = tmp / "input.mp4"
+            output_mp4 = tmp / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            frame0 = bytes([0, 1, 2, 3, 4, 5])
+            frame1 = bytes([6, 7, 8, 9, 10, 11])
+            commands = []
+            encoder_stdin = io.BytesIO()
+
+            class DecoderProcess:
+                def __init__(self):
+                    self.stdout = io.BytesIO(frame0 + frame1)
+                    self.stderr = io.BytesIO()
+
+                def poll(self):
+                    return None
+
+                def kill(self):
+                    pass
+
+            class EncoderStdin:
+                closed = False
+
+                def write(self, data):
+                    encoder_stdin.write(data)
+
+                def close(self):
+                    self.closed = True
+
+            class EncoderProcess:
+                def __init__(self):
+                    self.stdin = EncoderStdin()
+                    self.stderr = io.BytesIO()
+
+                def wait(self, timeout=None):
+                    output_mp4.write_bytes(b"mp4")
+                    return 0
+
+                def poll(self):
+                    return 0
+
+                def kill(self):
+                    pass
+
+            def fake_popen(cmd, *args, **kwargs):
+                commands.append(list(cmd))
+                if "pipe:1" in cmd:
+                    return DecoderProcess()
+                return EncoderProcess()
+
+            with patch.object(
+                video_sync, "_quick_video_dimensions", return_value=(2, 2)
+            ), patch.object(
+                video_sync,
+                "_ffmpeg_h264_decoder_args",
+                return_value=["-c:v", "h264_nvmpi"],
+            ), patch.object(
+                video_sync.subprocess, "Popen", side_effect=fake_popen
+            ), patch.object(
+                video_sync, "_h264_encoder", return_value=("libx264", [])
+            ), patch.object(
+                video_sync, "_video_frame_count_and_fps", return_value=(2, 15.0)
+            ), patch.object(
+                video_sync, "_video_decodes_successfully", return_value=True
+            ):
+                result = video_sync._remux_selected_frames_ffmpeg_yuv420_pipe(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 1],
+                    output_mp4=output_mp4,
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+
+            self.assertEqual(result.mode, "stream_encode")
+            self.assertEqual(encoder_stdin.getvalue(), frame0 + frame1)
+            self.assertIn("h264_nvmpi", commands[0])
+            self.assertIn("-fps_mode", commands[0])
+            self.assertIn("passthrough", commands[0])
+
+    def test_streaming_uses_opencv_backend_by_default(self):
+        expected = video_sync.VideoSyncResult(frame_count=1, mode="stream_encode")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_mp4 = Path(tmpdir) / "input.mp4"
+            output_mp4 = Path(tmpdir) / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            with patch.dict(os.environ, {}, clear=True), patch.object(
+                video_sync,
+                "_remux_selected_frames_ffmpeg_pipe",
+            ) as mock_pipe, patch.object(
+                video_sync,
+                "_remux_selected_frames_opencv_streaming",
+                return_value=expected,
+            ) as mock_opencv:
+                result = video_sync._remux_selected_frames_streaming(
+                    input_mp4=input_mp4,
+                    frame_indices=[0],
+                    output_mp4=output_mp4,
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+
+        self.assertEqual(result, expected)
+        mock_pipe.assert_not_called()
+        mock_opencv.assert_called_once()
+
+    def test_opencv_streaming_writer_fallback_uses_ffmpeg_encoder(self):
+        expected = video_sync.VideoSyncResult(frame_count=1, mode="stream_encode")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_mp4 = Path(tmpdir) / "input.mp4"
+            output_mp4 = Path(tmpdir) / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            with patch.dict(
+                os.environ,
+                {"CYCLO_VIDEO_SYNC_ENABLE_OPENCV_WRITER": "1"},
+                clear=True,
+            ), patch.object(
+                video_sync,
+                "_remux_selected_frames_opencv_writer",
+                side_effect=RuntimeError("writer failed"),
+            ) as mock_writer, patch.object(
+                video_sync,
+                "_remux_selected_frames_opencv_ffmpeg_encoder",
+                return_value=expected,
+            ) as mock_ffmpeg:
+                result = video_sync._remux_selected_frames_opencv_streaming(
+                    input_mp4=input_mp4,
+                    frame_indices=[0],
+                    output_mp4=output_mp4,
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+
+        self.assertEqual(result, expected)
+        mock_writer.assert_called_once()
+        mock_ffmpeg.assert_called_once()
+
+    def test_opencv_streaming_can_disable_writer_fast_path(self):
+        expected = video_sync.VideoSyncResult(frame_count=1, mode="stream_encode")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_mp4 = Path(tmpdir) / "input.mp4"
+            output_mp4 = Path(tmpdir) / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            with patch.dict(
+                os.environ,
+                {
+                    "CYCLO_VIDEO_SYNC_ENABLE_OPENCV_WRITER": "1",
+                    "CYCLO_VIDEO_SYNC_DISABLE_OPENCV_WRITER": "1",
+                },
+                clear=True,
+            ), patch.object(
+                video_sync,
+                "_remux_selected_frames_opencv_writer",
+            ) as mock_writer, patch.object(
+                video_sync,
+                "_remux_selected_frames_opencv_ffmpeg_encoder",
+                return_value=expected,
+            ) as mock_ffmpeg:
+                result = video_sync._remux_selected_frames_opencv_streaming(
+                    input_mp4=input_mp4,
+                    frame_indices=[0],
+                    output_mp4=output_mp4,
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+
+        self.assertEqual(result, expected)
+        mock_writer.assert_not_called()
+        mock_ffmpeg.assert_called_once()
+
+    def test_opencv_streaming_uses_ffmpeg_encoder_by_default(self):
+        expected = video_sync.VideoSyncResult(frame_count=1, mode="stream_encode")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_mp4 = Path(tmpdir) / "input.mp4"
+            output_mp4 = Path(tmpdir) / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            with patch.dict(os.environ, {}, clear=True), patch.object(
+                video_sync,
+                "_remux_selected_frames_opencv_writer",
+            ) as mock_writer, patch.object(
+                video_sync,
+                "_remux_selected_frames_opencv_ffmpeg_encoder",
+                return_value=expected,
+            ) as mock_ffmpeg:
+                result = video_sync._remux_selected_frames_opencv_streaming(
+                    input_mp4=input_mp4,
+                    frame_indices=[0],
+                    output_mp4=output_mp4,
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+
+        self.assertEqual(result, expected)
+        mock_writer.assert_not_called()
+        mock_ffmpeg.assert_called_once()
+
+    def test_packet_copy_failure_falls_back_to_streaming_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_mp4 = Path(tmpdir) / "input.mp4"
+            output_mp4 = Path(tmpdir) / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            expected = video_sync.VideoSyncResult(
+                frame_count=1,
+                stats=None,
+                used_fallback=False,
+                mode="stream_encode",
+            )
+
+            with patch.object(
+                video_sync, "_ffmpeg", return_value="ffmpeg"
+            ), patch.object(
+                video_sync, "_can_packet_copy_sync", return_value=True
+            ), patch.object(
+                video_sync,
+                "_remux_selected_frames_packet_copy",
+                side_effect=RuntimeError("copy failed"),
+            ), patch.object(
+                video_sync,
+                "_remux_selected_frames_streaming",
+                return_value=expected,
+            ) as mock_stream:
+                result = video_sync.remux_selected_frames(
+                    input_mp4, [0], output_mp4, target_fps=15
+                )
+
+            self.assertEqual(result.mode, "stream_encode")
+            mock_stream.assert_called_once()
+
+    def test_rotation_skips_packet_copy_and_uses_streaming(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_mp4 = Path(tmpdir) / "input.mp4"
+            output_mp4 = Path(tmpdir) / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+            expected = video_sync.VideoSyncResult(frame_count=1, mode="stream_encode")
+
+            with patch.object(
+                video_sync, "_ffmpeg", return_value="ffmpeg"
+            ), patch.object(
+                video_sync,
+                "_remux_selected_frames_streaming",
+                return_value=expected,
+            ) as mock_stream:
+                result = video_sync.remux_selected_frames(
+                    input_mp4, [0], output_mp4, target_fps=15, rotation_deg=90
+                )
+
+            self.assertEqual(result.mode, "stream_encode")
+            mock_stream.assert_called_once()
+
+    def test_packet_copy_eligibility_rejects_non_identity_cases(self):
+        input_mp4 = Path("input.mp4")
+
+        with patch.object(
+            video_sync,
+            "_probe_video_stream",
+            return_value={"codec_name": "h264", "has_b_frames": 0},
+        ), patch.object(video_sync, "_ffmpeg_supports_setts", return_value=True):
+            self.assertTrue(
+                video_sync._can_packet_copy_sync(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 1, 2],
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+            )
+            self.assertFalse(
+                video_sync._can_packet_copy_sync(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 0, 1],
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+            )
+            self.assertFalse(
+                video_sync._can_packet_copy_sync(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 2],
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+            )
+            self.assertFalse(
+                video_sync._can_packet_copy_sync(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 1],
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=(32, 32),
+                    ffmpeg="ffmpeg",
+                )
+            )
+
+        with patch.object(
+            video_sync,
+            "_probe_video_stream",
+            return_value={"codec_name": "mjpeg", "has_b_frames": 0},
+        ), patch.object(video_sync, "_ffmpeg_supports_setts", return_value=True):
+            self.assertFalse(
+                video_sync._can_packet_copy_sync(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 1],
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+            )
+
+        with patch.dict(
+            os.environ,
+            {video_sync._VIDEO_SYNC_DISABLE_COPY_FASTPATH_ENV: "1"},
+        ):
+            self.assertFalse(
+                video_sync._can_packet_copy_sync(
+                    input_mp4=input_mp4,
+                    frame_indices=[0, 1],
+                    target_fps=15,
+                    rotation_deg=0,
+                    image_resize=None,
+                    ffmpeg="ffmpeg",
+                )
+            )
+
+    def test_jpeg_fallback_reports_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_mp4 = Path(tmpdir) / "input.mp4"
+            output_mp4 = Path(tmpdir) / "out.mp4"
+            input_mp4.write_bytes(b"fake")
+
+            def fake_inner(**kwargs):
+                output_mp4.write_bytes(b"mp4")
+
+            with patch.object(
+                video_sync, "_ffmpeg", return_value="ffmpeg"
+            ), patch.object(
+                video_sync, "_can_packet_copy_sync", return_value=False
+            ), patch.object(
+                video_sync,
+                "_remux_selected_frames_streaming",
+                side_effect=RuntimeError("stream failed"),
+            ), patch.object(
+                video_sync, "_remux_selected_frames_in_tmp", side_effect=fake_inner
+            ), patch.object(
+                video_sync, "_video_frame_count", return_value=1
+            ):
+                result = video_sync.remux_selected_frames(
+                    input_mp4, [0], output_mp4, target_fps=15
+                )
+
+            self.assertTrue(result.used_fallback)
+            self.assertEqual(result.mode, "jpeg_fallback")
 
     def test_h264_extract_regenerates_monotonic_pts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1059,6 +6639,55 @@ class TestVideoSyncTempResources(unittest.TestCase):
             self.assertIn("setpts=N/TB", extract_cmd)
             self.assertIn("-fps_mode", extract_cmd)
             self.assertIn("passthrough", extract_cmd)
+
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"),
+        "ffmpeg/ffprobe are required for packet-copy integration test",
+    )
+    def test_h264_packet_copy_prefix_preserves_decoded_frames(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            input_mp4 = tmp / "input.mp4"
+            output_mp4 = tmp / "out.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi",
+                    "-i", "testsrc=size=64x48:rate=15:duration=0.4",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p",
+                    str(input_mp4),
+                ],
+                check=True,
+            )
+
+            result = video_sync.remux_selected_frames(
+                input_mp4, [0, 1, 2], output_mp4, target_fps=15
+            )
+
+            self.assertEqual(result.mode, "packet_copy")
+            self.assertEqual(video_sync._video_frame_count(output_mp4), 3)
+            self.assertAlmostEqual(video_sync._video_fps(output_mp4), 15.0, places=2)
+            self.assertEqual(
+                self._framehash(input_mp4, frames=3),
+                self._framehash(output_mp4),
+            )
+
+    def _framehash(self, video_path: Path, frames: Optional[int] = None):
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(video_path),
+        ]
+        if frames is not None:
+            cmd.extend(["-frames:v", str(frames)])
+        cmd.extend(["-f", "framehash", "-"])
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return [
+            line.split(",", maxsplit=5)[-1].strip()
+            for line in result.stdout.splitlines()
+            if line and not line.startswith("#")
+        ]
 
 
 if __name__ == "__main__":
