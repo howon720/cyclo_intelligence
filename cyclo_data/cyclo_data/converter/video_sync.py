@@ -79,6 +79,41 @@ def _ffmpeg() -> str:
     return bin_
 
 
+def _terminate_process(
+    process: "subprocess.Popen | None",
+    *,
+    close_stdin: bool = False,
+    timeout: float = 5.0,
+) -> None:
+    """Terminate and reap a subprocess without leaking zombies."""
+    if process is None:
+        return
+    if close_stdin:
+        try:
+            stdin = getattr(process, "stdin", None)
+            if stdin is not None and not stdin.closed:
+                stdin.close()
+        except Exception:
+            pass
+    if process.poll() is None:
+        process.kill()
+    wait = getattr(process, "wait", None)
+    if callable(wait):
+        try:
+            wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            wait()
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        try:
+            if stream is not None and not stream.closed:
+                stream.close()
+        except Exception:
+            pass
+
+
 _H264_ENCODER_THREAD_LOCAL = threading.local()
 _NVENC_MIN_DIMENSION = 256
 _NVENC_ENCODER_OPTS = [
@@ -1727,15 +1762,8 @@ def _remux_selected_frames_ffmpeg_yuv420_pipe(
             output_width=width,
         )
     finally:
-        if decoder is not None and decoder.poll() is None:
-            decoder.kill()
-        if encoder_process is not None and encoder_process.poll() is None:
-            try:
-                if encoder_process.stdin and not encoder_process.stdin.closed:
-                    encoder_process.stdin.close()
-            except Exception:
-                pass
-            encoder_process.kill()
+        _terminate_process(decoder)
+        _terminate_process(encoder_process, close_stdin=True)
 
 
 def _remux_selected_frames_ffmpeg_pipe(
@@ -1879,15 +1907,8 @@ def _remux_selected_frames_ffmpeg_pipe(
             output_width=output_width,
         )
     finally:
-        if decoder is not None and decoder.poll() is None:
-            decoder.kill()
-        if encoder_process is not None and encoder_process.poll() is None:
-            try:
-                if encoder_process.stdin and not encoder_process.stdin.closed:
-                    encoder_process.stdin.close()
-            except Exception:
-                pass
-            encoder_process.kill()
+        _terminate_process(decoder)
+        _terminate_process(encoder_process, close_stdin=True)
 
 
 def _remux_selected_frames_opencv_streaming(
@@ -2188,13 +2209,7 @@ def _remux_selected_frames_opencv_ffmpeg_encoder(
         )
     finally:
         cap.release()
-        if process is not None and process.poll() is None:
-            try:
-                if process.stdin and not process.stdin.closed:
-                    process.stdin.close()
-            except Exception:
-                pass
-            process.kill()
+        _terminate_process(process, close_stdin=True)
 
 
 def _remux_selected_frames_in_tmp(

@@ -96,6 +96,7 @@ from .video_sync import (
     _read_exact_into,
     _set_pipe_size,
     _splice_exact,
+    _terminate_process,
     _validated_video_count,
     _video_stats_sample_positions,
     _write_repeated_frame_bytes,
@@ -3008,16 +3009,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                 )
                 return
             finally:
-                if encoder_process is not None and encoder_process.poll() is None:
-                    try:
-                        if (
-                            encoder_process.stdin is not None
-                            and not encoder_process.stdin.closed
-                        ):
-                            encoder_process.stdin.close()
-                    except Exception:
-                        pass
-                    encoder_process.kill()
+                _terminate_process(encoder_process, close_stdin=True)
 
     def _pipe_selected_yuv420_frames(
         self,
@@ -3163,13 +3155,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                     os.close(discard_fd)
             except OSError:
                 pass
-            if decoder is not None and decoder.poll() is None:
-                decoder.kill()
-            if decoder is not None and decoder.stderr is not None:
-                try:
-                    decoder.stderr.read()
-                except Exception:
-                    pass
+            _terminate_process(decoder)
 
     def _pipe_selected_yuv420_frames_concat_decoder(
         self,
@@ -3335,13 +3321,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                     os.close(discard_fd)
             except OSError:
                 pass
-            if decoder is not None and decoder.poll() is None:
-                decoder.kill()
-            if decoder is not None and decoder.stderr is not None:
-                try:
-                    decoder.stderr.read()
-                except Exception:
-                    pass
+            _terminate_process(decoder)
             Path(concat_list_path).unlink(missing_ok=True)
 
     @staticmethod
@@ -3494,13 +3474,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             return written
         finally:
             Path(concat_list_path).unlink(missing_ok=True)
-            if decoder is not None and decoder.poll() is None:
-                decoder.kill()
-            if decoder is not None and decoder.stderr is not None:
-                try:
-                    decoder.stderr.read()
-                except Exception:
-                    pass
+            _terminate_process(decoder)
 
     def _write_direct_aggregate_synced_fallback(
         self,

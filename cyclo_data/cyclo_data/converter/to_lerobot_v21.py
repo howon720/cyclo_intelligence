@@ -87,6 +87,7 @@ from .video_sync import (
     _read_exact_into,
     _set_pipe_size,
     _splice_exact,
+    _terminate_process,
     _validated_video_count,
     _video_stats_sample_positions,
     _write_repeated_frame_bytes,
@@ -753,13 +754,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
                     os.close(discard_fd)
             except OSError:
                 pass
-            if decoder is not None and decoder.poll() is None:
-                decoder.kill()
-            if decoder is not None and decoder.stderr is not None:
-                try:
-                    decoder.stderr.read()
-                except Exception:
-                    pass
+            _terminate_process(decoder)
 
     def _pipe_selected_yuv420_frames_concat_decoder(
         self,
@@ -929,13 +924,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
                     os.close(discard_fd)
             except OSError:
                 pass
-            if decoder is not None and decoder.poll() is None:
-                decoder.kill()
-            if decoder is not None and decoder.stderr is not None:
-                try:
-                    decoder.stderr.read()
-                except Exception:
-                    pass
+            _terminate_process(decoder)
             Path(concat_list_path).unlink(missing_ok=True)
 
     @staticmethod
@@ -1310,13 +1299,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
                         f"expected {expected_total}"
                     )
             finally:
-                if process is not None and process.poll() is None:
-                    try:
-                        if process.stdin and not process.stdin.closed:
-                            process.stdin.close()
-                    except Exception:
-                        pass
-                    process.kill()
+                _terminate_process(process, close_stdin=True)
 
             segment_paths = sorted(tmp.glob("segment_*.mp4"))
             if len(segment_paths) != len(requests):
