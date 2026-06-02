@@ -89,6 +89,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 DEFAULT_DATA_FILE_SIZE_IN_MB = 100
 DEFAULT_VIDEO_FILE_SIZE_IN_MB = 200
 _ROSBAG_SEARCH_PRUNE_DIRS = {
+    ".cache",
     ".cyclo_cache",
     "_direct_aggregate_fallback",
     "_stitched_subtasks",
@@ -130,27 +131,21 @@ def apply_h264_encoder(h264_encoder: str | None) -> None:
     os.environ["CYCLO_H264_ENCODER"] = h264_encoder
 
 
-def apply_h264_decoder(h264_decoder: str | None) -> None:
-    """Apply an explicit CLI H.264 decoder selection."""
-    if not h264_decoder:
-        return
-    os.environ["CYCLO_H264_DECODER"] = h264_decoder
-
-
 def active_h264_encoder_label() -> str:
     """Return the user-facing active H.264 encoder selection."""
     explicit = os.environ.get("CYCLO_H264_ENCODER")
-    if explicit:
+    if explicit and explicit.strip().lower() in {
+        "auto",
+        "default",
+        "libx264",
+        "software",
+        "x264",
+    }:
         return explicit
     profile = os.environ.get("CYCLO_X264_SPEED_PROFILE", "").strip().lower()
     if profile in {"max", "maximum", "max_speed", "fastest"}:
         return "libx264 (max profile)"
     return "libx264"
-
-
-def active_h264_decoder_label() -> str:
-    """Return the user-facing active H.264 decoder selection."""
-    return os.environ.get("CYCLO_H264_DECODER", "default")
 
 
 def find_rosbags_in_directory(directory: Path) -> list[Path]:
@@ -208,7 +203,10 @@ def find_rosbags_in_directory(directory: Path) -> list[Path]:
         prune.update(name for name in dirnames if name.endswith("_converted"))
         if has_episode_info or has_rosbag:
             prune.add("videos")
-        dirnames[:] = [name for name in dirnames if name not in prune]
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in prune and not name.startswith(".")
+        ]
 
     return sorted(rosbags, key=sort_key)
 
@@ -337,32 +335,10 @@ Examples:
             "auto",
             "software",
             "libx264",
-            "h264_nvenc",
-            "h264_nvmpi",
-            "h264_v4l2m2m",
-            "h264_omx",
-            "jetson",
         ],
         default=None,
         help=(
-            "H.264 encoder selection. Defaults to portable libx264; hardware "
-            "encoders are opt-in because measured conversion is CPU-fastest."
-        ),
-    )
-    parser.add_argument(
-        "--h264-decoder",
-        choices=[
-            "auto",
-            "software",
-            "h264_cuvid",
-            "h264_nvmpi",
-            "h264_v4l2m2m",
-            "jetson",
-        ],
-        default=None,
-        help=(
-            "H.264 decoder selection for raw-video sync/aggregation. "
-            "Defaults to portable software decode; hardware decode is opt-in."
+            "H.264 encoder selection. The converter uses portable libx264."
         ),
     )
 
@@ -389,7 +365,6 @@ Examples:
     args = parser.parse_args()
     apply_speed_profile(args.speed_profile)
     apply_h264_encoder(args.h264_encoder)
-    apply_h264_decoder(args.h264_decoder)
 
     # Setup logging
     logger = setup_logging(args.verbose)
@@ -431,7 +406,6 @@ Examples:
     active_speed_profile = os.environ.get("CYCLO_X264_SPEED_PROFILE", "fast")
     logger.info(f"Video speed profile: {active_speed_profile}")
     logger.info(f"H.264 encoder: {active_h264_encoder_label()}")
-    logger.info(f"H.264 decoder: {active_h264_decoder_label()}")
     if args.robot_config:
         logger.info(f"Robot config: {args.robot_config}")
     if args.version == "v3.0":

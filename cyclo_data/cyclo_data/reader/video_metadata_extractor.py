@@ -97,13 +97,16 @@ class VideoMetadataExtractor:
         Returns:
             List of relative video file paths (e.g., 'videos/cam_left_head.mp4')
         """
-        videos_dir = Path(bag_path) / "videos"
+        bag_root = Path(bag_path)
+        videos_dir = bag_root / "videos"
         if not videos_dir.exists():
             return []
 
         video_files = []
-        for video_file in sorted(videos_dir.glob("*.mp4")):
-            video_files.append(f"videos/{video_file.name}")
+        for video_file in sorted(videos_dir.rglob("*.mp4")):
+            if video_file.stem.endswith("_synced"):
+                continue
+            video_files.append(video_file.relative_to(bag_root).as_posix())
 
         return video_files
 
@@ -132,12 +135,15 @@ class VideoMetadataExtractor:
             "frame_counts": {},
         }
 
-        videos_dir = Path(bag_path) / "videos"
+        bag_root = Path(bag_path)
+        videos_dir = bag_root / "videos"
         if not videos_dir.exists():
             return result
 
-        for video_file in sorted(videos_dir.glob("*.mp4")):
-            result["video_files"].append(f"videos/{video_file.name}")
+        for video_file in sorted(videos_dir.rglob("*.mp4")):
+            if video_file.stem.endswith("_synced"):
+                continue
+            result["video_files"].append(video_file.relative_to(bag_root).as_posix())
 
             video_name = video_file.stem
             matching_topic = self._find_matching_topic(

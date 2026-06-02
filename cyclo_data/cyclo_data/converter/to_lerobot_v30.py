@@ -118,8 +118,6 @@ DEFAULT_VIDEO_PATH = "videos/{video_key}/" + CHUNK_FILE_PATTERN + ".mp4"
 _VIDEO_AGG_CAMERA_WORKERS_ENV = "CYCLO_VIDEO_AGG_CAMERA_WORKERS"
 _V30_DIRECT_AGG_DISABLE_ENV = "CYCLO_V30_DISABLE_DIRECT_AGGREGATE"
 _V30_CONCAT_DECODER_DISABLE_ENV = "CYCLO_V30_DISABLE_CONCAT_DECODER"
-_V30_SELECT_DECODER_ENABLE_ENV = "CYCLO_V30_ENABLE_SELECT_DECODER"
-_V30_SELECT_DECODER_MAX_EXPR_ENV = "CYCLO_V30_SELECT_DECODER_MAX_EXPR"
 _V30_TRUST_SIDECAR_FRAME_COUNT_ENV = "CYCLO_V30_TRUST_SIDECAR_FRAME_COUNT"
 _V30_VALIDATE_DIRECT_AGGREGATE_ENV = "CYCLO_V30_VALIDATE_DIRECT_AGGREGATE"
 _V30_SOURCE_AGG_CACHE_DISABLE_ENV = "CYCLO_V30_DISABLE_SOURCE_AGGREGATE_CACHE"
@@ -136,12 +134,6 @@ _V30_TASKS_PARQUET_CACHE_VERSION = 1
 _V30_SUBTASKS_PARQUET_CACHE_VERSION = 1
 _FICLONE_IOCTL = 0x40049409
 _REFLINK_UNSUPPORTED_DEV_PAIRS: set[Tuple[int, int]] = set()
-_H264_HARDWARE_ENCODERS = {
-    "h264_nvenc",
-    "h264_nvmpi",
-    "h264_v4l2m2m",
-    "h264_omx",
-}
 _H264_ENCODER_TUNING_ENVS = {
     "CYCLO_H264_ENCODER",
     "CYCLO_X264_PRESET",
@@ -2524,9 +2516,8 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         raw = os.environ.get(_V30_SOURCE_AGG_CACHE_POPULATE_ENV)
         if raw is not None:
             return raw.strip().lower() in {"1", "true", "yes", "on", "write"}
-        profile = os.environ.get("CYCLO_X264_SPEED_PROFILE", "").strip().lower()
-        max_profile = profile in {"max", "maximum", "max_speed", "fastest"}
-        return max_profile and str(encoder) in _H264_HARDWARE_ENCODERS
+        del encoder
+        return False
 
     @staticmethod
     def _clone_or_copy_no_hardlink(
@@ -2880,28 +2871,16 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
 
                 if concat_decoder_ok:
                     try:
-                        if os.environ.get(_V30_SELECT_DECODER_ENABLE_ENV):
-                            total_written = (
-                                self._pipe_selected_yuv420_frames_concat_select_decoder(
-                                    ffmpeg,
-                                    frame_requests,
-                                    frame_size,
-                                    encoder_process.stdin,
-                                    width=width,
-                                    height=height,
-                                )
+                        total_written = (
+                            self._pipe_selected_yuv420_frames_concat_decoder(
+                                ffmpeg,
+                                frame_requests,
+                                frame_size,
+                                encoder_process.stdin,
+                                width=width,
+                                height=height,
                             )
-                        else:
-                            total_written = (
-                                self._pipe_selected_yuv420_frames_concat_decoder(
-                                    ffmpeg,
-                                    frame_requests,
-                                    frame_size,
-                                    encoder_process.stdin,
-                                    width=width,
-                                    height=height,
-                                )
-                            )
+                        )
                     except Exception as exc:
                         raise _DirectV30ConcatDecoderError(str(exc)) from exc
                 else:
@@ -3324,158 +3303,6 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             _terminate_process(decoder)
             Path(concat_list_path).unlink(missing_ok=True)
 
-    @staticmethod
-    def _selected_yuv420_concat_plan(
-        frame_requests: Sequence[
-            Tuple[int, Path, np.ndarray, int, Optional[_StreamingRgbStats]]
-        ],
-    ) -> Tuple[
-        List[Tuple[int, int, Optional[_StreamingRgbStats], int]],
-        str,
-    ]:
-        """Return output runs and an ffmpeg select expression for unique frames."""
-        output_runs: List[Tuple[int, int, Optional[_StreamingRgbStats], int]] = []
-        selected: List[int] = []
-        source_offset = 0
-        for _, _, indices, source_count, stats in frame_requests:
-            sample_positions = (
-                _video_stats_sample_positions(len(indices))
-                if stats is not None else set()
-            )
-            out_idx = 0
-            indices_len = len(indices)
-            while out_idx < indices_len:
-                requested_idx_raw = int(indices[out_idx])
-                run_end = out_idx + 1
-                while (
-                    run_end < indices_len
-                    and int(indices[run_end]) == requested_idx_raw
-                ):
-                    run_end += 1
-                global_idx = source_offset + requested_idx_raw
-                sample_hits = sum(
-                    1 for sample_idx in sample_positions
-                    if out_idx <= sample_idx < run_end
-                )
-                output_runs.append((global_idx, run_end - out_idx, stats, sample_hits))
-                if not selected or selected[-1] != global_idx:
-                    selected.append(global_idx)
-                out_idx = run_end
-            source_offset += int(source_count)
-
-        if not selected:
-            return output_runs, "0"
-
-        terms: List[str] = []
-        start = prev = int(selected[0])
-        for value in map(int, selected[1:]):
-            if value == prev + 1:
-                prev = value
-                continue
-            if start == prev:
-                terms.append(f"eq(n\\,{start})")
-            else:
-                terms.append(f"between(n\\,{start}\\,{prev})")
-            start = prev = value
-        if start == prev:
-            terms.append(f"eq(n\\,{start})")
-        else:
-            terms.append(f"between(n\\,{start}\\,{prev})")
-        return output_runs, "+".join(terms)
-
-    @staticmethod
-    def _select_decoder_expression_limit() -> int:
-        raw = os.environ.get(_V30_SELECT_DECODER_MAX_EXPR_ENV)
-        if raw is not None:
-            try:
-                return max(0, int(raw))
-            except ValueError:
-                return 0
-        return 100_000
-
-    def _pipe_selected_yuv420_frames_concat_select_decoder(
-        self,
-        ffmpeg: str,
-        frame_requests: Sequence[
-            Tuple[int, Path, np.ndarray, int, Optional[_StreamingRgbStats]]
-        ],
-        frame_size: int,
-        output,
-        *,
-        width: int,
-        height: int,
-    ) -> int:
-        """Decode only selected unique concat frames, then expand duplicates."""
-        output_runs, select_expr = self._selected_yuv420_concat_plan(frame_requests)
-        if not output_runs:
-            return 0
-        expr_limit = self._select_decoder_expression_limit()
-        if expr_limit <= 0 or len(select_expr) > expr_limit:
-            return self._pipe_selected_yuv420_frames_concat_decoder(
-                ffmpeg,
-                frame_requests,
-                frame_size,
-                output,
-                width=width,
-                height=height,
-            )
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".txt",
-            delete=False,
-        ) as concat_file:
-            for _, video_path, _, _, _ in frame_requests:
-                concat_file.write(_concat_file_line(Path(video_path)))
-            concat_list_path = concat_file.name
-
-        decoder_cmd = [
-            ffmpeg, "-hide_banner", "-loglevel", "fatal",
-            *_ffmpeg_h264_decoder_args(ffmpeg),
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_list_path,
-            "-map", "0:v:0",
-            "-an",
-            "-vf", f"select={select_expr}",
-            "-fps_mode", "passthrough",
-            "-f", "rawvideo",
-            "-pix_fmt", "yuv420p",
-            "pipe:1",
-        ]
-        decoder: Optional[subprocess.Popen] = None
-        try:
-            decoder = subprocess.Popen(
-                decoder_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=0,
-            )
-            assert decoder.stdout is not None
-            _set_pipe_size(decoder.stdout, _ffmpeg_pipe_size(frame_size))
-            read_buffer = bytearray(frame_size)
-            written = 0
-            for _, run_length, stats, sample_hits in output_runs:
-                n = _read_exact_into(decoder.stdout, read_buffer, frame_size)
-                if n != frame_size:
-                    raise RuntimeError(
-                        "no selected frame decoded from concat video batch"
-                    )
-                _write_repeated_frame_bytes(output, read_buffer, run_length)
-                if stats is not None and sample_hits > 0:
-                    for _ in range(sample_hits):
-                        _add_frame_yuv420p_for_stats(
-                            stats,
-                            read_buffer,
-                            width=width,
-                            height=height,
-                        )
-                written += int(run_length)
-            return written
-        finally:
-            Path(concat_list_path).unlink(missing_ok=True)
-            _terminate_process(decoder)
-
     def _write_direct_aggregate_synced_fallback(
         self,
         output_dir: Path,
@@ -3595,18 +3422,30 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                 width=encoder_width,
                 height=encoder_height,
             )
+            input_args: List[str] = []
+            filter_parts: List[str] = []
+            concat_inputs: List[str] = []
+            for idx, (_, video_path, _) in enumerate(videos):
+                input_args.extend(["-i", str(video_path)])
+                label = f"v{idx}"
+                filter_parts.append(
+                    f"[{idx}:v]fps={fps_str},setpts=PTS-STARTPTS[{label}]"
+                )
+                concat_inputs.append(f"[{label}]")
+            filter_parts.append(
+                "".join(concat_inputs)
+                + f"concat=n={len(videos)}:v=1:a=0,"
+                + f"fps={fps_str},setpts=N/({fps_str}*TB)[outv]"
+            )
             cmd = [
                 ffmpeg,
                 "-y",
                 *_ffmpeg_threads_arg(),
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                concat_list_path,
-                "-vf",
-                f"fps={fps_str},setpts=N/({fps_str}*TB)",
+                *input_args,
+                "-filter_complex",
+                ";".join(filter_parts),
+                "-map",
+                "[outv]",
                 "-r",
                 fps_str,
                 "-an",

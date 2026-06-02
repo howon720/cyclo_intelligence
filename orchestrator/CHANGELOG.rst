@@ -2,6 +2,12 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.9 (2026-06-02)
+------------------
+* Synced prepared recording task information from SET_TASK_INFO so robot-button recordings use the latest folder name and metadata.
+* Cached UI task information for trigger-started recording sessions and refreshed recording status after task info updates.
+* Contributors: kimtaehyeong99
+
 0.1.8 (2026-06-01)
 ------------------
 * None

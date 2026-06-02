@@ -80,6 +80,15 @@ class TestVideoMetadataExtractor:
         assert "videos/cam_left_head.mp4" in files
         assert "videos/cam_left_wrist.mp4" in files
 
+    def test_get_video_files_segmented(self, extractor, temp_bag_dir):
+        segment_dir = temp_bag_dir / "videos" / "100_0"
+        segment_dir.mkdir(parents=True)
+        (segment_dir / "cam_left_head.mp4").touch()
+
+        files = extractor.get_video_files(temp_bag_dir)
+
+        assert files == ["videos/100_0/cam_left_head.mp4"]
+
     def test_build_video_info_empty(self, extractor, temp_bag_dir):
         result = extractor.build_video_info(temp_bag_dir, {}, {})
         assert result["video_files"] == []

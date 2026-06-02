@@ -297,6 +297,52 @@ class OrchestratorNode(Node):
             segment_index=segment_index,
         )
 
+    @staticmethod
+    def _task_info_record_signature(task_info: Optional[TaskInfo]):
+        if task_info is None:
+            return None
+        return (
+            str(getattr(task_info, 'task_num', '') or ''),
+            str(getattr(task_info, 'task_name', '') or ''),
+            tuple(
+                str(item or '')
+                for item in (getattr(task_info, 'subtask_instruction', []) or [])
+            ),
+        )
+
+    def _cache_ui_task_info(self, task_info: TaskInfo, source: str) -> None:
+        """Cache latest UI task_info for UI and joystick-triggered starts."""
+        previous_record_signature = self._task_info_record_signature(
+            getattr(self, '_prepared_record_task_info', None)
+        )
+        self._last_ui_task_info = task_info
+
+        is_inference_task = getattr(task_info, 'task_type', '') == 'inference'
+        if is_inference_task:
+            self._prepared_inference_task_info = task_info
+            return
+
+        next_record_signature = self._task_info_record_signature(task_info)
+        self._prepared_record_task_info = task_info
+        if previous_record_signature != next_record_signature:
+            self._trigger_record_active_segment_index = 0
+            self._trigger_record_next_segment_index = 0
+
+        if not self.robot_type:
+            self.get_logger().info(
+                f'{source}: cached record task_info; robot_type not set yet')
+            return
+
+        task_name = f'{self.robot_type}_{task_info.task_name}'
+        if getattr(self, '_current_task_name', None) != task_name:
+            self.get_logger().info(
+                f'{source}: initialising task config (task={task_name})')
+            self.init_robot_control_parameters_from_user_task(task_info)
+            self._current_task_name = task_name
+        else:
+            self.get_logger().info(
+                f'{source}: cached task_info for existing task={task_name}')
+
     def _data_operation_status_callback(self, msg: DataOperationStatus):
         """Debug-log DataOperationStatus arrivals.
 
@@ -956,28 +1002,7 @@ class OrchestratorNode(Node):
                     return response
 
                 task_info = request.task_info
-                self._last_ui_task_info = task_info
-                is_inference_prepare = task_info.task_type == 'inference'
-                if is_inference_prepare:
-                    self._prepared_inference_task_info = task_info
-                else:
-                    self._prepared_record_task_info = task_info
-                    self._trigger_record_active_segment_index = 0
-                    self._trigger_record_next_segment_index = 0
-                task_name = f'{self.robot_type}_{task_info.task_name}'
-                need_new_config = (
-                    getattr(self, '_current_task_name', None) != task_name
-                )
-                if need_new_config:
-                    self.get_logger().info(
-                        f'PREPARE_SESSION: initialising task config '
-                        f'(task={task_name})')
-                    self.init_robot_control_parameters_from_user_task(task_info)
-                    self._current_task_name = task_name
-                else:
-                    self.get_logger().info(
-                        f'PREPARE_SESSION: reusing cached task config '
-                        f'(task={task_name})')
+                self._cache_ui_task_info(task_info, 'PREPARE_SESSION')
                 if self.timer_manager:
                     self.timer_manager.start(timer_name='collection')
 
@@ -998,7 +1023,7 @@ class OrchestratorNode(Node):
 
                 response.success = True
                 response.message = (
-                    f'Session prepared (task={task_name}). '
+                    f'Session prepared (task={self.robot_type}_{task_info.task_name}). '
                     'Use the leader joystick to start episode 0.'
                 )
                 return response
@@ -1092,7 +1117,7 @@ class OrchestratorNode(Node):
                     self._apply_cyclo_data_response(cd_result, response)
 
             elif request.command == SendCommand.Request.SET_TASK_INFO:
-                self._last_ui_task_info = request.task_info
+                self._cache_ui_task_info(request.task_info, 'SET_TASK_INFO')
                 cd_result = self._forward_recording(
                     RecordingCommand.Request.SET_TASK_INFO,
                     task_info=request.task_info,
@@ -2254,6 +2279,13 @@ class OrchestratorNode(Node):
             self.get_logger().warning(
                 'Trigger record start ignored: robot_type is not set')
             return False
+
+        task_name = f'{self.robot_type}_{task_info.task_name}'
+        if getattr(self, '_current_task_name', None) != task_name:
+            self.get_logger().info(
+                f'Trigger: initialising task config (task={task_name})')
+            self.init_robot_control_parameters_from_user_task(task_info)
+            self._current_task_name = task_name
 
         if self.timer_manager:
             self.timer_manager.start(timer_name='collection')

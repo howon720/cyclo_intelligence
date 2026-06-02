@@ -18,6 +18,38 @@
 
 import { createSlice } from '@reduxjs/toolkit';
 import { RecordPhase, InferencePhase } from '../../constants/taskPhases';
+import { getRecordTaskInfoKey } from '../../utils/taskInfoSync';
+
+const SYNCED_MESSAGE = 'Session task info synced.';
+const CONFLICT_MESSAGE = 'Server task info changed while editing; local draft not synced.';
+const FAILED_MESSAGE = 'Task info not synced; robot button may use old task.';
+
+const syncInitialState = {
+  serverTaskKey: '',
+  editBaseServerTaskKey: '',
+  dirty: false,
+  conflict: false,
+  syncStatus: 'idle',
+  syncMessage: '',
+  serverTaskInfo: null,
+};
+
+const applyRecordTaskInfoToForm = (state, taskInfo) => {
+  state.taskInfo = { ...state.taskInfo, ...taskInfo };
+  const subtasks = Array.isArray(taskInfo.subtaskInstruction)
+    ? taskInfo.subtaskInstruction
+    : [];
+  state.plannedSubTasks = subtasks;
+  state.plannedCount = subtasks.length;
+  state.slotToServerIdx = subtasks.map((_, index) => (
+    Number.isInteger(state.slotToServerIdx[index])
+      ? state.slotToServerIdx[index]
+      : -1
+  ));
+  state.activeSlotIndex = subtasks.length > 0
+    ? Math.min(state.activeSlotIndex, subtasks.length - 1)
+    : 0;
+};
 
 const initialState = {
   // Hoisted shared field — same value drives both flows. Owned by
@@ -49,6 +81,8 @@ const initialState = {
     serviceType: 'lerobot',
     policyType: 'act',
   },
+
+  taskInfoSync: { ...syncInitialState },
 
   // Record-side snapshot from /data/recording/status (cyclo_data direct,
   // 5 Hz during a recording session). Conversion progress is its own
@@ -115,6 +149,7 @@ const taskSlice = createSlice({
     },
     resetTaskInfo: (state) => {
       state.taskInfo = initialState.taskInfo;
+      state.taskInfoSync = { ...syncInitialState };
     },
     setRecordStatus: (state, action) => {
       state.recordStatus = { ...state.recordStatus, ...action.payload };
@@ -186,6 +221,96 @@ const taskSlice = createSlice({
       state.slotToServerIdx = state.plannedSubTasks.map(() => -1);
       state.activeSlotIndex = 0;
     },
+    markLocalTaskInfoEdited: (state) => {
+      if (!state.taskInfoSync.dirty) {
+        state.taskInfoSync.editBaseServerTaskKey = state.taskInfoSync.serverTaskKey;
+      }
+      state.taskInfoSync.dirty = true;
+      state.taskInfoSync.syncStatus = state.taskInfoSync.conflict ? 'conflict' : 'pending';
+      state.taskInfoSync.syncMessage = state.taskInfoSync.conflict
+        ? CONFLICT_MESSAGE
+        : 'Task info changed; syncing soon...';
+    },
+    markTaskInfoSyncPending: (state) => {
+      state.taskInfoSync.syncStatus = 'pending';
+      state.taskInfoSync.syncMessage = 'Task info changed; syncing soon...';
+    },
+    markTaskInfoSyncing: (state) => {
+      state.taskInfoSync.syncStatus = 'syncing';
+      state.taskInfoSync.syncMessage = 'Syncing task info...';
+    },
+    markTaskInfoSyncSuccess: (state) => {
+      const taskKey = getRecordTaskInfoKey(state.taskInfo);
+      state.taskInfoSync.serverTaskKey = taskKey;
+      state.taskInfoSync.editBaseServerTaskKey = taskKey;
+      state.taskInfoSync.dirty = false;
+      state.taskInfoSync.conflict = false;
+      state.taskInfoSync.syncStatus = 'synced';
+      state.taskInfoSync.syncMessage = SYNCED_MESSAGE;
+      state.taskInfoSync.serverTaskInfo = {
+        ...state.taskInfo,
+        taskInstruction: [...(state.taskInfo.taskInstruction || [])],
+        subtaskInstruction: [...(state.taskInfo.subtaskInstruction || [])],
+      };
+    },
+    markTaskInfoSyncFailed: (state, action) => {
+      state.taskInfoSync.syncStatus = 'failed';
+      state.taskInfoSync.syncMessage = action.payload || FAILED_MESSAGE;
+    },
+    markTaskInfoSyncMissing: (state) => {
+      state.taskInfoSync.syncStatus = 'missing';
+      state.taskInfoSync.syncMessage = 'Fill Task Num and Task Name to sync.';
+    },
+    receiveServerRecordTaskInfo: (state, action) => {
+      const serverTaskInfo = action.payload || {};
+      const serverTaskKey = getRecordTaskInfoKey(serverTaskInfo);
+      const localTaskKey = getRecordTaskInfoKey(state.taskInfo);
+      if (
+        serverTaskKey === state.taskInfoSync.serverTaskKey &&
+        serverTaskKey === localTaskKey &&
+        !state.taskInfoSync.dirty &&
+        !state.taskInfoSync.conflict &&
+        state.taskInfoSync.syncStatus === 'synced'
+      ) {
+        return;
+      }
+      state.taskInfoSync.serverTaskKey = serverTaskKey;
+      state.taskInfoSync.serverTaskInfo = serverTaskInfo;
+
+      if (state.taskInfoSync.dirty) {
+        if (serverTaskKey === localTaskKey) {
+          state.taskInfoSync.editBaseServerTaskKey = serverTaskKey;
+          state.taskInfoSync.dirty = false;
+          state.taskInfoSync.conflict = false;
+          state.taskInfoSync.syncStatus = 'synced';
+          state.taskInfoSync.syncMessage = SYNCED_MESSAGE;
+        } else if (
+          serverTaskKey !== state.taskInfoSync.editBaseServerTaskKey
+        ) {
+          state.taskInfoSync.conflict = true;
+          state.taskInfoSync.syncStatus = 'conflict';
+          state.taskInfoSync.syncMessage = CONFLICT_MESSAGE;
+        }
+        return;
+      }
+
+      if (serverTaskKey !== localTaskKey) {
+        applyRecordTaskInfoToForm(state, serverTaskInfo);
+      }
+      state.taskInfoSync.editBaseServerTaskKey = serverTaskKey;
+      state.taskInfoSync.conflict = false;
+      state.taskInfoSync.syncStatus = 'synced';
+      state.taskInfoSync.syncMessage = SYNCED_MESSAGE;
+    },
+    applyServerTaskInfo: (state) => {
+      if (!state.taskInfoSync.serverTaskInfo) return;
+      applyRecordTaskInfoToForm(state, state.taskInfoSync.serverTaskInfo);
+      state.taskInfoSync.editBaseServerTaskKey = state.taskInfoSync.serverTaskKey;
+      state.taskInfoSync.dirty = false;
+      state.taskInfoSync.conflict = false;
+      state.taskInfoSync.syncStatus = state.taskInfoSync.serverTaskKey ? 'synced' : 'idle';
+      state.taskInfoSync.syncMessage = state.taskInfoSync.serverTaskKey ? SYNCED_MESSAGE : '';
+    },
   },
 });
 
@@ -212,6 +337,14 @@ export const {
   setActiveSlotIndex,
   resetSegmentPlan,
   resetSegmentProgress,
+  markLocalTaskInfoEdited,
+  markTaskInfoSyncPending,
+  markTaskInfoSyncing,
+  markTaskInfoSyncSuccess,
+  markTaskInfoSyncFailed,
+  markTaskInfoSyncMissing,
+  receiveServerRecordTaskInfo,
+  applyServerTaskInfo,
 } = taskSlice.actions;
 
 export default taskSlice.reducer;

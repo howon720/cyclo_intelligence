@@ -14,15 +14,27 @@
 //
 // Author: Kiwoong Park
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
 import { MdInfoOutline } from 'react-icons/md';
 import { RecordPhase } from '../constants/taskPhases';
-import { setTaskInfo } from '../features/tasks/taskSlice';
+import {
+  applyServerTaskInfo,
+  markLocalTaskInfoEdited,
+  markTaskInfoSyncFailed,
+  markTaskInfoSyncing,
+  markTaskInfoSyncMissing,
+  markTaskInfoSyncPending,
+  markTaskInfoSyncSuccess,
+  setTaskInfo,
+} from '../features/tasks/taskSlice';
 import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
+import { getRecordTaskInfoKey } from '../utils/taskInfoSync';
 import Tooltip from './Tooltip';
+
+const AUTO_SYNC_DELAY_MS = 700;
 
 const InfoPanel = ({ variant = 'card' }) => {
   const dispatch = useDispatch();
@@ -30,6 +42,7 @@ const InfoPanel = ({ variant = 'card' }) => {
 
   const info = useSelector((state) => state.tasks.taskInfo);
   const recordStatus = useSelector((state) => state.tasks.recordStatus);
+  const taskInfoSync = useSelector((state) => state.tasks.taskInfoSync);
 
   const [isTaskStatusPaused, setIsTaskStatusPaused] = useState(false);
   const [lastTaskStatusUpdate, setLastTaskStatusUpdate] = useState(Date.now());
@@ -40,20 +53,19 @@ const InfoPanel = ({ variant = 'card' }) => {
   const disabled = isTaskRunning;
   const [isEditable, setIsEditable] = useState(!disabled);
 
-  // Tracks whether prepare_session has succeeded for the current task
-  // identity. Reset whenever taskNum / taskName change so the button
-  // re-arms — user needs to confirm again after editing.
-  const [isPrepared, setIsPrepared] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
+  const syncGenerationRef = useRef(0);
+  const syncTimerRef = useRef(null);
 
   const { sendRecordCommand } = useRosServiceCaller();
 
   const handleChange = useCallback(
     (field, value) => {
       if (!isEditable) return; // Block changes when not editable
-      dispatch(setTaskInfo({ ...info, [field]: value }));
+      dispatch(setTaskInfo({ [field]: value }));
+      dispatch(markLocalTaskInfoEdited());
     },
-    [isEditable, info, dispatch]
+    [isEditable, dispatch]
   );
 
   // Update isEditable state when the disabled prop changes
@@ -61,45 +73,166 @@ const InfoPanel = ({ variant = 'card' }) => {
     setIsEditable(!disabled);
   }, [disabled]);
 
-  // Re-arm the prepare button whenever the task definition changes so the
-  // user has to re-confirm. Solo-recording flow relies on this — editing
-  // task fields mid-session should not silently keep an old prep.
-  useEffect(() => {
-    setIsPrepared(false);
-  }, [info.taskNum, info.taskName, info.taskInstruction, info.subtaskInstruction]);
-
-  const canPrepare =
-    !disabled &&
-    !isPreparing &&
+  const hasTaskIdentity =
     Boolean(String(info.taskNum || '').trim()) &&
     Boolean(String(info.taskName || '').trim());
 
+  const taskSyncKey = useMemo(
+    () => getRecordTaskInfoKey(info),
+    [info]
+  );
+
+  useEffect(
+    () => () => {
+      if (syncTimerRef.current) {
+        clearTimeout(syncTimerRef.current);
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (syncTimerRef.current) {
+      clearTimeout(syncTimerRef.current);
+      syncTimerRef.current = null;
+    }
+
+    if (disabled) {
+      return;
+    }
+
+    if (!hasTaskIdentity) {
+      syncGenerationRef.current += 1;
+      dispatch(markTaskInfoSyncMissing());
+      return;
+    }
+
+    if (taskInfoSync.conflict) {
+      return;
+    }
+
+    if (!taskInfoSync.dirty) {
+      return;
+    }
+
+    const generation = syncGenerationRef.current + 1;
+    syncGenerationRef.current = generation;
+    dispatch(markTaskInfoSyncPending());
+
+    syncTimerRef.current = setTimeout(async () => {
+      dispatch(markTaskInfoSyncing());
+      try {
+        const result = await sendRecordCommand('set_task_info');
+        if (syncGenerationRef.current !== generation) return;
+        if (result && result.success) {
+          dispatch(markTaskInfoSyncSuccess());
+        } else {
+          dispatch(markTaskInfoSyncFailed(
+            (result && result.message) || 'Task info not synced; robot button may use old task.'
+          ));
+        }
+      } catch (error) {
+        if (syncGenerationRef.current !== generation) return;
+        dispatch(markTaskInfoSyncFailed(
+          `Task info not synced; robot button may use old task. ${error.message || error}`
+        ));
+      }
+    }, AUTO_SYNC_DELAY_MS);
+
+    return () => {
+      if (syncTimerRef.current) {
+        clearTimeout(syncTimerRef.current);
+        syncTimerRef.current = null;
+      }
+    };
+  }, [
+    disabled,
+    dispatch,
+    hasTaskIdentity,
+    sendRecordCommand,
+    taskInfoSync.conflict,
+    taskInfoSync.dirty,
+    taskSyncKey,
+  ]);
+
+  const taskSyncStatus = taskInfoSync.syncStatus;
+  const taskSyncMessage = taskInfoSync.syncMessage;
+  const isPrepared =
+    hasTaskIdentity &&
+    !taskInfoSync.dirty &&
+    !taskInfoSync.conflict &&
+    taskInfoSync.serverTaskKey === taskSyncKey &&
+    taskSyncStatus === 'synced';
+  const isAutoSyncing = taskSyncStatus === 'pending' || taskSyncStatus === 'syncing';
+  const canShowSyncAction = !disabled && hasTaskIdentity;
+
+  const canPrepare =
+    canShowSyncAction &&
+    !isPreparing &&
+    !isAutoSyncing;
+
   const handlePrepareSession = useCallback(async () => {
     if (!canPrepare) {
-      if (!String(info.taskNum || '').trim() || !String(info.taskName || '').trim()) {
+      if (!hasTaskIdentity) {
         toast.error('Fill in Task Num and Task Name first.');
       }
       return;
     }
+    if (syncTimerRef.current) {
+      clearTimeout(syncTimerRef.current);
+      syncTimerRef.current = null;
+    }
+    const generation = syncGenerationRef.current + 1;
+    syncGenerationRef.current = generation;
     setIsPreparing(true);
+    dispatch(markTaskInfoSyncing());
     try {
+      const syncResult = await sendRecordCommand('set_task_info');
+      if (syncGenerationRef.current !== generation) return;
+      if (!syncResult || !syncResult.success) {
+        dispatch(markTaskInfoSyncFailed(
+          (syncResult && syncResult.message) || 'Task info not synced; robot button may use old task.'
+        ));
+        toast.error(
+          `Sync failed: ${(syncResult && syncResult.message) || 'Unknown error'}`
+        );
+        return;
+      }
+
       const result = await sendRecordCommand('prepare_session');
+      if (syncGenerationRef.current !== generation) return;
       if (result && result.success) {
-        setIsPrepared(true);
+        dispatch(markTaskInfoSyncSuccess());
         toast.success(result.message || 'Session prepared — use the leader to start.');
       } else {
-        setIsPrepared(false);
+        dispatch(markTaskInfoSyncFailed(
+          (result && result.message) || 'Task info not synced; robot button may use old task.'
+        ));
         toast.error(
           `Prepare failed: ${(result && result.message) || 'Unknown error'}`
         );
       }
     } catch (error) {
-      setIsPrepared(false);
+      if (syncGenerationRef.current !== generation) return;
+      dispatch(markTaskInfoSyncFailed(
+        `Task info not synced; robot button may use old task. ${error.message || error}`
+      ));
       toast.error(`Prepare failed: ${error.message || error}`);
     } finally {
-      setIsPreparing(false);
+      if (syncGenerationRef.current === generation) {
+        setIsPreparing(false);
+      }
     }
-  }, [canPrepare, info.taskNum, info.taskName, sendRecordCommand]);
+  }, [canPrepare, dispatch, hasTaskIdentity, sendRecordCommand]);
+
+  const handleUseServerInfo = useCallback(() => {
+    if (syncTimerRef.current) {
+      clearTimeout(syncTimerRef.current);
+      syncTimerRef.current = null;
+    }
+    syncGenerationRef.current += 1;
+    dispatch(applyServerTaskInfo());
+  }, [dispatch]);
 
   // track task status update
   useEffect(() => {
@@ -179,6 +312,24 @@ const InfoPanel = ({ variant = 'card' }) => {
     {
       'bg-gray-100 cursor-not-allowed': !isEditable,
       'bg-white': isEditable,
+    }
+  );
+
+  const classSyncStatus = clsx(
+    'mb-2',
+    'p-2',
+    'rounded-md',
+    'border',
+    'text-xs',
+    'font-medium',
+    {
+      'bg-green-50 border-green-200 text-green-700': taskSyncStatus === 'synced',
+      'bg-amber-50 border-amber-200 text-amber-700':
+        taskSyncStatus === 'pending' || taskSyncStatus === 'syncing',
+      'bg-red-50 border-red-200 text-red-700':
+        taskSyncStatus === 'failed' || taskSyncStatus === 'conflict',
+      'bg-gray-50 border-gray-200 text-gray-500':
+        taskSyncStatus === 'missing' || taskSyncStatus === 'idle',
     }
   );
 
@@ -271,20 +422,53 @@ const InfoPanel = ({ variant = 'card' }) => {
         />
       </div>
 
+      <div className={classSyncStatus}>
+        {taskSyncMessage || 'Task info will sync automatically.'}
+      </div>
+
+      {taskInfoSync.conflict && taskInfoSync.serverTaskInfo && (
+        <button
+          type="button"
+          onClick={handleUseServerInfo}
+          disabled={disabled}
+          className={clsx(
+            'w-full',
+            'mb-2',
+            'px-2',
+            'py-1.5',
+            'rounded-md',
+            'border',
+            'text-xs',
+            'font-semibold',
+            'transition-colors',
+            disabled
+              ? 'bg-gray-100 border-gray-200 text-gray-400 cursor-not-allowed'
+              : 'bg-white border-red-300 text-red-700 hover:bg-red-50'
+          )}
+        >
+          Use server info: Task_{taskInfoSync.serverTaskInfo.taskNum}_{taskInfoSync.serverTaskInfo.taskName}_MCAP
+        </button>
+      )}
+
       {/* Prepare-session button. Doubles as the "saved as" indicator:
           clicking arms the orchestrator with this task_info so the
           leader joystick can drive episode 0 without anyone touching
-          the UI's RECORD button. Re-arms on task_num/name edit. */}
+          the UI's RECORD button. Auto-sync normally keeps this current;
+          clicking forces an immediate prepare/sync. */}
       <button
         type="button"
         onClick={handlePrepareSession}
         disabled={!canPrepare}
         title={
-          !canPrepare && !isPreparing
+          !hasTaskIdentity
             ? 'Fill in Task Num and Task Name to enable.'
-            : isPrepared
-              ? 'Session prepared — use the leader joystick to start recording.'
-              : 'Click to arm this task on the orchestrator so the leader joystick can start episode 0.'
+            : disabled
+              ? 'Task is running; task info cannot be changed right now.'
+              : isAutoSyncing || isPreparing
+                ? 'Task info is syncing.'
+                : isPrepared
+                  ? 'Task info is synced — use the leader joystick to start recording.'
+                  : 'Sync task info now so the leader joystick uses the latest values.'
         }
         className={clsx(
           'flex',
@@ -302,24 +486,39 @@ const InfoPanel = ({ variant = 'card' }) => {
           'focus:ring-2',
           'focus:ring-blue-400',
           {
-            'bg-gray-100 border-gray-200 text-gray-500 hover:bg-blue-50 hover:border-blue-300 cursor-pointer':
-              canPrepare && !isPrepared,
+            'bg-amber-50 border-amber-300 text-amber-700 hover:bg-amber-100 cursor-pointer':
+              canShowSyncAction &&
+              !isPrepared &&
+              taskSyncStatus !== 'failed' &&
+              taskSyncStatus !== 'conflict',
+            'bg-red-50 border-red-300 text-red-700 hover:bg-red-100 cursor-pointer':
+              canShowSyncAction &&
+              (taskSyncStatus === 'failed' || taskSyncStatus === 'conflict'),
             'bg-green-50 border-green-300 text-green-700 hover:bg-green-100 cursor-pointer':
-              canPrepare && isPrepared,
-            'bg-gray-100 border-gray-200 text-gray-400 cursor-not-allowed': !canPrepare,
+              canShowSyncAction && isPrepared,
+            'bg-gray-100 border-gray-200 text-gray-400 cursor-not-allowed': !canShowSyncAction,
+            'cursor-not-allowed': canShowSyncAction && !canPrepare,
           }
         )}
       >
         <div>
           {isPreparing
             ? 'Preparing…'
-            : isPrepared
-              ? 'Session ready — use leader to record'
-              : 'Click to prepare session as:'}
+            : isAutoSyncing
+              ? 'Syncing task info…'
+              : isPrepared
+                ? 'Task info synced — leader ready'
+                : taskSyncStatus === 'failed'
+                  ? 'Task info not synced — click to retry:'
+                  : taskSyncStatus === 'conflict'
+                    ? 'Local draft differs — click to overwrite server as:'
+                  : 'Sync now as:'}
         </div>
         <div
           className={clsx('font-bold', 'break-all', {
-            'text-blue-500': !isPrepared,
+            'text-amber-700':
+              !isPrepared && taskSyncStatus !== 'failed' && taskSyncStatus !== 'conflict',
+            'text-red-700': taskSyncStatus === 'failed' || taskSyncStatus === 'conflict',
             'text-green-700': isPrepared,
           })}
         >

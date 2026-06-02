@@ -20,6 +20,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import ROSLIB from 'roslib';
 import { RecordPhase, InferencePhase } from '../constants/taskPhases';
 import {
+  receiveServerRecordTaskInfo,
   setRecordStatus,
   setInferenceStatus,
   setTaskInfo,
@@ -49,8 +50,10 @@ import {
   setConversionStatus,
 } from '../features/editDataset/editDatasetSlice';
 import HFStatus from '../constants/HFStatus';
+import PageType from '../constants/pageType';
 import store from '../store/store';
 import rosConnectionManager from '../utils/rosConnectionManager';
+import { rosTaskInfoToUiTaskInfo } from '../utils/taskInfoSync';
 
 export function useRosTopicSubscription() {
   const recordingStatusTopicRef = useRef(null);
@@ -321,37 +324,23 @@ export function useRosTopicSubscription() {
           })
         );
 
-        // Seed taskInfo once on the first non-empty echo.
+        // Keep Record-page task information aligned with the server echo,
+        // unless this browser is protecting an in-progress local draft.
         const hasTaskInfo = msg.task_info && (
           (msg.task_info.task_name && msg.task_info.task_name.length > 0) ||
           (msg.task_info.policy_path && msg.task_info.policy_path.length > 0)
         );
-        if (hasTaskInfo && !initialTaskInfoSyncRef.current) {
+        const uiTaskInfo = hasTaskInfo ? rosTaskInfoToUiTaskInfo(msg.task_info) : null;
+        const currentPage = store.getState().ui.currentPage;
+        if (uiTaskInfo && currentPage === PageType.RECORD) {
+          dispatch(receiveServerRecordTaskInfo(uiTaskInfo));
+        } else if (
+          uiTaskInfo &&
+          currentPage === PageType.HOME &&
+          !initialTaskInfoSyncRef.current
+        ) {
           initialTaskInfoSyncRef.current = true;
-          dispatch(
-            setTaskInfo({
-              taskNum: msg.task_info.task_num || '',
-              taskName: msg.task_info.task_name || '',
-              taskType: msg.task_info.task_type || '',
-              taskInstruction: msg.task_info.task_instruction || [],
-              subtaskInstruction: msg.task_info.subtask_instruction || [],
-              policyPath: msg.task_info.policy_path || '',
-              recordInferenceMode: msg.task_info.record_inference_mode || false,
-              userId: msg.task_info.user_id || '',
-              controlHz: msg.task_info.control_hz || 100,
-              inferenceHz: msg.task_info.inference_hz || 15,
-              chunkAlignWindowS: msg.task_info.chunk_align_window_s || 0.3,
-              includeRobotisLicense: Boolean(msg.task_info.include_robotis_license),
-              warmupTime: msg.task_info.warmup_time_s || 0,
-              episodeTime: msg.task_info.episode_time_s || 0,
-              resetTime: msg.task_info.reset_time_s || 0,
-              numEpisodes: msg.task_info.num_episodes || 0,
-              pushToHub: msg.task_info.push_to_hub || false,
-              privateMode: msg.task_info.private_mode || false,
-              useOptimizedSave: msg.task_info.use_optimized_save_mode || false,
-              recordRosBag2: msg.task_info.record_rosbag2 || false,
-            })
-          );
+          dispatch(setTaskInfo(uiTaskInfo));
         }
       });
     } catch (error) {

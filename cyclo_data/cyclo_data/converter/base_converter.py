@@ -1258,6 +1258,12 @@ class RosbagToLerobotConverterBase:
         """Find raw camera MP4 files for one archived subtask segment."""
         video_dir = Path(bag_path) / "videos" / segment_stem
         if not video_dir.exists():
+            videos_root = Path(bag_path) / "videos"
+            if videos_root.exists():
+                raise FileNotFoundError(
+                    f"{bag_path.name}: expected video segment directory "
+                    f"{video_dir.relative_to(bag_path)} for {segment_stem}"
+                )
             return {}
         video_files: Dict[str, Path] = {}
         for mp4_file in sorted(video_dir.glob("*.mp4")):
@@ -1706,11 +1712,13 @@ class RosbagToLerobotConverterBase:
         }
         if len(counts) <= 1:
             return True
-        self._log_error(
-            "Mixed Number of Subtasks in one dataset is not supported: "
-            f"found counts={sorted(counts)}. Use separate task folders."
-        )
-        return False
+        if 0 in counts:
+            self._log_error(
+                "Cannot mix single-task and subtask episodes in one dataset: "
+                f"found subtask counts={sorted(counts)}."
+            )
+            return False
+        return True
 
     def _stitch_subtask_group(
         self,
@@ -3991,7 +3999,10 @@ class RosbagToLerobotConverterBase:
                     continue
                 video_dir = bag_path / str(segment.get("video_dir", ""))
                 if not video_dir.exists():
-                    continue
+                    raise FileNotFoundError(
+                        f"{bag_path.name}: video_segments references missing "
+                        f"directory {video_dir.relative_to(bag_path)}"
+                    )
                 cameras = [
                     str(cam)
                     for cam in (segment.get("cameras") or [])
@@ -4006,10 +4017,20 @@ class RosbagToLerobotConverterBase:
                 ordered.append((video_dir, set(cameras)))
         else:
             videos_root = bag_path / "videos"
-            if videos_root.exists():
+            if videos_root.is_dir():
                 for mcap_path in sorted(bag_path.glob("*.mcap")):
                     video_dir = videos_root / mcap_path.stem
                     if not video_dir.exists():
+                        segment_dirs = [
+                            path for path in videos_root.iterdir()
+                            if path.is_dir()
+                        ]
+                        if segment_dirs:
+                            raise FileNotFoundError(
+                                f"{bag_path.name}: expected video segment "
+                                f"directory {video_dir.relative_to(bag_path)} "
+                                f"for {mcap_path.name}"
+                            )
                         continue
                     cameras = [
                         path.stem

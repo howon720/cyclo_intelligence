@@ -934,16 +934,6 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         return ["-segment_format_options", "movflags=+faststart"]
 
     @staticmethod
-    def _segment_forced_idr_args(encoder: str) -> List[str]:
-        # h264_nvenc treats force_key_frames as non-IDR I-frames unless this
-        # encoder-specific switch is set. MP4 segment outputs must start with
-        # independently decodable frames, but forcing every frame to IDR would
-        # make v2.1 output much larger.
-        if str(encoder).strip().lower() == "h264_nvenc":
-            return ["-forced-idr", "1"]
-        return []
-
-    @staticmethod
     def _segment_encoder_opts(encoder: str, encoder_opts: List[str]) -> List[str]:
         # The generic max-speed libx264 fallback defaults to all-intra (`-g 1`).
         # That helps standalone clips on some hosts, but segmented output only
@@ -1236,7 +1226,6 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             cmd.extend([
                 "-c:v", encoder,
                 *self._segment_encoder_opts(encoder, encoder_opts),
-                *self._segment_forced_idr_args(encoder),
                 "-pix_fmt", "yuv420p",
                 "-r", fps_str,
                 "-an",

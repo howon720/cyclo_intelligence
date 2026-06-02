@@ -40,14 +40,10 @@ _VIDEO_SYNC_TMPDIR_ENV = "CYCLO_VIDEO_SYNC_TMPDIR"
 _VIDEO_SYNC_MIN_FREE_MB_ENV = "CYCLO_VIDEO_SYNC_MIN_FREE_MB"
 _VIDEO_SYNC_FORCE_FALLBACK_ENV = "CYCLO_VIDEO_SYNC_FORCE_FALLBACK"
 _VIDEO_SYNC_DISABLE_COPY_FASTPATH_ENV = "CYCLO_VIDEO_SYNC_DISABLE_COPY_FASTPATH"
-_VIDEO_SYNC_ENABLE_FFMPEG_PIPE_ENV = "CYCLO_VIDEO_SYNC_ENABLE_FFMPEG_PIPE"
-_VIDEO_SYNC_ENABLE_OPENCV_WRITER_ENV = "CYCLO_VIDEO_SYNC_ENABLE_OPENCV_WRITER"
-_VIDEO_SYNC_DISABLE_OPENCV_WRITER_ENV = "CYCLO_VIDEO_SYNC_DISABLE_OPENCV_WRITER"
 _VIDEO_SYNC_DISABLE_YUV420_PIPE_ENV = "CYCLO_VIDEO_SYNC_DISABLE_YUV420_PIPE"
 _VIDEO_SYNC_STRICT_FFMPEG_DECODE_ENV = "CYCLO_VIDEO_SYNC_STRICT_FFMPEG_DECODE"
 _VIDEO_STATS_SAMPLES_ENV = "CYCLO_VIDEO_STATS_SAMPLES"
 _H264_ENCODER_ENV = "CYCLO_H264_ENCODER"
-_H264_DECODER_ENV = "CYCLO_H264_DECODER"
 _X264_SPEED_PROFILE_ENV = "CYCLO_X264_SPEED_PROFILE"
 _X264_PRESET_ENV = "CYCLO_X264_PRESET"
 _X264_CRF_ENV = "CYCLO_X264_CRF"
@@ -115,24 +111,6 @@ def _terminate_process(
 
 
 _H264_ENCODER_THREAD_LOCAL = threading.local()
-_NVENC_MIN_DIMENSION = 256
-_NVENC_ENCODER_OPTS = [
-    "-preset", "p1",
-    "-tune", "ll",
-    "-rc", "vbr",
-    "-cq", "23",
-    "-bf", "0",
-    "-zerolatency", "1",
-]
-_NVENC_MAX_ENCODER_OPTS = [
-    "-preset", "p1",
-    "-tune", "ll",
-    "-rc", "constqp",
-    "-qp", "51",
-    "-bf", "0",
-    "-zerolatency", "1",
-]
-_HW_BITRATE_ENCODER_OPTS = ["-b:v", "5M"]
 _UINT8_VALUES = np.arange(256, dtype=np.float64)
 _UINT8_SQUARES = _UINT8_VALUES * _UINT8_VALUES
 
@@ -205,42 +183,6 @@ def _force_h264_software_encoder():
         else:
             _H264_ENCODER_THREAD_LOCAL.force_software = previous
 
-
-def _nvenc_encoder_opts() -> list[str]:
-    if _is_max_speed_profile():
-        return list(_NVENC_MAX_ENCODER_OPTS)
-    return list(_NVENC_ENCODER_OPTS)
-
-
-@lru_cache(maxsize=1)
-def _running_on_jetson() -> bool:
-    """Best-effort detection for Jetson/Orin edge devices."""
-    marker_paths = (
-        Path("/etc/nv_tegra_release"),
-        Path("/sys/module/tegra_fuse"),
-    )
-    if any(path.exists() for path in marker_paths):
-        return True
-    try:
-        model = Path("/proc/device-tree/model").read_text(
-            encoding="utf-8",
-            errors="ignore",
-        ).lower()
-    except OSError:
-        return False
-    return any(token in model for token in ("jetson", "orin", "tegra"))
-
-
-def _jetson_hardware_encoder_candidates() -> list[tuple[str, list[str]]]:
-    """Return Jetson/Orin hardware encoders in preferred probe order."""
-    return [
-        ("h264_nvmpi", list(_HW_BITRATE_ENCODER_OPTS)),
-        ("h264_v4l2m2m", list(_HW_BITRATE_ENCODER_OPTS)),
-        ("h264_omx", list(_HW_BITRATE_ENCODER_OPTS)),
-        ("h264_nvenc", _nvenc_encoder_opts()),
-    ]
-
-
 def _ffmpeg_threads_arg() -> list[str]:
     """Return ``["-threads", "N"]`` for ffmpeg codec thread placement.
 
@@ -260,114 +202,9 @@ def _ffmpeg_threads_arg() -> list[str]:
     return ["-threads", str(n)]
 
 
-@lru_cache(maxsize=4)
-def _ffmpeg_supports_h264_cuvid(ffmpeg: str) -> bool:
-    """Return True when this ffmpeg can actually decode H.264 via CUVID."""
-    return _ffmpeg_supports_h264_decoder(ffmpeg, "h264_cuvid")
-
-
-@lru_cache(maxsize=16)
-def _ffmpeg_supports_h264_decoder(ffmpeg: str, decoder: str) -> bool:
-    """Return True when ffmpeg can actually decode H.264 with ``decoder``."""
-    try:
-        listed = subprocess.run(
-            [ffmpeg, "-hide_banner", "-decoders"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if listed.returncode != 0 or decoder not in listed.stdout:
-            return False
-        with tempfile.TemporaryDirectory(prefix="cyclo_h264dec_probe_") as tmpdir:
-            sample = Path(tmpdir) / "sample.mp4"
-            make_sample = subprocess.run(
-                [
-                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                    "-f", "lavfi",
-                    "-i", "color=c=black:s=256x256:r=1:d=0.1",
-                    "-frames:v", "1",
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-pix_fmt", "yuv420p",
-                    str(sample),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            )
-            if make_sample.returncode != 0:
-                return False
-            decode = subprocess.run(
-                [
-                    ffmpeg, "-hide_banner", "-loglevel", "error",
-                    "-c:v", decoder,
-                    "-i", str(sample),
-                    "-frames:v", "1",
-                    "-f", "null", "-",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            )
-            return decode.returncode == 0
-    except Exception:
-        return False
-
-
-def _first_usable_h264_decoder(ffmpeg: str, candidates: Sequence[str]) -> Optional[str]:
-    for decoder in candidates:
-        if decoder == "h264_cuvid":
-            if _ffmpeg_supports_h264_cuvid(ffmpeg):
-                return decoder
-        elif _ffmpeg_supports_h264_decoder(ffmpeg, decoder):
-            return decoder
-    return None
-
-
 def _ffmpeg_h264_decoder_args(ffmpeg: str) -> list[str]:
-    """Return ffmpeg input args for the fastest available H.264 decoder.
-
-    Conversion benchmarks on both desktop NVIDIA and Orin showed that the
-    portable software decoder is the best default for this pipeline. Hardware
-    decode remains available only when explicitly requested with
-    ``CYCLO_H264_DECODER=h264_cuvid``/``h264_nvmpi``/``h264_v4l2m2m``/``auto``.
-    """
-    raw = os.environ.get(_H264_DECODER_ENV)
-    requested = (raw or "").strip().lower()
-    if not requested:
-        return _ffmpeg_threads_arg()
-    if requested in {"0", "false", "no", "off", "none", "native", "software"}:
-        return _ffmpeg_threads_arg()
-    aliases = {
-        "cuda": ["h264_cuvid"],
-        "cuvid": ["h264_cuvid"],
-        "h264_cuvid": ["h264_cuvid"],
-        "nvdec": ["h264_cuvid"],
-        "nvmpi": ["h264_nvmpi"],
-        "h264_nvmpi": ["h264_nvmpi"],
-        "jetson": ["h264_nvmpi", "h264_v4l2m2m", "h264_cuvid"],
-        "v4l2m2m": ["h264_v4l2m2m"],
-        "h264_v4l2m2m": ["h264_v4l2m2m"],
-        "auto": (
-            ["h264_nvmpi", "h264_v4l2m2m", "h264_cuvid"]
-            if _running_on_jetson()
-            else ["h264_cuvid", "h264_nvmpi", "h264_v4l2m2m"]
-        ),
-    }
-    candidates = aliases.get(requested)
-    if candidates is not None:
-        decoder = _first_usable_h264_decoder(ffmpeg, candidates)
-        if decoder:
-            return ["-c:v", decoder]
-        return _ffmpeg_threads_arg()
-    # Unknown values behave like auto so host-specific tuning typos do not
-    # fail a conversion that has a perfectly good software fallback.
-    decoder = _first_usable_h264_decoder(
-        ffmpeg,
-        ["h264_cuvid", "h264_nvmpi", "h264_v4l2m2m"],
-    )
-    if decoder:
-        return ["-c:v", decoder]
+    """Return ffmpeg input args for portable software H.264 decode."""
+    del ffmpeg
     return _ffmpeg_threads_arg()
 
 
@@ -448,44 +285,13 @@ def _cleanup_tmp_parent(tmp_parent: Path, cleanup_when_empty: bool) -> None:
         pass
 
 
-def _try_encoder(ffmpeg: str, encoder: str, opts: list[str]) -> bool:
-    """Smoke-test an encoder by running a 1-frame null-out encode.
-
-    ffmpeg lists encoders that are *compiled in* regardless of whether
-    the runtime can actually use them (e.g. h264_nvenc inside a
-    container without nvidia-uvm / GPU passthrough). The only reliable
-    check is to try a tiny encode and see if the process exits 0.
-    """
-    # Keep the probe representative of real camera frames. Some hardware
-    # encoders reject tiny 64x64 inputs even though they work for normal camera
-    # resolutions; probing too small falsely disables a usable hardware encoder
-    # and falls back to libx264.
-    cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "lavfi", "-i", "color=c=black:s=256x256:r=15:d=0.1",
-        "-c:v", encoder, *opts,
-        "-pix_fmt", "yuv420p",
-        "-f", "null", "-",
-    ]
-    try:
-        res = subprocess.run(cmd, capture_output=True, timeout=10)
-        return res.returncode == 0
-    except Exception:
-        return False
-
-
 def _h264_encoder(
     ffmpeg: str,
     *,
     width: int | None = None,
     height: int | None = None,
 ) -> tuple[str, list[str]]:
-    """Pick an H.264 encoder + options.
-
-    The measured default is always libx264. Desktop NVENC and Jetson hardware
-    paths are still available as explicit escape hatches, but conversion
-    benchmarks showed that auto-selecting them slows this frame-selection
-    pipeline down.
+    """Return the CPU H.264 encoder + options.
 
     Set ``CYCLO_X264_SPEED_PROFILE=quality`` for the old CRF23 default, or
     ``CYCLO_X264_SPEED_PROFILE=max`` to use the fastest measured x264 profile.
@@ -493,52 +299,20 @@ def _h264_encoder(
     Set ``CYCLO_X264_PRESET`` / ``CYCLO_X264_CRF`` / ``CYCLO_X264_QP`` /
     ``CYCLO_X264_TUNE`` / ``CYCLO_X264_GOP`` / ``CYCLO_X264_THREADS`` to
     override the profile without changing conversion call sites.
-    Set ``CYCLO_H264_ENCODER=h264_nvenc`` / ``h264_nvmpi`` /
-    ``h264_v4l2m2m`` / ``jetson`` to force a hardware path explicitly.
     """
+    del ffmpeg, width, height
     if getattr(_H264_ENCODER_THREAD_LOCAL, "force_software", False):
         return _libx264_encoder()
 
     requested_raw = os.environ.get(_H264_ENCODER_ENV)
     requested = (requested_raw or "").strip().lower()
-    if requested in ("", "auto", "default", "libx264", "x264", "software"):
-        return _libx264_encoder()
-
-    if requested == "jetson":
-        for name, opts in _jetson_hardware_encoder_candidates():
-            if name == "h264_nvenc" and (
-                width is not None
-                and height is not None
-                and min(int(width), int(height)) < _NVENC_MIN_DIMENSION
-            ):
-                continue
-            if _try_encoder(ffmpeg, name, opts):
-                return name, list(opts)
-        return _libx264_encoder()
-
-    explicit: dict[str, tuple[str, list[str]]] = {
-        "nvenc": ("h264_nvenc", list(_NVENC_ENCODER_OPTS)),
-        "h264_nvenc": ("h264_nvenc", _nvenc_encoder_opts()),
-        "nvmpi": ("h264_nvmpi", list(_HW_BITRATE_ENCODER_OPTS)),
-        "h264_nvmpi": ("h264_nvmpi", list(_HW_BITRATE_ENCODER_OPTS)),
-        "v4l2m2m": ("h264_v4l2m2m", list(_HW_BITRATE_ENCODER_OPTS)),
-        "h264_v4l2m2m": ("h264_v4l2m2m", list(_HW_BITRATE_ENCODER_OPTS)),
-        "omx": ("h264_omx", list(_HW_BITRATE_ENCODER_OPTS)),
-        "h264_omx": ("h264_omx", list(_HW_BITRATE_ENCODER_OPTS)),
-    }
-    if requested in explicit:
-        name, opts = explicit[requested]
-        if name == "h264_nvenc" and (
-            width is not None
-            and height is not None
-            and min(int(width), int(height)) < _NVENC_MIN_DIMENSION
-        ):
-            name, opts = _libx264_encoder()
-        elif not _try_encoder(ffmpeg, name, opts):
-            name, opts = _libx264_encoder()
-        return name, list(opts)
-
-    # Unknown tuning values should not make conversion slower or fail.
+    if requested not in ("", "auto", "default", "libx264", "x264", "software"):
+        import sys as _sys
+        print(
+            f"video_sync: ignoring unsupported {_H264_ENCODER_ENV}="
+            f"{requested_raw!r}; using libx264",
+            file=_sys.stderr,
+        )
     return _libx264_encoder()
 
 
@@ -1261,26 +1035,6 @@ def _remux_selected_frames_streaming(
                 )
             output_mp4.unlink(missing_ok=True)
 
-    if os.environ.get(_VIDEO_SYNC_ENABLE_FFMPEG_PIPE_ENV):
-        try:
-            return _remux_selected_frames_ffmpeg_pipe(
-                input_mp4=input_mp4,
-                frame_indices=frame_indices,
-                output_mp4=output_mp4,
-                target_fps=target_fps,
-                rotation_deg=rotation_deg,
-                image_resize=image_resize,
-                ffmpeg=ffmpeg,
-            )
-        except Exception as exc:
-            import sys as _sys
-            print(
-                f"video_sync[{input_mp4.name}]: ffmpeg-pipe stream path failed "
-                f"({exc!r}); falling back to OpenCV stream path",
-                file=_sys.stderr,
-            )
-            output_mp4.unlink(missing_ok=True)
-
     return _remux_selected_frames_opencv_streaming(
         input_mp4=input_mp4,
         frame_indices=frame_indices,
@@ -1766,151 +1520,6 @@ def _remux_selected_frames_ffmpeg_yuv420_pipe(
         _terminate_process(encoder_process, close_stdin=True)
 
 
-def _remux_selected_frames_ffmpeg_pipe(
-    *,
-    input_mp4: Path,
-    frame_indices: Sequence[int],
-    output_mp4: Path,
-    target_fps: int,
-    rotation_deg: int,
-    image_resize: "tuple[int, int] | None",
-    ffmpeg: str,
-) -> VideoSyncResult:
-    """Use ffmpeg for decode and encode, with Python only selecting frames."""
-    if any(i < 0 for i in frame_indices):
-        raise ValueError("frame_indices must be non-negative")
-    if any(b < a for a, b in zip(frame_indices, frame_indices[1:])):
-        raise ValueError("streaming sync requires non-decreasing frame_indices")
-
-    stream = _probe_video_stream(input_mp4)
-    if not stream:
-        raise RuntimeError(f"failed to probe input video stream: {input_mp4}")
-    width = int(stream.get("width") or 0)
-    height = int(stream.get("height") or 0)
-    if width <= 0 or height <= 0:
-        raise RuntimeError(f"invalid video dimensions for {input_mp4}: {width}x{height}")
-
-    frame_size = width * height * 3
-    decoder_cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "error",
-        *_ffmpeg_h264_decoder_args(ffmpeg),
-        "-i", str(input_mp4),
-        "-map", "0:v:0",
-        "-an",
-        "-fps_mode", "passthrough",
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "pipe:1",
-    ]
-    encoder, enc_opts = _h264_encoder(ffmpeg, width=width, height=height)
-    encoder_cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
-        *_ffmpeg_threads_arg(),
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}",
-        "-r", str(int(target_fps)),
-        "-i", "pipe:0",
-        *_video_filter_args(rotation_deg, image_resize),
-        "-c:v", encoder,
-        *enc_opts,
-        "-pix_fmt", "yuv420p",
-        "-r", str(int(target_fps)),
-        "-video_track_timescale", "90000",
-        str(output_mp4),
-    ]
-
-    decoder: subprocess.Popen | None = None
-    encoder_process: subprocess.Popen | None = None
-    last_frame: bytes | None = None
-    current_idx = -1
-    clamped_count = 0
-    sample_positions = _video_stats_sample_positions(len(frame_indices))
-    stats = _StreamingRgbStats()
-    try:
-        decoder = subprocess.Popen(
-            decoder_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
-        encoder_process = subprocess.Popen(
-            encoder_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        assert decoder.stdout is not None
-        assert encoder_process.stdin is not None
-
-        for out_idx, requested_idx in enumerate(frame_indices):
-            while current_idx < requested_idx:
-                frame = _read_exact(decoder.stdout, frame_size)
-                if len(frame) != frame_size:
-                    if last_frame is None:
-                        raise RuntimeError(
-                            f"no frames decoded from {input_mp4.name}"
-                        )
-                    clamped_count += 1
-                    break
-                current_idx += 1
-                last_frame = frame
-
-            if last_frame is None:
-                raise RuntimeError(f"no frame available for {input_mp4.name}")
-
-            encoder_process.stdin.write(last_frame)
-            if out_idx in sample_positions:
-                _add_frame_bytes_for_stats(
-                    stats,
-                    last_frame,
-                    width=width,
-                    height=height,
-                    rotation_deg=rotation_deg,
-                    image_resize=image_resize,
-                )
-
-        encoder_process.stdin.close()
-        stderr = (
-            encoder_process.stderr.read().decode(errors="replace")
-            if encoder_process.stderr is not None else ""
-        )
-        rc = encoder_process.wait(timeout=300)
-        if rc != 0:
-            raise RuntimeError(f"ffmpeg encode rc={rc}: {stderr[-500:]}")
-
-        produced_frames = _validate_stream_encoded_output(
-            output_mp4,
-            expected_frames=len(frame_indices),
-            target_fps=target_fps,
-            ffmpeg=ffmpeg,
-        )
-
-        if clamped_count:
-            import sys as _sys
-            print(
-                f"video_sync[{input_mp4.name}]: clamped {clamped_count} "
-                f"selected indices beyond decoded frames to last frame",
-                file=_sys.stderr,
-            )
-
-        output_height, output_width = _output_dimensions(
-            height, width, rotation_deg, image_resize
-        )
-        return VideoSyncResult(
-            frame_count=int(produced_frames),
-            stats=stats.to_stats(),
-            used_fallback=False,
-            mode="stream_encode",
-            output_height=output_height,
-            output_width=output_width,
-        )
-    finally:
-        _terminate_process(decoder)
-        _terminate_process(encoder_process, close_stdin=True)
-
-
 def _remux_selected_frames_opencv_streaming(
     *,
     input_mp4: Path,
@@ -1922,29 +1531,6 @@ def _remux_selected_frames_opencv_streaming(
     ffmpeg: str,
 ) -> VideoSyncResult:
     """Decode input with OpenCV and write selected BGR frames to H.264."""
-    if (
-        os.environ.get(_VIDEO_SYNC_ENABLE_OPENCV_WRITER_ENV)
-        and not os.environ.get(_VIDEO_SYNC_DISABLE_OPENCV_WRITER_ENV)
-    ):
-        try:
-            return _remux_selected_frames_opencv_writer(
-                input_mp4=input_mp4,
-                frame_indices=frame_indices,
-                output_mp4=output_mp4,
-                target_fps=target_fps,
-                rotation_deg=rotation_deg,
-                image_resize=image_resize,
-                ffmpeg=ffmpeg,
-            )
-        except Exception as exc:
-            import sys as _sys
-            print(
-                f"video_sync[{input_mp4.name}]: OpenCV writer path failed "
-                f"({exc!r}); falling back to ffmpeg rawvideo encoder",
-                file=_sys.stderr,
-            )
-            output_mp4.unlink(missing_ok=True)
-
     return _remux_selected_frames_opencv_ffmpeg_encoder(
         input_mp4=input_mp4,
         frame_indices=frame_indices,
@@ -1954,113 +1540,6 @@ def _remux_selected_frames_opencv_streaming(
         image_resize=image_resize,
         ffmpeg=ffmpeg,
     )
-
-
-def _remux_selected_frames_opencv_writer(
-    *,
-    input_mp4: Path,
-    frame_indices: Sequence[int],
-    output_mp4: Path,
-    target_fps: int,
-    rotation_deg: int,
-    image_resize: "tuple[int, int] | None",
-    ffmpeg: str,
-) -> VideoSyncResult:
-    """Decode and encode with OpenCV's FFmpeg-backed H.264 writer."""
-    if any(i < 0 for i in frame_indices):
-        raise ValueError("frame_indices must be non-negative")
-    if any(b < a for a, b in zip(frame_indices, frame_indices[1:])):
-        raise ValueError("streaming sync requires non-decreasing frame_indices")
-
-    import cv2
-
-    cap = cv2.VideoCapture(str(input_mp4))
-    if not cap.isOpened():
-        raise RuntimeError(f"failed to open input video: {input_mp4}")
-
-    writer = None
-    output_height: int | None = None
-    output_width: int | None = None
-    last_frame: np.ndarray | None = None
-    current_idx = -1
-    clamped_count = 0
-    sample_positions = _video_stats_sample_positions(len(frame_indices))
-    stats = _StreamingRgbStats()
-
-    try:
-        for out_idx, requested_idx in enumerate(frame_indices):
-            current_idx, last_frame, clamped = _advance_capture_to_index(
-                cap,
-                current_idx=current_idx,
-                requested_idx=requested_idx,
-                last_frame=last_frame,
-                input_name=input_mp4.name,
-            )
-            if clamped:
-                clamped_count += 1
-
-            if last_frame is None:
-                raise RuntimeError(f"no frame available for {input_mp4.name}")
-
-            output_frame = (
-                _transform_frame_bgr_for_output(
-                    last_frame,
-                    rotation_deg=rotation_deg,
-                    image_resize=image_resize,
-                )
-                if rotation_deg or image_resize is not None
-                else last_frame
-            )
-
-            if writer is None:
-                height, width = output_frame.shape[:2]
-                output_height, output_width = int(height), int(width)
-                writer = cv2.VideoWriter(
-                    str(output_mp4),
-                    cv2.VideoWriter_fourcc(*"avc1"),
-                    float(target_fps),
-                    (width, height),
-                )
-                if not writer.isOpened():
-                    raise RuntimeError("OpenCV H.264 VideoWriter failed to open")
-
-            writer.write(output_frame)
-
-            if out_idx in sample_positions:
-                stats.add_bgr(output_frame)
-
-        if writer is None:
-            raise RuntimeError("OpenCV writer was not started")
-        writer.release()
-        writer = None
-
-        produced_frames = _validate_stream_encoded_output(
-            output_mp4,
-            expected_frames=len(frame_indices),
-            target_fps=target_fps,
-            ffmpeg=ffmpeg,
-        )
-
-        if clamped_count:
-            import sys as _sys
-            print(
-                f"video_sync[{input_mp4.name}]: clamped {clamped_count} "
-                f"selected indices beyond decoded frames to last frame",
-                file=_sys.stderr,
-            )
-
-        return VideoSyncResult(
-            frame_count=produced_frames,
-            stats=stats.to_stats(),
-            used_fallback=False,
-            mode="stream_encode",
-            output_height=output_height,
-            output_width=output_width,
-        )
-    finally:
-        cap.release()
-        if writer is not None:
-            writer.release()
 
 
 def _remux_selected_frames_opencv_ffmpeg_encoder(

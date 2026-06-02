@@ -955,8 +955,15 @@ class Mp4ConversionWorker:
     @staticmethod
     def _skip_episode_scan_path(path: Path) -> bool:
         return any(
-            part.endswith('_converted')
-            or part in {'_stitched_subtasks', '_subtask_video_concat'}
+            part.startswith('.')
+            or part.endswith('_converted')
+            or part in {
+                '_stitched_subtasks',
+                '_subtask_video_concat',
+                'camera_info',
+                'meshes',
+                'videos',
+            }
             for part in path.parts
         )
 
@@ -1033,7 +1040,9 @@ class Mp4ConversionWorker:
                 f"full_{info.get('full_episode_index', 0)}_"
                 f"subtask_{info.get('subtask_index', 0)}"
             )
-        return str(info.get('episode_index') or episode_dir.name)
+        if info.get('episode_index') is not None:
+            return str(info.get('episode_index'))
+        return str(episode_dir.name)
 
     @staticmethod
     def _converted_dir_name(episode_dir: Path) -> str:
