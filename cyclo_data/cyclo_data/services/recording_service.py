@@ -613,6 +613,7 @@ class RecordingService:
             response.message = 'task_info cached upstream; robot_type not set yet'
             return response
         self._ensure_data_manager(request.task_info, request.robot_type)
+        self._publish_recording_status()
         response.success = True
         response.message = 'task_info cached'
         return response

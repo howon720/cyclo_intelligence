@@ -2,6 +2,20 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.9 (2026-06-02)
+------------------
+* Improved LeRobot dataset conversion and merge handling for mixed subtask counts, segmented videos, and v3.0 video aggregation.
+* Simplified the LeRobot video sync path around the CPU H.264 backend and removed unused hardware encoder code.
+* Updated task information sync so SET_TASK_INFO refreshes recording metadata, save paths, and recording status immediately.
+* Contributors: kimtaehyeong99
+
+0.1.8 (2026-06-01)
+------------------
+* Optimized LeRobot conversion by syncing H.264 videos directly instead of materializing decoded PNG frames on disk.
+* Added source video cache reuse, fast metadata validation, and tuned worker scheduling for v2.1 and v3.0 exports.
+* Kept the default video backend on CPU ``libx264`` after Jetson and desktop benchmark comparisons.
+* Contributors: kimtaehyeong99
+
 0.1.7 (2026-05-27)
 ------------------
 * None

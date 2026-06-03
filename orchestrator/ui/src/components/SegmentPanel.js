@@ -18,6 +18,7 @@ import {
 
 import { RecordPhase } from '../constants/taskPhases';
 import {
+  markLocalTaskInfoEdited,
   resetSegmentPlan,
   resetSegmentProgress,
   setActiveSlotIndex,
@@ -186,6 +187,7 @@ export default function SegmentPanel() {
       dispatch(setSlotToServerIdx(nextSlotMap));
       const nextPending = nextSlotMap.findIndex((v) => v === -1);
       dispatch(setActiveSlotIndex(nextPending >= 0 ? nextPending : Math.max(0, bounded - 1)));
+      dispatch(markLocalTaskInfoEdited());
     },
     [dispatch, plannedCountNumber, plannedSubTasks, slotToServerIdx]
   );
@@ -381,7 +383,16 @@ export default function SegmentPanel() {
   const handleResetPlan = useCallback(() => {
     setEpisodeAcquisitionStarted(false);
     dispatch(resetSegmentPlan());
+    dispatch(markLocalTaskInfoEdited());
   }, [dispatch]);
+
+  const handleSubTaskChange = useCallback(
+    (index, value) => {
+      dispatch(setPlannedSubTaskAt({ index, value }));
+      dispatch(markLocalTaskInfoEdited());
+    },
+    [dispatch]
+  );
 
   useEffect(() => {
     const onKeyUp = (e) => {
@@ -459,7 +470,7 @@ export default function SegmentPanel() {
           )}
           value={plannedSubTasks[i] || ''}
           placeholder="sub_task 입력"
-          onChange={(e) => dispatch(setPlannedSubTaskAt({ index: i, value: e.target.value }))}
+          onChange={(e) => handleSubTaskChange(i, e.target.value)}
           disabled={inputDisabled}
         />
         <button

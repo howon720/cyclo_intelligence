@@ -214,6 +214,26 @@ def _read_status(episode_dir: Path) -> dict:
     return json.loads((episode_dir / "episode_info.json").read_text())
 
 
+def test_patch_status_preserves_korean_instruction_as_utf8(tmp_path):
+    info_path = tmp_path / "episode_info.json"
+    info_path.write_text(
+        json.dumps(
+            {
+                "subtask_instruction": "화장품 집기",
+                "transcoding_status": STATUS_PENDING,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    _patch_status(info_path, STATUS_DONE)
+
+    raw = info_path.read_text(encoding="utf-8")
+    assert "화장품 집기" in raw
+    assert "\\ud654" not in raw
+
+
 def _ffprobe_codec(mp4: Path) -> str:
     out = subprocess.run(
         [

@@ -307,14 +307,17 @@ class ReplayDataHandler:
                 )
             except Exception:
                 load_frame_timestamps = None  # type: ignore[assignment]
-            sidecar_by_camera: Dict[str, Any] = {}
+            sidecar_by_video_path: Dict[Path, Any] = {}
             if videos_dir.exists() and load_frame_timestamps is not None:
                 for sidecar in sorted(
-                    videos_dir.glob("*_timestamps.parquet")
+                    videos_dir.rglob("*_timestamps.parquet")
                 ):
                     cam_name = sidecar.stem[: -len("_timestamps")]
+                    video_path = sidecar.with_name(f"{cam_name}.mp4")
+                    if video_path in sidecar_by_video_path:
+                        continue
                     try:
-                        sidecar_by_camera[cam_name] = load_frame_timestamps(
+                        sidecar_by_video_path[video_path] = load_frame_timestamps(
                             sidecar, cam_name
                         )
                     except Exception as exc:  # pragma: no cover - defensive
@@ -324,23 +327,31 @@ class ReplayDataHandler:
 
             # Process video files
             if videos_dir.exists():
-                for video_file in sorted(videos_dir.glob("*.mp4")):
+                for video_file in sorted(videos_dir.rglob("*.mp4")):
                     if video_file.stem.endswith("_synced"):
                         # Skip converter-side derivatives that happen to
                         # live in the same dir.
                         continue
-                    result["video_files"].append(f"videos/{video_file.name}")
+                    result["video_files"].append(
+                        video_file.relative_to(bag_path_obj).as_posix()
+                    )
 
                     # Find matching topic
                     video_name = video_file.stem
                     matching_topic = None
-                    if video_name in sidecar_by_camera:
+                    if video_file in sidecar_by_video_path:
                         # v2 path: per-camera sidecar is the source of
                         # truth. Fold its rows into image_metadata_by_topic
-                        # keyed by the video filename (no source topic in
-                        # the v2 MCAP) so the rest of this method works
-                        # unchanged.
-                        ft = sidecar_by_camera[video_name]
+                        # keyed by the relative video path (no source topic
+                        # in the v2 MCAP). Segmented datasets can repeat the
+                        # same camera filename under videos/<segment>/, so a
+                        # plain camera-name key would drop later segments.
+                        ft = sidecar_by_video_path[video_file]
+                        sidecar_topic = (
+                            video_file.relative_to(bag_path_obj)
+                            .with_suffix("")
+                            .as_posix()
+                        )
                         # Use header.stamp seconds (publisher clock) so
                         # the timeline lines up with anything that
                         # publishes header.stamp in the MCAP.
@@ -351,8 +362,8 @@ class ReplayDataHandler:
                             )
                         ]
                         if per_frame:
-                            image_metadata_by_topic[video_name] = per_frame
-                            matching_topic = video_name
+                            image_metadata_by_topic[sidecar_topic] = per_frame
+                            matching_topic = sidecar_topic
                             if per_frame[0][1] > 0:
                                 min_time = min(min_time, per_frame[0][1])
                             if per_frame[-1][1] > 0:
@@ -373,7 +384,7 @@ class ReplayDataHandler:
                         if not camera_name:
                             # Fallback: extract meaningful name from topic path
                             camera_name = self._extract_camera_name_from_topic(
-                                matching_topic
+                                video_name
                             )
                     else:
                         # No matching topic, try to extract from video filename

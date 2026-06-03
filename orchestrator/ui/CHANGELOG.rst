@@ -2,6 +2,16 @@
 Changelog for package cyclo-ui
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.9 (2026-06-02)
+------------------
+* Added debounced Record page Task Information sync with the backend.
+* Reflected synced server task information across multiple Record pages with conflict handling and manual server/draft resolution actions.
+* Contributors: kimtaehyeong99
+
+0.1.8 (2026-06-01)
+------------------
+* None
+
 0.1.7 (2026-05-27)
 ------------------
 * Removed the UI foot-switch command bridge and synced Record subtask progress from backend recording status.

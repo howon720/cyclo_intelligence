@@ -821,12 +821,14 @@ class Mp4ConversionWorker:
                 logger=logger,
             )
 
-            # Parallel episode conversion using ProcessPoolExecutor
-            # Each worker creates its own RosbagToMp4Converter (stateless, picklable args)
-            # max_workers=min(4, total_episodes): 2 episodes × 4 cameras = 8 NVENC sessions
             from concurrent.futures import ProcessPoolExecutor, as_completed
+            from cyclo_data.converter.base_converter import (
+                _active_conversion_workers,
+                _conversion_worker_init,
+                _resolve_conversion_worker_count,
+            )
 
-            max_workers = min(4, total_episodes)
+            max_workers = _resolve_conversion_worker_count(total_episodes)
             logger.info(
                 f'Starting parallel MP4 conversion with {max_workers} workers'
             )
@@ -851,57 +853,61 @@ class Mp4ConversionWorker:
                 episode_tasks.append((episode_dir, output_dir, episode_id))
 
             completed_count = 0
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {}
-                for episode_dir, output_dir, episode_id in episode_tasks:
-                    future = executor.submit(
-                        _convert_single_episode_worker,
-                        episode_dir, output_dir,
-                        fps, True, True,  # fps from caller, use_hw, enable_smoothing
-                        selected_cameras or [],
-                        camera_rotations or {},
-                        image_resize,
-                        camera_pairs,
-                    )
-                    futures[future] = episode_id
-
-                for future in as_completed(futures):
-                    episode_id = futures[future]
-                    completed_count += 1
-
-                    # Update progress
-                    stage_progress = completed_count / total_episodes
-                    overall_progress = (
-                        progress_start
-                        + stage_progress * (progress_end - progress_start)
-                    )
-                    progress_queue.put({
-                        'current': completed_count,
-                        'total': total_episodes,
-                        'percentage': overall_progress,
-                        'current_episode': episode_id,
-                        'dataset_path': str(dataset_path),
-                        'stage': 'mp4'
-                    })
-
-                    try:
-                        _, success, _ = future.result()
-                        if success:
-                            converted_count += 1
-                            logger.info(
-                                f'Episode {episode_id} converted successfully '
-                                f'({completed_count}/{total_episodes})'
-                            )
-                        else:
-                            failed_episodes.append(episode_id)
-                            logger.warning(
-                                f'Episode {episode_id} conversion had issues'
-                            )
-                    except Exception as e:
-                        failed_episodes.append(episode_id)
-                        logger.error(
-                            f'Error converting episode {episode_id}: {str(e)}'
+            with _active_conversion_workers(max_workers):
+                with ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    initializer=_conversion_worker_init,
+                ) as executor:
+                    futures = {}
+                    for episode_dir, output_dir, episode_id in episode_tasks:
+                        future = executor.submit(
+                            _convert_single_episode_worker,
+                            episode_dir, output_dir,
+                            fps, True, True,  # fps from caller, use_hw, enable_smoothing
+                            selected_cameras or [],
+                            camera_rotations or {},
+                            image_resize,
+                            camera_pairs,
                         )
+                        futures[future] = episode_id
+
+                    for future in as_completed(futures):
+                        episode_id = futures[future]
+                        completed_count += 1
+
+                        # Update progress
+                        stage_progress = completed_count / total_episodes
+                        overall_progress = (
+                            progress_start
+                            + stage_progress * (progress_end - progress_start)
+                        )
+                        progress_queue.put({
+                            'current': completed_count,
+                            'total': total_episodes,
+                            'percentage': overall_progress,
+                            'current_episode': episode_id,
+                            'dataset_path': str(dataset_path),
+                            'stage': 'mp4'
+                        })
+
+                        try:
+                            _, success, _ = future.result()
+                            if success:
+                                converted_count += 1
+                                logger.info(
+                                    f'Episode {episode_id} converted successfully '
+                                    f'({completed_count}/{total_episodes})'
+                                )
+                            else:
+                                failed_episodes.append(episode_id)
+                                logger.warning(
+                                    f'Episode {episode_id} conversion had issues'
+                                )
+                        except Exception as e:
+                            failed_episodes.append(episode_id)
+                            logger.error(
+                                f'Error converting episode {episode_id}: {str(e)}'
+                            )
 
             # Final progress update for Stage 1
             progress_data = {
@@ -949,8 +955,15 @@ class Mp4ConversionWorker:
     @staticmethod
     def _skip_episode_scan_path(path: Path) -> bool:
         return any(
-            part.endswith('_converted')
-            or part in {'_stitched_subtasks', '_subtask_video_concat'}
+            part.startswith('.')
+            or part.endswith('_converted')
+            or part in {
+                '_stitched_subtasks',
+                '_subtask_video_concat',
+                'camera_info',
+                'meshes',
+                'videos',
+            }
             for part in path.parts
         )
 
@@ -1027,7 +1040,9 @@ class Mp4ConversionWorker:
                 f"full_{info.get('full_episode_index', 0)}_"
                 f"subtask_{info.get('subtask_index', 0)}"
             )
-        return str(info.get('episode_index') or episode_dir.name)
+        if info.get('episode_index') is not None:
+            return str(info.get('episode_index'))
+        return str(episode_dir.name)
 
     @staticmethod
     def _converted_dir_name(episode_dir: Path) -> str:
@@ -1125,6 +1140,7 @@ class Mp4ConversionWorker:
 
         from cyclo_data.converter.base_converter import (
             RosbagToLerobotConverterBase,
+            _active_conversion_workers,
             _conversion_worker_init,
             _convert_rosbag_worker,
             _resolve_conversion_worker_count,
@@ -1169,31 +1185,32 @@ class Mp4ConversionWorker:
         logger.info(
             f'Starting shared LeRobot parsing with {max_workers} workers'
         )
-        with ProcessPoolExecutor(
-            max_workers=max_workers,
-            initializer=_conversion_worker_init,
-        ) as executor:
-            futures = {}
-            for idx, bag_path in enumerate(bag_paths):
-                future = executor.submit(
-                    _convert_rosbag_worker,
-                    str(bag_path), idx, config_dict,
-                )
-                futures[future] = idx
+        with _active_conversion_workers(max_workers):
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_conversion_worker_init,
+            ) as executor:
+                futures = {}
+                for idx, bag_path in enumerate(bag_paths):
+                    future = executor.submit(
+                        _convert_rosbag_worker,
+                        str(bag_path), idx, config_dict,
+                    )
+                    futures[future] = idx
 
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    episode_index, episode_data = future.result()
-                    if episode_data is not None:
-                        episodes_data.append(episode_data)
-                        logger.info(
-                            f'Episode {episode_index} parsed successfully'
-                        )
-                    else:
-                        logger.warning(f'Episode {idx} returned no data')
-                except Exception as e:
-                    logger.error(f'Error parsing episode {idx}: {e}')
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        episode_index, episode_data = future.result()
+                        if episode_data is not None:
+                            episodes_data.append(episode_data)
+                            logger.info(
+                                f'Episode {episode_index} parsed successfully'
+                            )
+                        else:
+                            logger.warning(f'Episode {idx} returned no data')
+                    except Exception as e:
+                        logger.error(f'Error parsing episode {idx}: {e}')
 
         episodes_data.sort(key=lambda ep: ep.episode_index)
         return episodes_data, parser

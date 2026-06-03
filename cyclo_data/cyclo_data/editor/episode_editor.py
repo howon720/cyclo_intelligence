@@ -133,13 +133,51 @@ def _list_episode_dirs(task_dir: Path) -> List[Path]:
 
 
 def _patch_episode_index(episode_dir: Path, new_index: int) -> None:
-    """Update episode_info.json::episode_index in place."""
+    """Update episode_info.json fields that carry the episode index."""
     info_path = episode_dir / 'episode_info.json'
     if not info_path.exists():
         return
     info = FileIO.read_json(info_path, default={}) or {}
     info['episode_index'] = new_index
+
+    video_segments = info.get('video_segments')
+    if isinstance(video_segments, list):
+        for segment in video_segments:
+            if not isinstance(segment, dict):
+                continue
+            if 'mcap' in segment:
+                segment['mcap'] = _renumber_indexed_path(segment['mcap'], new_index)
+            if 'video_dir' in segment:
+                segment['video_dir'] = _renumber_indexed_path(
+                    segment['video_dir'], new_index
+                )
+
     FileIO.write_json(info_path, info)
+
+
+def _renumber_indexed_name(name, new_index: int):
+    if not isinstance(name, str):
+        return name
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    if '_' not in stem:
+        return name
+    prefix, _, rest = stem.partition('_')
+    try:
+        int(prefix)
+    except ValueError:
+        return name
+    return f'{new_index}_{rest}{suffix}'
+
+
+def _renumber_indexed_path(value, new_index: int):
+    if not isinstance(value, str):
+        return value
+    path = Path(value)
+    new_name = _renumber_indexed_name(path.name, new_index)
+    if new_name == path.name:
+        return value
+    return str(path.with_name(new_name))
 
 
 def _rename_mcap_files(episode_dir: Path, new_index: int) -> None:
@@ -149,13 +187,31 @@ def _rename_mcap_files(episode_dir: Path, new_index: int) -> None:
     handle the general split case (``_0``, ``_1``, ...) defensively.
     """
     for mcap in list(episode_dir.glob('*.mcap')):
-        stem = mcap.stem  # e.g. "3_0"
-        if '_' not in stem:
+        new_name = _renumber_indexed_name(mcap.name, new_index)
+        if new_name == mcap.name:
             continue
-        _, _, suffix = stem.partition('_')
-        new_name = f'{new_index}_{suffix}{mcap.suffix}'
-        if new_name != mcap.name:
-            mcap.rename(episode_dir / new_name)
+        mcap.rename(episode_dir / new_name)
+
+
+def _rename_video_segment_dirs(episode_dir: Path, new_index: int) -> None:
+    """Rename ``videos/<old>_<n>/`` segment dirs to ``videos/<new>_<n>/``."""
+    videos_dir = episode_dir / 'videos'
+    if not videos_dir.is_dir():
+        return
+
+    for segment_dir in list(videos_dir.iterdir()):
+        if not segment_dir.is_dir():
+            continue
+        new_name = _renumber_indexed_name(segment_dir.name, new_index)
+        if new_name == segment_dir.name:
+            continue
+        target = videos_dir / new_name
+        if target.exists():
+            raise FileExistsError(
+                f"Cannot rename segment directory to {new_name} "
+                f"because it already exists."
+            )
+        segment_dir.rename(target)
 
 
 def _patch_metadata_paths(episode_dir: Path, new_index: int) -> None:
@@ -182,18 +238,7 @@ def _patch_metadata_paths(episode_dir: Path, new_index: int) -> None:
         return
 
     def _patched(name):
-        if not isinstance(name, str):
-            return name
-        p = Path(name)
-        stem = p.stem
-        if '_' not in stem:
-            return name
-        prefix, _, suffix = stem.partition('_')
-        try:
-            int(prefix)
-        except ValueError:
-            return name
-        return f'{new_index}_{suffix}{p.suffix}'
+        return _renumber_indexed_path(name, new_index)
 
     rel = info.get('relative_file_paths')
     if isinstance(rel, list):
@@ -297,6 +342,7 @@ class DataEditor:
                     else:
                         shutil.copytree(str(episode), str(dest))
                     _rename_mcap_files(dest, new_index)
+                    _rename_video_segment_dirs(dest, new_index)
                     _patch_metadata_paths(dest, new_index)
                     _patch_episode_index(dest, new_index)
                     self._log(
@@ -459,6 +505,7 @@ class DataEditor:
             final = task_dir / str(new_index)
             tmp.rename(final)
             _rename_mcap_files(final, new_index)
+            _rename_video_segment_dirs(final, new_index)
             _patch_metadata_paths(final, new_index)
             _patch_episode_index(final, new_index)
             self._log(f'Compacted episode -> {final}')

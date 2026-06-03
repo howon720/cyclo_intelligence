@@ -142,7 +142,9 @@ class BagReader:
                     if decoded_msg is not None:
                         yield channel.topic, decoded_msg, timestamp_sec
 
-    def read_raw_messages(self) -> Iterator[Tuple[str, bytes, float, str]]:
+    def read_raw_messages(
+        self, topic_filter: Optional[List[str]] = None
+    ) -> Iterator[Tuple[str, bytes, float, str]]:
         """
         Read raw (serialized) messages from the bag file.
 
@@ -153,10 +155,16 @@ class BagReader:
             self._log_error("MCAP file not opened. Call open() first.")
             return
 
+        topic_set = set(topic_filter) if topic_filter else None
+
         for mcap_file in self._mcap_files:
             with open(mcap_file, 'rb') as f:
                 reader = make_reader(f)
-                for schema, channel, message in reader.iter_messages():
+                for schema, channel, message in reader.iter_messages(
+                    topics=topic_filter
+                ):
+                    if topic_set and channel.topic not in topic_set:
+                        continue
                     timestamp_sec = message.log_time / 1e9
                     topic_type = self._topic_type_map.get(channel.topic, "")
                     yield channel.topic, message.data, timestamp_sec, topic_type
