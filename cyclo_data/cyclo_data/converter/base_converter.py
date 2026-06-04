@@ -34,6 +34,7 @@ import shutil  # noqa: F401  (re-exported transitively for legacy callers)
 import struct
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,10 +76,10 @@ _CONVERSION_WORKER_NICE_ENV = "CYCLO_CONVERSION_WORKER_NICE"
 _DEFAULT_VIDEO_SYNC_TOTAL_WORKERS = 6
 _VIDEO_SYNC_CLEAN_CACHE_ENV = "CYCLO_VIDEO_SYNC_CLEAN_CACHE"
 _EXTRACT_CACHE_DISABLE_ENV = "CYCLO_EXTRACT_CACHE_DISABLE"
-_EXTRACT_CACHE_VERSION = 1
+_EXTRACT_CACHE_VERSION = 2
 _RAW_CDR_EXTRACT_DISABLE_ENV = "CYCLO_EXTRACT_DISABLE_RAW_CDR"
 _PREPARED_EPISODE_CACHE_DISABLE_ENV = "CYCLO_PREPARED_EPISODE_CACHE_DISABLE"
-_PREPARED_EPISODE_CACHE_VERSION = 1
+_PREPARED_EPISODE_CACHE_VERSION = 2
 _VIDEO_COPY_MODE_ENV = "CYCLO_VIDEO_COPY_MODE"
 _VIDEO_STATS_SAMPLES_ENV = "CYCLO_VIDEO_STATS_SAMPLES"
 _CONVERTER_INFO_LOGS_ENV = "CYCLO_CONVERTER_INFO_LOGS"
@@ -464,6 +465,8 @@ class RosbagToLerobotConverterBase:
         self._video_streams_probe_cache: Dict[
             Tuple[str, int, int], Optional[Dict[str, Any]]
         ] = {}
+        self._frame_reuse_reports: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        self._frame_reuse_lock = threading.Lock()
 
         # Load robot config — caller's explicit path wins, otherwise
         # auto-resolve via the schema (which searches the standard
@@ -515,6 +518,164 @@ class RosbagToLerobotConverterBase:
             self.logger.warning(msg)
         else:
             print(f"[WARNING] {msg}")
+
+    def _reset_frame_reuse_reports(self) -> None:
+        with self._frame_reuse_lock:
+            self._frame_reuse_reports = {}
+
+    def _remember_frame_reuse_report(
+        self,
+        report: Optional[Dict[str, Any]],
+    ) -> None:
+        if not report:
+            return
+        key = (int(report["episode_index"]), str(report["camera"]))
+        with self._frame_reuse_lock:
+            self._frame_reuse_reports[key] = report
+
+    def _record_frame_reuse_report(
+        self,
+        *,
+        episode: EpisodeData,
+        camera_name: str,
+        indices: np.ndarray,
+        grid_ns: np.ndarray,
+        frame_timestamps: Any,
+    ) -> None:
+        from cyclo_data.reader.frame_timestamps import build_frame_reuse_report
+
+        report = build_frame_reuse_report(
+            indices,
+            grid_ns,
+            frame_timestamps,
+            episode_index=int(episode.episode_index),
+            camera=camera_name,
+            fps=int(self.config.fps),
+            time_source="header",
+        )
+        self._remember_frame_reuse_report(report)
+
+    def _record_frame_reuse_for_video(
+        self,
+        episode: EpisodeData,
+        camera_name: str,
+        video_path: Path,
+    ) -> None:
+        if not episode.grid_log_times_sec:
+            return
+        sidecar = Path(video_path).parent / f"{camera_name}_timestamps.parquet"
+        if not sidecar.exists():
+            return
+        try:
+            from cyclo_data.reader.frame_timestamps import load_frame_timestamps
+
+            frame_timestamps = load_frame_timestamps(sidecar, camera_name)
+            grid_ns = (
+                np.asarray(
+                    episode.grid_log_times_sec[: int(episode.length)],
+                    dtype=np.float64,
+                )
+                * 1_000_000_000
+            ).astype(np.int64)
+            indices = frame_timestamps.map_to_grid(grid_ns, time_source="header")
+            self._record_frame_reuse_report(
+                episode=episode,
+                camera_name=camera_name,
+                indices=indices,
+                grid_ns=grid_ns,
+                frame_timestamps=frame_timestamps,
+            )
+        except Exception as exc:  # noqa: BLE001 - metadata must not break conversion
+            self._log_warning(
+                f"{camera_name}: failed to build frame reuse report for "
+                f"episode {int(episode.episode_index)} ({exc!r})"
+            )
+
+    def _write_frame_reuse_metadata(self, output_dir: Path) -> None:
+        path = Path(output_dir) / "meta" / "frame_reuse.parquet"
+        legacy_paths = [
+            Path(output_dir) / "meta" / "frame_reuse.jsonl",
+            Path(output_dir) / "meta" / "frame_reuse.json.gz",
+        ]
+        with self._frame_reuse_lock:
+            reports = sorted(
+                self._frame_reuse_reports.values(),
+                key=lambda item: (int(item["episode_index"]), str(item["camera"])),
+            )
+        rows: List[Dict[str, Any]] = []
+        for report in reports:
+            episode_index = int(report["episode_index"])
+            camera = str(report["camera"])
+            for run in report.get("runs") or []:
+                for target_frame_index in range(
+                    int(run["target_start_frame"]),
+                    int(run["target_end_frame"]) + 1,
+                ):
+                    rows.append({
+                        "episode_index": int(episode_index),
+                        "camera": camera,
+                        "target_frame_index": int(target_frame_index),
+                    })
+        rows.sort(
+            key=lambda item: (
+                int(item["episode_index"]),
+                str(item["camera"]),
+                int(item["target_frame_index"]),
+            )
+        )
+
+        if not rows:
+            path.unlink(missing_ok=True)
+            for legacy_path in legacy_paths:
+                legacy_path.unlink(missing_ok=True)
+            return
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                prefix=path.stem + ".",
+                suffix=".tmp",
+                dir=str(path.parent),
+                delete=False,
+            ) as fh:
+                tmp_path = Path(fh.name)
+            table = pa.table(
+                {
+                    "episode_index": [
+                        int(row["episode_index"]) for row in rows
+                    ],
+                    "camera": [str(row["camera"]) for row in rows],
+                    "target_frame_index": [
+                        int(row["target_frame_index"]) for row in rows
+                    ],
+                },
+                schema=pa.schema([
+                    ("episode_index", pa.int32()),
+                    ("camera", pa.string()),
+                    ("target_frame_index", pa.int32()),
+                ]),
+            )
+            compression = None
+            for candidate in ("zstd", "snappy"):
+                if pa.Codec.is_available(candidate):
+                    compression = candidate
+                    break
+            pq.write_table(
+                table,
+                tmp_path,
+                compression=compression,
+                use_dictionary=["camera"],
+            )
+            os.replace(tmp_path, path)
+            for legacy_path in legacy_paths:
+                legacy_path.unlink(missing_ok=True)
+            self._log_info(f"Wrote frame reuse metadata: {path}")
+        except Exception:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+            raise
 
     def _load_robot_config_file(self, config_path: str):
         """Load robot config from YAML file (e.g., ffw_sg2_rev1_config.yaml).
@@ -823,9 +984,13 @@ class RosbagToLerobotConverterBase:
             # under ``videos/<cam>_timestamps.parquet``. Build a synced MP4
             # per camera so that frame N == grid step N (LeRobot's video
             # reader assumes 1:1 with the parquet rows). For each grid
-            # step we pick the most recent MP4 frame with ``recv_ns`` <=
-            # ``grid_log_time``; both are subscriber-side clocks so they
-            # share an origin.
+            # step we pick the most recent MP4 frame with
+            # ``header_stamp_ns`` <= ``grid_log_time``. Camera sync must use
+            # publisher/header time so network or rosbridge delays do not
+            # shift images. The joint extraction step builds the grid from
+            # observation.state header.stamp when available, while action
+            # topics intentionally stay on MCAP/log-time because command
+            # messages often have no publisher header.
             episode_data = self._sync_videos_to_grid(bag_path, episode_data)
 
             # Legacy fallback: when no sidecars exist (recordings made by
@@ -2291,6 +2456,13 @@ class RosbagToLerobotConverterBase:
         if not topic_plan:
             return None
 
+        if any(role == "state" for role, _, _ in topic_plan.values()):
+            self._log_info(
+                "Raw CDR extraction skipped because observation.state uses "
+                "header.stamp timestamps; using ROS decoder instead"
+            )
+            return None
+
         position_layout_cache: Dict[str, Tuple[int, int, List[str]]] = {}
         exclude_windows = [
             (
@@ -2395,6 +2567,34 @@ class RosbagToLerobotConverterBase:
             action_joint_names_by_topic,
         )
 
+    @staticmethod
+    def _message_header_timestamp_sec(
+        msg: Any,
+        fallback_timestamp_sec: float,
+    ) -> Tuple[float, bool]:
+        """Return ``header.stamp`` seconds when present, else MCAP log time."""
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if stamp is None:
+            return fallback_timestamp_sec, False
+
+        sec = int(getattr(stamp, "sec", 0) or 0)
+        nanosec = int(getattr(stamp, "nanosec", 0) or 0)
+        if sec == 0 and nanosec == 0:
+            return fallback_timestamp_sec, False
+        return sec + nanosec / 1e9, True
+
+    def _timestamp_is_selected(
+        self,
+        timestamp_sec: float,
+        trim_start: float,
+        trim_end: float,
+        exclude_regions: List[Dict],
+    ) -> bool:
+        if timestamp_sec < trim_start or timestamp_sec > trim_end:
+            return False
+        return not self._is_in_exclude_region(timestamp_sec, exclude_regions)
+
     def _extract_joint_data(
         self,
         bag_path: Path,
@@ -2474,15 +2674,8 @@ class RosbagToLerobotConverterBase:
                 action_joint_names_by_topic,
             ) = raw_collected
         else:
+            state_log_time_fallback_topics: set[str] = set()
             for topic, msg, timestamp in reader.read_messages(topic_filter=topics_to_read):
-                # Skip if outside trim bounds
-                if timestamp < trim_start or timestamp > trim_end:
-                    continue
-
-                # Skip if in exclude region
-                if self._is_in_exclude_region(timestamp, exclude_regions):
-                    continue
-
                 topic_type = topic_types.get(topic, "")
 
                 # Process state topics
@@ -2509,8 +2702,20 @@ class RosbagToLerobotConverterBase:
                             )
 
                     if positions is not None:
+                        sample_timestamp, used_header_stamp = (
+                            self._message_header_timestamp_sec(msg, timestamp)
+                        )
+                        if not used_header_stamp:
+                            state_log_time_fallback_topics.add(topic)
+                        if not self._timestamp_is_selected(
+                            sample_timestamp,
+                            trim_start,
+                            trim_end,
+                            exclude_regions,
+                        ):
+                            continue
                         state_messages_by_topic.setdefault(topic, []).append(
-                            (timestamp, positions)
+                            (sample_timestamp, positions)
                         )
                         if topic not in state_joint_names_by_topic and joint_names:
                             state_joint_names_by_topic[topic] = joint_names
@@ -2535,11 +2740,24 @@ class RosbagToLerobotConverterBase:
                             joint_names = self._extract_joint_names(msg)
 
                     if positions is not None:
+                        if not self._timestamp_is_selected(
+                            timestamp,
+                            trim_start,
+                            trim_end,
+                            exclude_regions,
+                        ):
+                            continue
                         action_messages_by_topic.setdefault(topic, []).append(
                             (timestamp, positions)
                         )
                         if topic not in action_joint_names_by_topic and joint_names:
                             action_joint_names_by_topic[topic] = joint_names
+            if state_log_time_fallback_topics:
+                topics = ", ".join(sorted(state_log_time_fallback_topics))
+                self._log_warning(
+                    "State topic(s) without valid header.stamp used MCAP "
+                    f"log_time fallback: {topics}"
+                )
 
         if not state_messages_by_topic:
             self._log_warning(f"No state messages found in {bag_path}")
@@ -3644,7 +3862,14 @@ class RosbagToLerobotConverterBase:
                 self._log_warning(f"{cam_name}: empty sidecar; skipping sync")
                 synced[cam_name] = src_path
                 continue
-            indices = ft.map_to_grid(grid_ns)
+            indices = ft.map_to_grid(grid_ns, time_source="header")
+            self._record_frame_reuse_report(
+                episode=episode,
+                camera_name=cam_name,
+                indices=indices,
+                grid_ns=grid_ns,
+                frame_timestamps=ft,
+            )
             sync_output_dir = self._video_sync_output_dir(videos_dir)
             out_path = sync_output_dir / f"{cam_name}_synced.mp4"
             rotation_extra = int(ui_rotations.get(cam_name, 0) or 0)

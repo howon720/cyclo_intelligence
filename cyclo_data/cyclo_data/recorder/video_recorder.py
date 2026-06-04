@@ -17,8 +17,9 @@ executor never blocks on pipe write/backpressure.
 A Parquet sidecar (``videos/<cam>_timestamps.parquet``) tracks the
 ``header.stamp`` (publisher clock) and ``recv`` (subscriber clock) of
 every frame written. LeRobot resampling maps the synced grid to MP4
-frame indices using ``recv_ns`` by default, matching MCAP ``log_time``
-semantics; ``header_stamp_ns`` stays available for diagnostics.
+frame indices using ``header_stamp_ns`` by default so transport delay
+does not shift image selection; ``recv_ns`` stays available for
+diagnostics and legacy fallback.
 
 Subscriptions are created once at ``__init__`` (= when the robot_type
 is first selected) and persist until ``close()``. Episode boundaries

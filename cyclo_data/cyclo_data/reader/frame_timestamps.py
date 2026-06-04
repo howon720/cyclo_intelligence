@@ -12,13 +12,16 @@ VideoRecorder writes one Parquet per camera with columns:
 ``frame_index`` (int32), ``header_stamp_ns`` (int64), ``recv_ns`` (int64).
 This module loads that file and produces helpers to map a synced grid
 of target timestamps (from LeRobot resampling) to MP4 frame indices.
+Camera synchronization uses ``header_stamp_ns`` by default so transport
+delay does not shift the chosen image frame; ``recv_ns`` is only a
+fallback for malformed/legacy sidecars with no header stamps.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -37,10 +40,31 @@ class FrameTimestamps:
     def num_frames(self) -> int:
         return int(self.frame_index.shape[0])
 
+    def effective_time_source(self, time_source: str = "header") -> str:
+        """Return the actual timestamp column used for grid alignment."""
+        if time_source == "header":
+            if self.header_stamp_ns.size and np.any(self.header_stamp_ns > 0):
+                return "header"
+            return "recv"
+        if time_source == "recv":
+            return "recv"
+        raise ValueError(
+            f"time_source must be 'header' or 'recv', got {time_source!r}"
+        )
+
+    def stamp_ns_for_grid(self, time_source: str = "header") -> np.ndarray:
+        """Return timestamp column used to align camera frames to a grid."""
+        effective = self.effective_time_source(time_source)
+        if effective == "header":
+            return self.header_stamp_ns
+        if effective == "recv":
+            return self.recv_ns
+        raise AssertionError(f"unexpected time_source: {effective!r}")
+
     def map_to_grid(
         self,
         grid_ns: Iterable[int],
-        time_source: str = "recv",
+        time_source: str = "header",
     ) -> np.ndarray:
         """Return MP4 frame indices aligned to a target timestamp grid.
 
@@ -51,19 +75,12 @@ class FrameTimestamps:
 
         Args:
             grid_ns: target grid timestamps in nanoseconds.
-            time_source: ``"recv"`` (subscriber clock, default — matches
-                MCAP ``log_time`` semantics) or ``"header"`` (publisher
-                clock from ``msg.header.stamp``).
+            time_source: ``"header"`` (publisher clock from
+                ``msg.header.stamp``, default for camera alignment) or
+                ``"recv"`` (subscriber clock, fallback/debug path).
         """
         grid = np.asarray(grid_ns, dtype=np.int64)
-        if time_source == "recv":
-            stamps = self.recv_ns
-        elif time_source == "header":
-            stamps = self.header_stamp_ns
-        else:
-            raise ValueError(
-                f"time_source must be 'recv' or 'header', got {time_source!r}"
-            )
+        stamps = self.stamp_ns_for_grid(time_source)
         if stamps.size == 0:
             return np.zeros(grid.shape, dtype=np.int64)
         # The sidecar guarantees frame_index monotonicity but not stamp
@@ -81,6 +98,108 @@ class FrameTimestamps:
         pos = np.searchsorted(sorted_stamps, grid, side="right") - 1
         np.clip(pos, 0, sorted_stamps.size - 1, out=pos)
         return sorted_indices[pos].astype(np.int64)
+
+
+def _optional_stamp(stamps: np.ndarray, index: int, *, positive_only: bool) -> Optional[int]:
+    if index < 0 or index >= int(stamps.size):
+        return None
+    value = int(stamps[index])
+    if positive_only and value <= 0:
+        return None
+    return value
+
+
+def build_frame_reuse_report(
+    indices: Iterable[int],
+    grid_ns: Iterable[int],
+    frame_timestamps: FrameTimestamps,
+    *,
+    episode_index: int,
+    camera: str,
+    fps: int,
+    time_source: str = "header",
+) -> Dict[str, Any]:
+    """Build compressed metadata for target frames that reused a source frame."""
+    index_array = np.asarray(indices, dtype=np.int64)
+    grid = np.asarray(grid_ns, dtype=np.int64)
+    total_target_frames = int(index_array.size)
+    total_source_frames = int(frame_timestamps.num_frames)
+    effective_time_source = frame_timestamps.effective_time_source(time_source)
+    stamps = frame_timestamps.stamp_ns_for_grid(time_source)
+
+    grid_for_count = grid[:total_target_frames]
+    clamped_before_first_count = 0
+    if stamps.size and grid_for_count.size:
+        clamped_before_first_count = int(
+            np.count_nonzero(grid_for_count < int(np.min(stamps)))
+        )
+
+    runs: List[Dict[str, Any]] = []
+    reused_target_frames = 0
+    run_start: Optional[int] = None
+    run_source: Optional[int] = None
+
+    def finish_run(end_frame: int) -> None:
+        nonlocal run_start, run_source, reused_target_frames
+        if run_start is None or run_source is None:
+            return
+        source_pos = int(run_source)
+        source_frame_index = source_pos
+        if 0 <= source_pos < int(frame_timestamps.frame_index.size):
+            source_frame_index = int(frame_timestamps.frame_index[source_pos])
+        count = int(end_frame - run_start + 1)
+        reused_target_frames += count
+        runs.append({
+            "target_start_frame": int(run_start),
+            "target_end_frame": int(end_frame),
+            "count": count,
+            "source_frame_index": source_frame_index,
+            "source_header_stamp_ns": _optional_stamp(
+                frame_timestamps.header_stamp_ns,
+                source_pos,
+                positive_only=True,
+            ),
+            "source_recv_ns": _optional_stamp(
+                frame_timestamps.recv_ns,
+                source_pos,
+                positive_only=False,
+            ),
+        })
+        run_start = None
+        run_source = None
+
+    for target_frame in range(1, total_target_frames):
+        source_pos = int(index_array[target_frame])
+        reused = source_pos == int(index_array[target_frame - 1])
+        if reused:
+            if run_start is None:
+                run_start = target_frame
+                run_source = source_pos
+            elif run_source != source_pos:
+                finish_run(target_frame - 1)
+                run_start = target_frame
+                run_source = source_pos
+        elif run_start is not None:
+            finish_run(target_frame - 1)
+    if run_start is not None:
+        finish_run(total_target_frames - 1)
+
+    reuse_ratio = (
+        float(reused_target_frames) / float(total_target_frames)
+        if total_target_frames > 0 else 0.0
+    )
+    return {
+        "episode_index": int(episode_index),
+        "camera": str(camera),
+        "target_fps": int(fps),
+        "time_source": effective_time_source,
+        "total_target_frames": total_target_frames,
+        "total_source_frames": total_source_frames,
+        "reused_target_frames": int(reused_target_frames),
+        "reuse_ratio": reuse_ratio,
+        "clamped_before_first_count": int(clamped_before_first_count),
+        "runs": runs,
+    }
 
 
 def load_frame_timestamps(parquet_path: Path, camera: str) -> FrameTimestamps:

@@ -953,7 +953,7 @@ class TestVideoSyncWorkerPolicy(unittest.TestCase):
         )
         self.assertEqual(splice_sizes, [frame_size * 3, frame_size])
 
-    def test_v21_raw_video_grid_mapping_uses_recv_timestamp_order(self):
+    def test_v21_raw_video_grid_mapping_uses_header_timestamp_order(self):
         import pyarrow as pa
         import pyarrow.parquet as pq
 
@@ -992,7 +992,136 @@ class TestVideoSyncWorkerPolicy(unittest.TestCase):
             )
 
         self.assertEqual(source_count, 3)
-        self.assertEqual(indices.tolist(), [1, 2, 0])
+        self.assertEqual(indices.tolist(), [0, 1, 2])
+
+    def test_frame_reuse_report_compresses_duplicate_runs(self):
+        from cyclo_data.reader.frame_timestamps import (
+            FrameTimestamps,
+            build_frame_reuse_report,
+        )
+
+        ft = FrameTimestamps(
+            camera="cam",
+            frame_index=np.array([0, 1, 2, 3, 4, 5], dtype=np.int32),
+            header_stamp_ns=np.array([1, 10, 20, 30, 40, 50], dtype=np.int64),
+            recv_ns=np.array([101, 110, 120, 130, 140, 150], dtype=np.int64),
+        )
+
+        report = build_frame_reuse_report(
+            np.array([0, 0, 1, 2, 2, 2, 5], dtype=np.int64),
+            np.array([1, 5, 10, 20, 25, 26, 50], dtype=np.int64),
+            ft,
+            episode_index=7,
+            camera="cam",
+            fps=15,
+        )
+
+        self.assertEqual(report["episode_index"], 7)
+        self.assertEqual(report["camera"], "cam")
+        self.assertEqual(report["time_source"], "header")
+        self.assertEqual(report["reused_target_frames"], 3)
+        self.assertEqual(report["clamped_before_first_count"], 0)
+        self.assertEqual(
+            report["runs"],
+            [
+                {
+                    "target_start_frame": 1,
+                    "target_end_frame": 1,
+                    "count": 1,
+                    "source_frame_index": 0,
+                    "source_header_stamp_ns": 1,
+                    "source_recv_ns": 101,
+                },
+                {
+                    "target_start_frame": 4,
+                    "target_end_frame": 5,
+                    "count": 2,
+                    "source_frame_index": 2,
+                    "source_header_stamp_ns": 20,
+                    "source_recv_ns": 120,
+                },
+            ],
+        )
+
+    def test_frame_reuse_report_marks_recv_fallback_and_initial_clamp(self):
+        from cyclo_data.reader.frame_timestamps import (
+            FrameTimestamps,
+            build_frame_reuse_report,
+        )
+
+        ft = FrameTimestamps(
+            camera="cam",
+            frame_index=np.array([0, 1], dtype=np.int32),
+            header_stamp_ns=np.array([0, 0], dtype=np.int64),
+            recv_ns=np.array([100, 200], dtype=np.int64),
+        )
+        grid_ns = np.array([50, 100, 200], dtype=np.int64)
+        indices = ft.map_to_grid(grid_ns, time_source="header")
+
+        report = build_frame_reuse_report(
+            indices,
+            grid_ns,
+            ft,
+            episode_index=0,
+            camera="cam",
+            fps=15,
+        )
+
+        self.assertEqual(indices.tolist(), [0, 0, 1])
+        self.assertEqual(report["time_source"], "recv")
+        self.assertEqual(report["clamped_before_first_count"], 1)
+        self.assertEqual(report["runs"][0]["source_header_stamp_ns"], None)
+
+    def test_frame_reuse_metadata_writer_overwrites_sorted_reports(self):
+        from cyclo_data.reader.frame_timestamps import FrameTimestamps
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            converter = RosbagToLerobotConverter(
+                ConversionConfig(
+                    repo_id="test/dataset",
+                    output_dir=tmp,
+                    fps=15,
+                    use_videos=True,
+                )
+            )
+            ft = FrameTimestamps(
+                camera="cam",
+                frame_index=np.array([0, 1], dtype=np.int32),
+                header_stamp_ns=np.array([1, 2], dtype=np.int64),
+                recv_ns=np.array([1, 2], dtype=np.int64),
+            )
+            episode = EpisodeData(
+                episode_index=2,
+                length=3,
+                grid_log_times_sec=[0.000000001, 0.000000001, 0.000000002],
+            )
+            converter._record_frame_reuse_report(
+                episode=episode,
+                camera_name="cam",
+                indices=np.array([0, 0, 1], dtype=np.int64),
+                grid_ns=np.array([1, 1, 2], dtype=np.int64),
+                frame_timestamps=ft,
+            )
+            import pyarrow.parquet as pq
+
+            reuse_path = tmp / "meta" / "frame_reuse.parquet"
+            legacy_jsonl_path = tmp / "meta" / "frame_reuse.jsonl"
+            legacy_gzip_path = tmp / "meta" / "frame_reuse.json.gz"
+            reuse_path.parent.mkdir(parents=True)
+            legacy_jsonl_path.write_text("old\n", encoding="utf-8")
+            legacy_gzip_path.write_bytes(b"old\n")
+
+            converter._write_frame_reuse_metadata(tmp)
+
+            rows = pq.read_table(reuse_path).to_pylist()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["episode_index"], 2)
+            self.assertEqual(rows[0]["camera"], "cam")
+            self.assertEqual(rows[0]["target_frame_index"], 1)
+            self.assertNotIn("source_frame_index", rows[0])
+            self.assertFalse(legacy_jsonl_path.exists())
+            self.assertFalse(legacy_gzip_path.exists())
 
     def test_conversion_worker_max_profile_caps_at_sixteen(self):
         with patch.dict(
@@ -2446,6 +2575,68 @@ class TestRosbagToLerobotConverter(unittest.TestCase):
             "/robot/arm_left_follower/joint_states", topic_types))
         self.assertFalse(self.converter._is_action_topic("/odom", topic_types))
 
+    def test_extract_joint_data_uses_header_time_for_state_only(self):
+        state_topic = "/robot/arm_left_follower/joint_states"
+        action_topic = "/robot/arm_left_leader/joint_states"
+        self.converter.config.state_topics = [state_topic]
+        self.converter.config.action_topics = [action_topic]
+
+        def stamp(sec: int, nanosec: int = 0):
+            return types.SimpleNamespace(sec=sec, nanosec=nanosec)
+
+        def joint_msg(value: float, header_stamp):
+            return types.SimpleNamespace(
+                header=types.SimpleNamespace(stamp=header_stamp),
+                name=["joint_a"],
+                position=[value],
+            )
+
+        messages = [
+            (state_topic, joint_msg(1.0, stamp(1, 100_000_000)), 100.0),
+            (action_topic, joint_msg(2.0, stamp(9, 900_000_000)), 100.1),
+            (state_topic, joint_msg(3.0, stamp(1, 200_000_000)), 100.2),
+            (action_topic, joint_msg(4.0, stamp(9, 800_000_000)), 100.3),
+        ]
+
+        fake_reader = MagicMock()
+        fake_reader.open.return_value = True
+        fake_reader.get_topic_types.return_value = {
+            state_topic: "sensor_msgs/msg/JointState",
+            action_topic: "sensor_msgs/msg/JointState",
+        }
+        fake_reader.read_messages.return_value = iter(messages)
+
+        captured = {}
+
+        def fake_resample(episode, state_messages, action_messages, trim_start):
+            captured["state_times"] = [round(t, 3) for t, _ in state_messages]
+            captured["action_times"] = [round(t, 3) for t, _ in action_messages]
+            episode.length = 1
+            return episode, {}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bag = Path(tmpdir)
+            with patch.dict(os.environ, {"CYCLO_EXTRACT_CACHE_DISABLE": "1"}):
+                with patch(
+                    "cyclo_data.converter.base_converter.BagReader",
+                    return_value=fake_reader,
+                ):
+                    with patch.object(
+                        self.converter,
+                        "_resample_to_fps",
+                        side_effect=fake_resample,
+                    ):
+                        episode = self.converter._extract_joint_data(
+                            bag,
+                            episode_index=0,
+                            trim_points=None,
+                            exclude_regions=[],
+                        )
+
+        self.assertIsNotNone(episode)
+        self.assertEqual(captured["state_times"], [1.1, 1.2])
+        self.assertEqual(captured["action_times"], [100.1, 100.3])
+
     def test_merge_state_messages_multi_topic(self):
         state_msgs = {
             "/robot/arm_left_follower/joint_states": [
@@ -3883,7 +4074,7 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
                 self.converter._direct_aggregate_requires_output_validation()
             )
 
-    def test_grid_indices_for_raw_video_maps_recv_sidecar(self):
+    def test_grid_indices_for_raw_video_maps_header_sidecar(self):
         import pyarrow as pa
         import pyarrow.parquet as pq
 
@@ -3892,7 +4083,17 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
         video_path = video_dir / "cam_left_head.mp4"
         video_path.touch()
         pq.write_table(
-            pa.table({"recv_ns": [1_000_000_000, 2_000_000_000, 4_000_000_000]}),
+            pa.table({
+                "frame_index": pa.array([0, 1, 2], type=pa.int32()),
+                "header_stamp_ns": pa.array(
+                    [1_000_000_000, 2_000_000_000, 4_000_000_000],
+                    type=pa.int64(),
+                ),
+                "recv_ns": pa.array(
+                    [4_000_000_000, 1_000_000_000, 2_000_000_000],
+                    type=pa.int64(),
+                ),
+            }),
             video_dir / "cam_left_head_timestamps.parquet",
         )
         episode = EpisodeData(
@@ -3908,6 +4109,10 @@ class TestRosbagToLerobotV30VideoConcat(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(indices, np.array([0, 0, 0, 1, 1, 2, 2]))
+        report = self.converter._frame_reuse_reports[(0, "cam_left_head")]
+        self.assertEqual(report["time_source"], "header")
+        self.assertEqual(report["reused_target_frames"], 4)
+        self.assertEqual(report["clamped_before_first_count"], 1)
 
     def test_direct_video_aggregation_rejects_resize(self):
         self.converter.config.image_resize = (240, 320)

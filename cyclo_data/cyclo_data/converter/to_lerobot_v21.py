@@ -482,6 +482,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
                 pass
             stats = self._load_precomputed_video_stats(cache_video, camera_name)
             self._remember_direct_v21_video_stats(episode, camera_name, stats)
+            self._record_frame_reuse_for_video(episode, camera_name, video_path)
             self._log_info(
                 f"{camera_name}: reused source synced cache for episode "
                 f"{int(episode.episode_index)} ({copy_mode})"
@@ -589,24 +590,22 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         video_path: Path,
     ) -> Tuple[np.ndarray, int]:
         sidecar = Path(video_path).parent / f"{camera_name}_timestamps.parquet"
-        table = pq.read_table(sidecar, columns=["recv_ns"])
-        stamps = table.column("recv_ns").to_numpy().astype(np.int64, copy=False)
+        from cyclo_data.reader.frame_timestamps import load_frame_timestamps
+
+        ft = load_frame_timestamps(sidecar, camera_name)
         grid_ns = (
             np.asarray(episode.grid_log_times_sec, dtype=np.float64)
             * 1_000_000_000
         ).astype(np.int64)
-        if stamps.size == 0:
-            return np.zeros(grid_ns.shape, dtype=np.int64), 0
-        if stamps.size > 1 and not np.all(np.diff(stamps) >= 0):
-            order = np.argsort(stamps)
-            sorted_stamps = stamps[order]
-            sorted_indices = np.arange(stamps.size, dtype=np.int64)[order]
-        else:
-            sorted_stamps = stamps
-            sorted_indices = np.arange(stamps.size, dtype=np.int64)
-        pos = np.searchsorted(sorted_stamps, grid_ns, side="right") - 1
-        np.clip(pos, 0, sorted_stamps.size - 1, out=pos)
-        return sorted_indices[pos].astype(np.int64, copy=False), int(stamps.size)
+        indices = ft.map_to_grid(grid_ns, time_source="header")
+        self._record_frame_reuse_report(
+            episode=episode,
+            camera_name=camera_name,
+            indices=indices,
+            grid_ns=grid_ns,
+            frame_timestamps=ft,
+        )
+        return indices, int(ft.num_frames)
 
     def _pipe_selected_yuv420_frames(
         self,
@@ -1443,6 +1442,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             True if successful, False otherwise
         """
         self._log_info(f"Converting {len(bag_paths)} rosbags to LeRobot dataset")
+        self._reset_frame_reuse_reports()
 
         # Initialize output directory
         output_dir = Path(self.config.output_dir)
@@ -1599,6 +1599,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         if not episodes_data:
             self._log_error("No episodes were provided for LeRobot v2.1 writing")
             return False
+        self._reset_frame_reuse_reports()
         episodes_data = self.prepare_episodes_for_writing(episodes_data)
         if not episodes_data:
             self._log_error("No complete episodes remained after subtask stitching")
@@ -1983,6 +1984,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         self._write_info_json()
         self._write_tasks_jsonl()
         self._write_root_info_json()
+        self._write_frame_reuse_metadata(output_dir)
 
     def _write_episode(self, episode: EpisodeData):
         """Write a single episode's data files."""
@@ -2033,6 +2035,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         # resolutions). Operators who want a clean tree can wipe
         # ``<episode>/videos/*_synced.*`` after the dataset is final.
         for camera_name, src_video in episode.video_files.items():
+            self._record_frame_reuse_for_video(episode, camera_name, src_video)
             video_dir = video_chunk_dir / self._video_feature_key(camera_name)
             video_dir.mkdir(parents=True, exist_ok=True)
             dst_video = video_dir / f"{_v21_episode_stem(ep_idx)}.mp4"
