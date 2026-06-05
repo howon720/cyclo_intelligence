@@ -904,7 +904,7 @@ export default function BTManagerPage({ isActive = true }) {
 
       {/* React Flow Canvas */}
       <div className="flex-1 relative flex">
-        <BTNodePalette />
+        <BTNodePalette canUpdateCatalog={isBtNodeUp} />
         <div
           className="flex-1 relative"
           onDragOver={handleCanvasDragOver}
