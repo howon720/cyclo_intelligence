@@ -6,7 +6,8 @@ from setuptools import setup
 package_name = 'orchestrator'
 authors_info = [
     ('Dongyun Kim', 'kdy@robotis.com'),
-    ('Seongwoo Kim', 'kimsw@robotis.com')
+    ('Seongwoo Kim', 'kimsw@robotis.com'),
+    ('Taehyeong Kim', 'kth@robotis.com')
 ]
 authors = ', '.join(author for author, _ in authors_info)
 author_emails = ', '.join(email for _, email in authors_info)
@@ -51,7 +52,7 @@ packages = [
 
 setup(
     name=package_name,
-    version='0.1.11',
+    version='0.1.12',
     packages=packages,
     # Nested layout convention (D17): root namespace '' maps to current
     # directory. Avoids colcon-core's _symlinks_in_build veto on

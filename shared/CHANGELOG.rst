@@ -2,6 +2,10 @@
 Changelog for package shared
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.12 (2026-06-05)
+-------------------
+* None
+
 0.1.11 (2026-06-05)
 -------------------
 * None
@@ -29,7 +33,7 @@ Changelog for package shared
 0.1.5 (2026-05-26)
 ------------------
 * Renamed robot configuration camera keys to canonical ``cam_<side>_<part>`` names.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.4 (2026-05-22)
 ------------------
@@ -51,4 +55,4 @@ Changelog for package shared
 ------------------
 * Initial open-source release of shared Cyclo Intelligence utilities.
 * Added robot configuration assets, schema helpers, URDF assets, and common IO helpers shared by runtime packages.
-* Contributors: ROBOTIS
+* Contributors: Taehyeong Kim

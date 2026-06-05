@@ -1,12 +1,17 @@
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Changelog for package cyclo_data
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+0.1.12 (2026-06-05)
+-------------------
+* Restored Hugging Face dataset and model download defaults to workspace rosbag and LeRobot model paths.
+* Contributors: Seongwoo Kim
 
 0.1.11 (2026-06-05)
 -------------------
 * Preserved LeRobot camera frame reuse metadata across multi-subtask stitching so target frame indexes are reported in final episode coordinates.
 * Added legacy prepared episode cache handling for LeRobot conversions that restore cached episode objects without frame reuse report fields.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.10 (2026-06-04)
 -------------------
@@ -15,21 +20,21 @@ Changelog for package cyclo_data
 * Reworked camera recording to append JPEG payloads to raw MJPEG spools during capture and remux them to MP4 on STOP.
 * Split video and metadata recorder workers, preserved raw spools on remux or frame-count validation failures, and added recorder diagnostics/stat summaries.
 * Added a video diagnostics analysis CLI for callback delay, queue wait, raw write, metadata wait, and flush timing reports.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.9 (2026-06-02)
 ------------------
 * Improved LeRobot dataset conversion and merge handling for mixed subtask counts, segmented videos, and v3.0 video aggregation.
 * Simplified the LeRobot video sync path around the CPU H.264 backend and removed unused hardware encoder code.
 * Updated task information sync so SET_TASK_INFO refreshes recording metadata, save paths, and recording status immediately.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.8 (2026-06-01)
 ------------------
 * Optimized LeRobot conversion by syncing H.264 videos directly instead of materializing decoded PNG frames on disk.
 * Added source video cache reuse, fast metadata validation, and tuned worker scheduling for v2.1 and v3.0 exports.
 * Kept the default video backend on CPU ``libx264`` after Jetson and desktop benchmark comparisons.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.7 (2026-05-27)
 ------------------
@@ -39,7 +44,7 @@ Changelog for package cyclo_data
 ------------------
 * Added behavior tree XML save support to the data file server API.
 * Extended JSON error responses with structured details for tree-save conflicts.
-* Contributors: kimtaehyeong99, Seongoo
+* Contributors: Taehyeong Kim, Seongwoo Kim
 
 0.1.5 (2026-05-26)
 ------------------
@@ -49,7 +54,7 @@ Changelog for package cyclo_data
 * Aligned LeRobot v2.1 and v3.0 camera feature paths and conversion audit metadata with robot configuration keys.
 * Fixed episode discard handling so active and partially saved segmented episodes are removed cleanly.
 * Decoupled segmented episode archive from H.264 transcoding so long recordings can finish without blocking the service response.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.4 (2026-05-22)
 ------------------
@@ -61,7 +66,7 @@ Changelog for package cyclo_data
 * Fixed VideoRecorder MJPEG pipe finalization so the last real camera frame is preserved without muxing a fake gray trailer frame.
 * Removed ffmpeg ``+nobuffer`` from the recording pipe because it could drop the final MJPEG packet and leave MP4 frame counts one behind timestamp sidecars.
 * Added regression coverage for recorder trailer handling and raw video/sidecar frame-count parity.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.2 (2026-05-20)
 ------------------
@@ -75,7 +80,7 @@ Changelog for package cyclo_data
 * Simplified new recording episode_info.json metadata by removing unused recorder/transcoding bookkeeping fields.
 * Added regression tests for streaming video sync frame counts, duplicate frames, resize/rotation, fallback behavior, and cache invalidation.
 * Added regression tests for timestamp-based replay segment loading, legacy frame conversion, malformed segment skipping, and save behavior.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.1 (2026-05-15)
 ------------------
@@ -86,10 +91,10 @@ Changelog for package cyclo_data
 * Added output-adjacent temporary disk controls for video sync.
 * Corrected global statistics calculation and standard-deviation flooring for LeRobot normalization.
 * Added regression tests for recorder resources, video sync, and v3.0 aggregation.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.0 (2026-05-15)
 ------------------
 * Initial open-source release of the Cyclo Intelligence data package.
 * Added ROS 2 services and CLI tools for recording, conversion, dataset editing, visualization, and Hugging Face operations.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
