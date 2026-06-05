@@ -5,7 +5,7 @@
       <SendCommand name="LoadModel"
         command="LOAD"
         model="groot:n17"
-        policy_path="/policy_checkpoints/groot/test"
+        policy_path="/workspace/model/groot/your_repo_id"
         task_instruction="Place the paper cups in to the basket."
         inference_hz="15"
         control_hz="100"

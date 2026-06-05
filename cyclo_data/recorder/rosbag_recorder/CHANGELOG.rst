@@ -1,6 +1,10 @@
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Changelog for package rosbag_recorder
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+0.1.12 (2026-06-05)
+-------------------
+* None
 
 0.1.11 (2026-06-05)
 -------------------
@@ -50,4 +54,4 @@ Changelog for package rosbag_recorder
 ------------------
 * Initial open-source release of the Cyclo Intelligence rosbag recorder service.
 * Added ROS 2 services for preparing, starting, stopping, deleting, and finishing rosbag2 recordings.
-* Contributors: ROBOTIS
+* Contributors: Taehyeong Kim

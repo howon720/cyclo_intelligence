@@ -101,11 +101,16 @@ orchestrator/
 ## BT node lifecycle
 
 `BehaviorTreeNode` (`bt/bt_node.py`) runs as the `bt_node` executable.
-The normal bringup launch starts it so catalog and runtime services stay
-available while BT Manager is open:
+The normal bringup launch no longer starts it automatically:
 ```
 ros2 launch orchestrator orchestrator_bringup.launch.py
 ```
+
+BT Manager owns the normal process lifecycle through the supervisor API:
+
+- **BT Node ON** starts the `bt_node` s6 service and refreshes the catalog.
+- **BT Node OFF** stops the `bt_node` s6 service, but only after BT execution
+  has been explicitly stopped.
 
 For isolated debugging, launch only the BT node with:
 ```
@@ -120,8 +125,9 @@ BT Manager Start/Stop controls tree execution, not the `bt_node` process:
 
 - **Start** serializes the current graph and calls `/bt/load_and_run`.
 - **Stop** calls `/bt/set_running` with `false`.
-- When a tree completes, `bt_node` remains alive so the catalog and refresh
-  flow keep working.
+- **Start** is disabled while the `bt_node` process is down.
+- When a tree completes or fails, press **Stop** to return the runtime to
+  `stopped`; only then is **BT Node OFF** enabled.
 
 ## Custom BT nodes
 

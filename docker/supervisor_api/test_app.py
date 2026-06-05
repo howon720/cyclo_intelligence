@@ -44,6 +44,8 @@ finally:
     sys.path = original_path
 
 _missing_required_mounts = app._missing_required_mounts
+_mount_source_for_destination = app._mount_source_for_destination
+_require_known_service = app._require_known_service
 
 
 def _container_with_mounts(*destinations):
@@ -58,17 +60,40 @@ def _container_with_mounts(*destinations):
 
 
 def test_missing_required_mounts_reports_stale_groot_container():
-    container = _container_with_mounts("/workspace")
+    container = _container_with_mounts("/legacy_model_mount/groot")
 
     assert _missing_required_mounts("groot", container) == [
-        "/policy_checkpoints/groot"
+        "/workspace"
     ]
 
 
 def test_missing_required_mounts_accepts_current_groot_container():
     container = _container_with_mounts(
         "/workspace",
-        "/policy_checkpoints/groot",
     )
 
     assert _missing_required_mounts("groot", container) == []
+
+
+def test_mount_source_for_destination_resolves_workspace_host_path():
+    mounts = [
+        {"Destination": "/root/ros2_ws/src/cyclo_intelligence", "Source": "/repo"},
+        {"Destination": "/workspace", "Source": "/mnt/ssd/cyclo_intelligence/workspace"},
+    ]
+
+    assert _mount_source_for_destination(mounts, "/workspace") == (
+        "/mnt/ssd/cyclo_intelligence/workspace"
+    )
+
+
+def test_bt_node_is_known_user_service():
+    _require_known_service("bt_node")
+
+
+def test_unknown_user_service_is_rejected():
+    try:
+        _require_known_service("not_a_service")
+    except app.HTTPException as exc:
+        assert exc.status_code == 404
+    else:
+        raise AssertionError("unknown service should be rejected")

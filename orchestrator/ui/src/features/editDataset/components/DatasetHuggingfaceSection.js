@@ -28,11 +28,13 @@ import {
   setHFRepoIdDownload,
 } from '../editDatasetSlice';
 import { useRosServiceCaller } from '../../../hooks/useRosServiceCaller';
+import useWorkspaceMount from '../../../hooks/useWorkspaceMount';
 import FileBrowserModal from '../../../components/FileBrowserModal';
 import TokenInputPopup from '../../../components/TokenInputPopup';
 import SectionSelector from './SectionSelector';
-import { HF_ENDPOINT_PRESETS } from '../../../constants/paths';
+import { DEFAULT_PATHS, HF_ENDPOINT_PRESETS } from '../../../constants/paths';
 import HFStatus from '../../../constants/HFStatus';
+import { mapWorkspacePathToHost } from '../../../utils/workspacePath';
 import {
   DOWNLOAD_MODEL_BACKENDS,
   getDefaultDownloadPath,
@@ -48,8 +50,6 @@ const SECTION_NAME = {
   UPLOAD: 'upload',
   DOWNLOAD: 'download',
 };
-
-const HF_FILE_BROWSER_ROOT = '/workspace';
 
 // HuggingFace repository name validation
 const validateHfRepoName = (repoName) => {
@@ -94,6 +94,19 @@ const validateHfRepoName = (repoName) => {
   }
 
   return { isValid: true, message: '' };
+};
+
+const getDefaultUploadPath = (uploadType, modelBackend = 'lerobot') =>
+  uploadType === 'model'
+    ? getDefaultDownloadPath('model', modelBackend)
+    : DEFAULT_PATHS.HF_DATASET_DOWNLOAD_PATH;
+
+const joinRepoPath = (baseDir, repoId) => {
+  const normalizedBase = (baseDir || '').trim().replace(/\/+$/, '');
+  const normalizedRepo = (repoId || '').trim().replace(/^\/+/, '');
+  if (!normalizedBase) return normalizedRepo;
+  if (!normalizedRepo) return normalizedBase;
+  return `${normalizedBase}/${normalizedRepo}`;
 };
 
 // Style Classes
@@ -165,31 +178,34 @@ const HuggingfaceSection = () => {
     listHFEndpoints,
     selectHFEndpoint,
   } = useRosServiceCaller();
+  const workspaceMount = useWorkspaceMount();
 
   // Local states
   const [activeSection, setActiveSection] = useState(SECTION_NAME.UPLOAD);
-  const [hfLocalDirUpload, setHfLocalDirUpload] = useState('');
+  const [hfLocalDirUpload, setHfLocalDirUpload] = useState(() =>
+    getDefaultUploadPath('dataset')
+  );
   // Per-section repo-type toggles. Both sections accept either a dataset
   // or a model; the toggle just changes the HF API repo_type on the wire
   // and the default destination path for download.
   const [uploadType, setUploadType] = useState('dataset');
-  const [downloadType, setDownloadType] = useState('model');
+  const [uploadModelBackend, setUploadModelBackend] = useState('lerobot');
+  const [downloadType, setDownloadType] = useState('dataset');
   const [downloadModelBackend, setDownloadModelBackend] = useState('lerobot');
   // Destination directory for HF downloads. Model downloads land in the
-  // selected policy checkpoint dropbox so Inference can browse them directly.
+  // selected model folder so Inference can browse them directly.
   const [hfLocalDirDownload, setHfLocalDirDownload] = useState(() =>
-    getDefaultDownloadPath('model', 'lerobot')
+    getDefaultDownloadPath('dataset')
   );
   // When the user toggles type, swap the destination to that type's
-  // canonical default — but only if the current value is a known default
-  // (i.e. they haven't typed something custom). Custom values stay put.
+  // canonical default when the current value belongs to one of our managed
+  // workspace roots. Custom values outside those roots stay put.
   useEffect(() => {
-    if (isManagedDownloadPath(hfLocalDirDownload)) {
-      setHfLocalDirDownload(getDefaultDownloadPath(downloadType, downloadModelBackend));
-    }
-    // hfLocalDirDownload intentionally omitted — we only react to type flips,
-    // backend flips, not to the user editing the field.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setHfLocalDirDownload((currentDir) =>
+      !currentDir || isManagedDownloadPath(currentDir)
+        ? getDefaultDownloadPath(downloadType, downloadModelBackend)
+        : currentDir
+    );
   }, [downloadType, downloadModelBackend]);
 
   const [showHfDownloadDirBrowserModal, setShowHfDownloadDirBrowserModal] = useState(false);
@@ -224,6 +240,14 @@ const HuggingfaceSection = () => {
     uploadRepoValidation.isValid &&
     userId?.trim() &&
     isHfStatusReady;
+
+  useEffect(() => {
+    setHfLocalDirUpload((currentDir) =>
+      !currentDir || isManagedDownloadPath(currentDir)
+        ? getDefaultUploadPath(uploadType, uploadModelBackend)
+        : currentDir
+    );
+  }, [uploadType, uploadModelBackend]);
 
   const downloadButtonEnabled =
     !isUploading &&
@@ -441,6 +465,14 @@ const HuggingfaceSection = () => {
     if (trimmed.includes('/')) return trimmed;
     return `${userId || ''}/${trimmed}`;
   };
+
+  const uploadContainerPath = joinRepoPath(hfLocalDirUpload, '');
+  const uploadHostPath = mapWorkspacePathToHost(uploadContainerPath, workspaceMount);
+  const downloadLandingPath = joinRepoPath(
+    hfLocalDirDownload,
+    resolveFullRepoId(hfRepoIdDownload) || '<repo-id>'
+  );
+  const downloadHostLandingPath = mapWorkspacePathToHost(downloadLandingPath, workspaceMount);
 
   // Validate just the repo name portion (after the slash) since `validateHfRepoName`
   // does not allow slashes.
@@ -839,6 +871,44 @@ const HuggingfaceSection = () => {
 
               {/* Upload Dataset Section Content */}
               <div className="w-full flex flex-col gap-3">
+                {uploadType === 'model' && (
+                  <div className="w-full flex flex-col gap-2">
+                    <span className="text-lg font-bold">Model source backend</span>
+                    <div
+                      className="flex w-fit gap-1 rounded-md bg-gray-200 p-0.5"
+                      role="radiogroup"
+                      aria-label="Model source backend"
+                    >
+                      {DOWNLOAD_MODEL_BACKENDS.map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          role="radio"
+                          aria-checked={uploadModelBackend === option.value}
+                          onClick={() => setUploadModelBackend(option.value)}
+                          disabled={isUploading}
+                          className={clsx(
+                            'px-3 py-1 text-xs font-medium rounded transition-colors',
+                            uploadModelBackend === option.value
+                              ? 'bg-white text-gray-900 shadow-sm'
+                              : 'text-gray-500 hover:text-gray-700',
+                            isUploading && 'cursor-not-allowed opacity-60'
+                          )}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="text-xs text-gray-500">
+                      Model uploads default to{' '}
+                      <span className="font-mono text-blue-700">
+                        {getDefaultUploadPath('model', uploadModelBackend)}
+                      </span>
+                      .
+                    </div>
+                  </div>
+                )}
+
                 {/* Local Directory Input */}
                 <div className="w-full flex flex-col gap-2">
                   <span className="text-lg font-bold">Local Directory</span>
@@ -860,6 +930,15 @@ const HuggingfaceSection = () => {
                       disabled={isDownloading}
                     />
                   </div>
+                  {uploadHostPath && (
+                    <div className="text-xs text-gray-500 flex items-center gap-1">
+                      <MdFolderOpen className="inline-block w-4 h-4 text-blue-700 mr-1" />
+                      Host path{' '}
+                      <span className="font-mono text-blue-700">
+                        {uploadHostPath}
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Repo ID Input */}
@@ -1021,7 +1100,7 @@ const HuggingfaceSection = () => {
 
               {/* Download Dataset Section Content */}
               <div className="w-full flex flex-col gap-3">
-                {downloadType === 'model' && (
+                {downloadType === 'model' ? (
                   <div className="w-full flex flex-col gap-2">
                     <span className="text-lg font-bold">Model target backend</span>
                     <div
@@ -1054,8 +1133,16 @@ const HuggingfaceSection = () => {
                       <span className="font-mono text-blue-700">
                         {getDefaultDownloadPath('model', downloadModelBackend)}
                       </span>
-                      , the same checkpoint folder used by the Inference page.
+                      .
                     </div>
+                  </div>
+                ) : (
+                  <div className="text-xs text-gray-500">
+                    Downloaded datasets are saved under{' '}
+                    <span className="font-mono text-blue-700">
+                      {getDefaultDownloadPath('dataset')}
+                    </span>
+                    .
                   </div>
                 )}
 
@@ -1133,10 +1220,18 @@ const HuggingfaceSection = () => {
                     <MdFolderOpen className="inline-block w-4 h-4 text-blue-700 mr-1" />
                     Repo will land at{' '}
                     <span className="font-mono text-blue-700">
-                      {(hfLocalDirDownload || '').replace(/\/$/, '')}/
-                      {resolveFullRepoId(hfRepoIdDownload) || '<repo-id>'}
+                      {downloadLandingPath}
                     </span>
                   </div>
+                  {downloadHostLandingPath && (
+                    <div className="text-xs text-gray-500 flex items-center gap-1">
+                      <MdFolderOpen className="inline-block w-4 h-4 text-blue-700 mr-1" />
+                      Host path{' '}
+                      <span className="font-mono text-blue-700">
+                        {downloadHostLandingPath}
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Download Button */}
@@ -1200,10 +1295,8 @@ const HuggingfaceSection = () => {
         title="Select Local Directory for Upload"
         selectButtonText="Select"
         allowDirectorySelect={true}
-        // Start at /workspace so users can choose rosbag2, lerobot, model,
-        // or another mounted workspace directory.
-        initialPath={HF_FILE_BROWSER_ROOT}
-        defaultPath={HF_FILE_BROWSER_ROOT}
+        initialPath={getDefaultUploadPath(uploadType, uploadModelBackend)}
+        defaultPath={getDefaultUploadPath(uploadType, uploadModelBackend)}
         homePath=""
       />
 

@@ -27,7 +27,16 @@ import {
 import '@xyflow/react/dist/style.css';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
-import { MdPlayArrow, MdStop, MdUploadFile, MdSave, MdUndo, MdRedo, MdAutoFixHigh } from 'react-icons/md';
+import {
+  MdPlayArrow,
+  MdStop,
+  MdUploadFile,
+  MdSave,
+  MdUndo,
+  MdRedo,
+  MdAutoFixHigh,
+  MdPowerSettingsNew,
+} from 'react-icons/md';
 
 import BTControlNode from '../components/bt/BTControlNode';
 import BTActionNode from '../components/bt/BTActionNode';
@@ -45,6 +54,18 @@ const nodeTypes = {
   btControl: BTControlNode,
   btAction: BTActionNode,
 };
+
+const API_BASE = '/api';
+
+async function readJsonResponse(response) {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { detail: text };
+  }
+}
 
 // BFS down the edges to enumerate every node reachable from `rootId`.
 // Used to mark a collapsed Control node's whole subtree as hidden.
@@ -119,7 +140,7 @@ function getBtStatusLabel(status) {
 export default function BTManagerPage({ isActive = true }) {
   const dispatch = useDispatch();
   const { callService } = useRosServiceCaller();
-  const { catalog: nodeCatalog = [] } = useBTNodeCatalog();
+  const { catalog: nodeCatalog = [], refreshCatalog } = useBTNodeCatalog();
   const rosbridgeUrl = useSelector((state) => state.ros.rosbridgeUrl);
 
   const treeXml = useSelector((state) => state.btmanager.treeXml);
@@ -137,6 +158,11 @@ export default function BTManagerPage({ isActive = true }) {
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [saveFileName, setSaveFileName] = useState('');
   const [saveConflict, setSaveConflict] = useState(null);
+  const [btNodeStatus, setBtNodeStatus] = useState({
+    state: 'unknown',
+    raw: 'not checked',
+  });
+  const [btNodePendingAction, setBtNodePendingAction] = useState(null);
 
   // ReactFlow instance for coordinate conversion on drop
   const reactFlowRef = useRef(null);
@@ -553,6 +579,10 @@ export default function BTManagerPage({ isActive = true }) {
       toast.error('No tree loaded');
       return;
     }
+    if (btNodeStatus.state !== 'up') {
+      toast.error('BT node is not running');
+      return;
+    }
     try {
       const currentXml = getSerializedXml();
 
@@ -572,7 +602,7 @@ export default function BTManagerPage({ isActive = true }) {
     } catch (err) {
       toast.error(`Failed to start BT: ${err.message}`);
     }
-  }, [callService, dispatch, nodes.length, getSerializedXml]);
+  }, [callService, dispatch, nodes.length, getSerializedXml, btNodeStatus.state]);
 
   // ── BT Stop ───────────────────────────────────────────────────────────────
   const handleStop = useCallback(async () => {
@@ -589,6 +619,86 @@ export default function BTManagerPage({ isActive = true }) {
       toast.error(`Failed to stop BT: ${err.message}`);
     }
   }, [callService, dispatch]);
+
+  // ── BT node process lifecycle via supervisor API ─────────────────────────
+  const refreshBtNodeStatus = useCallback(async ({ quiet = false } = {}) => {
+    try {
+      const response = await fetch(`${API_BASE}/services/bt_node/status`);
+      const data = await readJsonResponse(response);
+      if (!response.ok) {
+        throw new Error(data.detail || `status failed (${response.status})`);
+      }
+      setBtNodeStatus(data);
+      if (data.state === 'down') {
+        dispatch(setBtStatus('stopped'));
+        dispatch(setActiveNodeNames([]));
+      }
+      return data;
+    } catch (err) {
+      const next = {
+        state: 'unknown',
+        raw: err.message,
+      };
+      setBtNodeStatus(next);
+      if (!quiet) toast.error(`BT node status failed: ${err.message}`);
+      return next;
+    }
+  }, [dispatch]);
+
+  useEffect(() => {
+    if (!isActive) return undefined;
+    refreshBtNodeStatus({ quiet: true });
+    const id = setInterval(
+      () => refreshBtNodeStatus({ quiet: true }),
+      5000,
+    );
+    return () => clearInterval(id);
+  }, [isActive, refreshBtNodeStatus]);
+
+  const callBtNodeService = useCallback(async (action) => {
+    setBtNodePendingAction(action);
+    try {
+      const response = await fetch(`${API_BASE}/services/bt_node/${action}`, {
+        method: 'POST',
+      });
+      const data = await readJsonResponse(response);
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.detail || data.message || `${action} failed`);
+      }
+      return data;
+    } finally {
+      setBtNodePendingAction(null);
+    }
+  }, []);
+
+  const handleBtNodeOn = useCallback(async () => {
+    try {
+      await callBtNodeService('start');
+      toast.success('BT node started');
+      await refreshBtNodeStatus({ quiet: true });
+      try {
+        await refreshCatalog({ force: true });
+      } catch (err) {
+        console.debug('BT catalog refresh after node start failed:', err.message);
+      }
+    } catch (err) {
+      toast.error(`Failed to start BT node: ${err.message}`);
+      await refreshBtNodeStatus({ quiet: true });
+    }
+  }, [callBtNodeService, refreshBtNodeStatus, refreshCatalog]);
+
+  const handleBtNodeOff = useCallback(async () => {
+    try {
+      await callBtNodeService('stop');
+      dispatch(setBtStatus('stopped'));
+      dispatch(setActiveNodeNames([]));
+      toast.success('BT node stopped');
+      await refreshBtNodeStatus({ quiet: true });
+    } catch (err) {
+      toast.error(`Failed to stop BT node: ${err.message}`);
+      await refreshBtNodeStatus({ quiet: true });
+    }
+  }, [callBtNodeService, dispatch, refreshBtNodeStatus]);
 
   // ── BT status / active-nodes subscription ────────────────────────────────
   useEffect(() => {
@@ -687,10 +797,15 @@ export default function BTManagerPage({ isActive = true }) {
 
   const hasTree = nodes.length > 0;
   const normalizedBtStatus = normalizeBtStatus(btStatus);
+  const isBtNodeUp = btNodeStatus.state === 'up';
+  const isBtNodeBusy = Boolean(btNodePendingAction);
   const isBtRunning = normalizedBtStatus === 'running';
   const isBtBusy = isBtRunning || normalizedBtStatus === 'stopping';
-  const canStartBt = hasTree && !isBtBusy;
-  const canStopBt = isBtRunning;
+  const isBtTerminal = ['completed', 'failed', 'failure'].includes(normalizedBtStatus);
+  const canStartBt = hasTree && isBtNodeUp && !isBtBusy && !isBtNodeBusy;
+  const canStopBt = isBtNodeUp && (isBtRunning || isBtTerminal) && !isBtNodeBusy;
+  const canStartBtNode = !isBtNodeUp && !isBtNodeBusy;
+  const canStopBtNode = isBtNodeUp && normalizedBtStatus === 'stopped' && !isBtNodeBusy;
   const statusColor =
     isBtRunning ? 'bg-green-500' :
     normalizedBtStatus === 'completed' ? 'bg-yellow-400' :
@@ -698,6 +813,14 @@ export default function BTManagerPage({ isActive = true }) {
     normalizedBtStatus === 'stopping' ? 'bg-orange-400' :
     'bg-gray-400';
   const statusLabel = getBtStatusLabel(btStatus);
+  const btNodeStatusColor =
+    isBtNodeUp ? 'bg-green-500' :
+    btNodeStatus.state === 'down' ? 'bg-gray-400' :
+    'bg-yellow-400';
+  const btNodeStatusLabel =
+    isBtNodeUp ? 'Running' :
+    btNodeStatus.state === 'down' ? 'Stopped' :
+    'Unknown';
 
   return (
     <div className="w-full h-full flex flex-col">
@@ -781,7 +904,7 @@ export default function BTManagerPage({ isActive = true }) {
 
       {/* React Flow Canvas */}
       <div className="flex-1 relative flex">
-        <BTNodePalette />
+        <BTNodePalette canUpdateCatalog={isBtNodeUp} />
         <div
           className="flex-1 relative"
           onDragOver={handleCanvasDragOver}
@@ -843,6 +966,38 @@ export default function BTManagerPage({ isActive = true }) {
       {/* Bottom Control Bar */}
       <div className="flex items-center justify-between px-6 py-3 border-t border-gray-200 bg-white">
         <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 pr-3 mr-1 border-r border-gray-200">
+            <div className={clsx('w-3 h-3 rounded-full', btNodeStatusColor)} />
+            <span className="text-sm text-gray-600">BT Node {btNodeStatusLabel}</span>
+            <button
+              onClick={handleBtNodeOn}
+              disabled={!canStartBtNode}
+              title="Start BT node"
+              className={clsx(
+                'flex items-center gap-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
+                !canStartBtNode
+                  ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                  : 'bg-blue-600 hover:bg-blue-700 text-white'
+              )}
+            >
+              <MdPowerSettingsNew size={18} />
+              ON
+            </button>
+            <button
+              onClick={handleBtNodeOff}
+              disabled={!canStopBtNode}
+              title="Stop BT node"
+              className={clsx(
+                'flex items-center gap-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
+                !canStopBtNode
+                  ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                  : 'bg-red-600 hover:bg-red-700 text-white'
+              )}
+            >
+              <MdStop size={18} />
+              OFF
+            </button>
+          </div>
           <button
             onClick={handleStart}
             disabled={!canStartBt}

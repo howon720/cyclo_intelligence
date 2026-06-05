@@ -79,7 +79,7 @@ describe('btXmlSerializer', () => {
           params: {
             command: 'RESUME',
             model: 'groot:n17',
-            policy_path: '/policy_checkpoints/groot/test',
+            policy_path: '/workspace/model/groot/test',
             task_instruction: '',
             inference_hz: '10',
             control_hz: '100',

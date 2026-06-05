@@ -2,21 +2,27 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.12 (2026-06-05)
+-------------------
+* Added BT Manager lifecycle control for starting and stopping the ``bt_node`` runtime through supervisor-managed s6 services.
+* Disabled behavior tree execution controls while the ``bt_node`` process is stopped and documented the on-demand lifecycle flow.
+* Contributors: Seongwoo Kim
+
 0.1.11 (2026-06-05)
 -------------------
 * Added LeRobot converter regression coverage for multi-subtask frame reuse offsets, legacy prepared episode caches, and frame reuse metadata writing.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.10 (2026-06-04)
 -------------------
 * Extended recording service timeouts for STOP, FINISH, cancel, rerecord, and segmented recording operations so post-record remux work can complete.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.9 (2026-06-02)
 ------------------
 * Synced prepared recording task information from SET_TASK_INFO so robot-button recordings use the latest folder name and metadata.
 * Cached UI task information for trigger-started recording sessions and refreshed recording status after task info updates.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.8 (2026-06-01)
 ------------------
@@ -27,7 +33,7 @@ Changelog for package orchestrator
 * Moved leader trigger recording control into the orchestrator backend using right and left tact trigger events.
 * Added prepared Record and Inference recording contexts so trigger input can start, save, and cancel recordings without UI command bridging.
 * Kept inference recording state tied to actual recording start and stop responses.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.6 (2026-05-27)
 ------------------
@@ -35,7 +41,7 @@ Changelog for package orchestrator
 * Added behavior tree node templates and XML serialization support for generated action and control nodes.
 * Refactored behavior tree actions around joint control, SendCommand model routing, inference lifecycle handling, and monotonic timing.
 * Added tree editing support for save-as workflows, execution completion state, and persistent runtime flow.
-* Contributors: kimtaehyeong99, Seongoo
+* Contributors: Taehyeong Kim, Seongwoo
 
 0.1.5 (2026-05-26)
 ------------------
@@ -62,4 +68,4 @@ Changelog for package orchestrator
 * Initial open-source release of the Cyclo Intelligence orchestrator package.
 * Added ROS 2 orchestration for recording, inference, training, task commands, file browsing, and behavior tree workflows.
 * Added service forwarding boundaries for cyclo_data-owned recording, conversion, editing, and Hugging Face operations.
-* Contributors: ROBOTIS
+* Contributors: Taehyeong Kim

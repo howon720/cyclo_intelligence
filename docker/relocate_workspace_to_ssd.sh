@@ -1,8 +1,9 @@
 #!/bin/bash
-# Relocate cyclo_intelligence's workspace + huggingface bind-mount targets
-# from the SD card (/dev/mmcblk0p1) to NVMe (/mnt/ssd). The docker-compose
-# mounts (./workspace, ./huggingface) are kept as-is — they resolve via
-# symlinks to /mnt/ssd/cyclo_intelligence/{workspace,huggingface}.
+# Legacy helper to relocate cyclo_intelligence's workspace + huggingface
+# bind-mount targets from the SD card (/dev/mmcblk0p1) to NVMe (/mnt/ssd).
+# docker/container.sh now uses /mnt/ssd/cyclo_intelligence/{workspace,huggingface}
+# when that storage is available, otherwise it falls back to local development
+# paths. This script is only needed when explicitly migrating local data to SSD.
 #
 # Run with: sudo bash relocate_workspace_to_ssd.sh
 set -euo pipefail

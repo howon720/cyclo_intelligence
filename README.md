@@ -72,6 +72,11 @@ Dockerfile (only needed when iterating on Dockerfile changes).
 - **`Default Runtime: runc` instead of `nvidia`** — Install the NVIDIA
   Container Toolkit and set `nvidia` as the default runtime in
   `/etc/docker/daemon.json`, then `sudo systemctl restart docker`.
+- **`/mnt/ssd: permission denied` on a workstation** — `container.sh`
+  auto-detects SSD storage and falls back to `docker/workspace` plus
+  `docker/huggingface` when `/mnt/ssd/cyclo_intelligence` is not writable.
+  To force local paths, run with `CYCLO_STORAGE_MODE=local`; to require
+  SSD storage on a robot, use `CYCLO_STORAGE_MODE=ssd`.
 - **`/var/run/robotis/agent_sockets/...: permission denied`** —
   `container.sh` will create this with `mkdir -p` (using `sudo` if
   needed). If sudo prompts, grant once or pre-create the directory.

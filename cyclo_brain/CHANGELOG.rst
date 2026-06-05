@@ -1,6 +1,11 @@
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Changelog for package cyclo_brain
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+0.1.12 (2026-06-05)
+-------------------
+* Flushed pending policy action chunks on inference stop in LeRobot and GR00T control publishers.
+* Contributors: Seongwoo Kim
 
 0.1.11 (2026-06-05)
 -------------------
@@ -28,12 +33,12 @@ Changelog for package cyclo_brain
 * Added backend-specific s6 service status reporting for inference and control publisher processes.
 * Improved GR00T TensorRT engine build safety and behavior tree inference lifecycle handling.
 * Updated action chunk processing and policy runtime wiring for synchronized SendCommand execution.
-* Contributors: kimtaehyeong99, Seongoo
+* Contributors: Taehyeong Kim, Seongwoo Kim
 
 0.1.5 (2026-05-26)
 ------------------
 * Updated LeRobot and GR00T policy IO mapping to use canonical ``cam_<side>_<part>`` camera names.
-* Contributors: kimtaehyeong99
+* Contributors: Taehyeong Kim
 
 0.1.4 (2026-05-22)
 ------------------

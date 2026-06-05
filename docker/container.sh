@@ -58,18 +58,82 @@ set -- "${NEW_ARGS[@]}"
 
 # Pre-create host bind-mount targets so docker doesn't auto-create them
 # as root-owned directories (which then can't be written to from the
-# host without sudo). Include the user-facing default browser locations
-# used by Cyclo Data and Cyclo Brain.
+# host without sudo). In auto mode, prefer SSD-backed storage when it is
+# usable and fall back to repo-local storage on development machines.
 ensure_host_dir() {
     [ -d "$1" ] || mkdir -p "$1"
 }
 
-ensure_host_dir "${SCRIPT_DIR}/workspace"
-ensure_host_dir "${SCRIPT_DIR}/workspace/rosbag2"
-ensure_host_dir "${SCRIPT_DIR}/workspace/lerobot"
-ensure_host_dir "${SCRIPT_DIR}/huggingface"
-ensure_host_dir "${SCRIPT_DIR}/../cyclo_brain/policy/lerobot/checkpoints"
-ensure_host_dir "${SCRIPT_DIR}/../cyclo_brain/policy/groot/checkpoints"
+storage_root_usable() {
+    local root="$1"
+    local probe="${root}/.cyclo-write-test.$$"
+
+    mkdir -p "$root" 2>/dev/null || return 1
+    mkdir "$probe" 2>/dev/null || return 1
+    rmdir "$probe" 2>/dev/null || true
+}
+
+setup_storage() {
+    local storage_mode="${CYCLO_STORAGE_MODE:-auto}"
+    local ssd_root="${CYCLO_SSD_ROOT:-/mnt/ssd/cyclo_intelligence}"
+    local local_workspace="${CYCLO_LOCAL_WORKSPACE_DIR:-${SCRIPT_DIR}/workspace}"
+    local local_huggingface="${CYCLO_LOCAL_HUGGINGFACE_DIR:-${SCRIPT_DIR}/huggingface}"
+    local default_workspace
+    local default_huggingface
+    local storage_label
+
+    case "$storage_mode" in
+        auto)
+            if storage_root_usable "$ssd_root"; then
+                default_workspace="${ssd_root}/workspace"
+                default_huggingface="${ssd_root}/huggingface"
+                storage_label="SSD"
+            else
+                default_workspace="$local_workspace"
+                default_huggingface="$local_huggingface"
+                storage_label="local"
+            fi
+            ;;
+        ssd)
+            if ! storage_root_usable "$ssd_root"; then
+                echo "[container.sh] Error: SSD storage root is not writable: $ssd_root" >&2
+                echo "[container.sh] Mount/create the SSD path, choose CYCLO_STORAGE_MODE=local, or set CYCLO_WORKSPACE_DIR/CYCLO_HUGGINGFACE_DIR." >&2
+                exit 1
+            fi
+            default_workspace="${ssd_root}/workspace"
+            default_huggingface="${ssd_root}/huggingface"
+            storage_label="SSD"
+            ;;
+        local)
+            default_workspace="$local_workspace"
+            default_huggingface="$local_huggingface"
+            storage_label="local"
+            ;;
+        *)
+            echo "[container.sh] Error: unknown CYCLO_STORAGE_MODE='$storage_mode' (expected auto, ssd, or local)" >&2
+            exit 1
+            ;;
+    esac
+
+    CYCLO_WORKSPACE_DIR="${CYCLO_WORKSPACE_DIR:-$default_workspace}"
+    CYCLO_HUGGINGFACE_DIR="${CYCLO_HUGGINGFACE_DIR:-$default_huggingface}"
+    export CYCLO_WORKSPACE_DIR
+    export CYCLO_HUGGINGFACE_DIR
+
+    ensure_host_dir "${CYCLO_WORKSPACE_DIR}"
+    ensure_host_dir "${CYCLO_WORKSPACE_DIR}/dataset"
+    ensure_host_dir "${CYCLO_WORKSPACE_DIR}/rosbag2"
+    ensure_host_dir "${CYCLO_WORKSPACE_DIR}/lerobot"
+    ensure_host_dir "${CYCLO_WORKSPACE_DIR}/model"
+    ensure_host_dir "${CYCLO_WORKSPACE_DIR}/model/lerobot"
+    ensure_host_dir "${CYCLO_WORKSPACE_DIR}/model/groot"
+    ensure_host_dir "${CYCLO_HUGGINGFACE_DIR}"
+
+    echo "[container.sh] Using ${storage_label} storage"
+    echo "[container.sh]   workspace:   ${CYCLO_WORKSPACE_DIR}"
+    echo "[container.sh]   huggingface: ${CYCLO_HUGGINGFACE_DIR}"
+}
+
 CYCLO_AGENT_SOCKETS_DIR="${CYCLO_AGENT_SOCKETS_DIR:-/var/run/robotis/agent_sockets/cyclo_intelligence}"
 export CYCLO_AGENT_SOCKETS_DIR
 mkdir -p "$CYCLO_AGENT_SOCKETS_DIR" 2>/dev/null \
@@ -121,12 +185,19 @@ Flags (any start* command):
 
 Environment:
   GPU_ARCH         default | blackwell   (optional, amd64 only)
-  VERSION          image tag version (default: 0.1.11 for cyclo)
+  VERSION          image tag version (default: 0.1.12 for cyclo)
   ROS_DOMAIN_ID    default 30
+  CYCLO_STORAGE_MODE
+                   auto | ssd | local (default auto). Auto uses
+                   /mnt/ssd/cyclo_intelligence when writable, otherwise
+                   docker/workspace and docker/huggingface.
+  CYCLO_WORKSPACE_DIR / CYCLO_HUGGINGFACE_DIR
+                   Override the host bind-mount paths directly.
 EOF
 }
 
 start_main() {
+    setup_storage
     setup_x11
     echo "[container.sh] Pulling pre-built images (ignoring local-only failures)..."
     $COMPOSE pull --ignore-pull-failures "$MAIN_SERVICE" || true
@@ -136,6 +207,7 @@ start_main() {
 }
 
 start_lerobot() {
+    setup_storage
     setup_x11
     echo "[container.sh] Pulling pre-built images..."
     $COMPOSE pull --ignore-pull-failures "$LEROBOT_SERVICE" || true
@@ -144,6 +216,7 @@ start_lerobot() {
 }
 
 start_groot() {
+    setup_storage
     setup_x11
     echo "[container.sh] Pulling pre-built images..."
     $COMPOSE pull --ignore-pull-failures "$GROOT_SERVICE" || true

@@ -36,7 +36,7 @@ packages = [
 
 setup(
     name=package_name,
-    version='0.1.11',
+    version='0.1.12',
     packages=packages,
     # Nested layout convention (D17): root namespace '' maps to current
     # directory. Avoids colcon-core's _symlinks_in_build veto on
@@ -78,7 +78,10 @@ setup(
             # before Step 3 Part A and lost its entry — re-registered here
             # alongside the other data-side utilities.
             'visualize_rosbag = cyclo_data.visualization.scripts.visualize_rosbag:main',
-            'convert_rosbag_to_lerobot = cyclo_data.converter.scripts.convert_rosbag_to_lerobot:main',
+            (
+                'convert_rosbag_to_lerobot = '
+                'cyclo_data.converter.scripts.convert_rosbag_to_lerobot:main'
+            ),
             'remove_head_lift_joints = cyclo_data.editor.scripts.remove_head_lift_joints:main',
         ],
     },

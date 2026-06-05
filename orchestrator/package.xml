@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>orchestrator</name>
-  <version>0.1.11</version>
+  <version>0.1.12</version>
   <description>
     ROS 2 package for Cyclo Intelligence integration
   </description>
@@ -10,6 +10,7 @@
   <license>Apache 2.0</license>
   <author email="kdy@robotis.com">Dongyun Kim</author>
   <author email="kimsw@robotis.com">Seongwoo Kim</author>
+  <author email="kth@robotis.com">Taehyeong Kim</author>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>

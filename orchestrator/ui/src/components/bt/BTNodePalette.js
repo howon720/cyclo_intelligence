@@ -18,11 +18,15 @@ import { useMemo } from 'react';
 import { MdRefresh } from 'react-icons/md';
 import { useBTNodeCatalog } from '../../hooks/useBTNodeCatalog';
 
-// Drag the cards onto a Control node in the canvas to add a child.
 export const PALETTE_DRAG_MIME = 'application/bt-node-tag';
 
-export default function BTNodePalette() {
+export default function BTNodePalette({ canUpdateCatalog = true }) {
   const { catalog, source, refreshCatalog } = useBTNodeCatalog();
+  const isUpdating = source === 'loading';
+  const isUpdateDisabled = !canUpdateCatalog || isUpdating;
+  const updateTitle = canUpdateCatalog
+    ? 'Update node list from /bt/nodes/catalog'
+    : 'Start BT Node to update the node list';
 
   const grouped = useMemo(() => ({
     control: catalog.filter((n) => n.category === 'control'),
@@ -39,29 +43,28 @@ export default function BTNodePalette() {
   return (
     <div className="w-[180px] shrink-0 bg-white border-r border-gray-200 flex flex-col">
       <div className="px-3 py-3 border-b border-gray-200">
-        <div className="flex items-center justify-between gap-2">
-          <div className="text-sm font-bold text-gray-800">Add Node</div>
-          <button
-            type="button"
-            onClick={() => refreshCatalog({ force: true })}
-            disabled={source === 'loading'}
-            className="p-1 rounded text-gray-500 hover:text-gray-800 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="Refresh node catalog from /bt/nodes/catalog"
-          >
-            <MdRefresh size={16} />
-          </button>
-        </div>
-        <div className="text-[11px] text-gray-500 mt-0.5">
-          Drag onto a Control node
-        </div>
-        {source === 'fallback' && (
-          <div
-            className="mt-1 text-[10px] text-amber-600"
-            title="Could not reach /bt/nodes/catalog — using the bundled fallback catalog."
-          >
-            offline catalog
-          </div>
-        )}
+        <button
+          type="button"
+          onClick={() => refreshCatalog({ force: true })}
+          disabled={isUpdateDisabled}
+          className={`w-full flex items-center justify-center gap-2 px-3 py-2 rounded text-sm font-medium transition-colors ${
+            isUpdateDisabled
+              ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+              : 'bg-blue-50 text-blue-700 hover:bg-blue-100'
+          }`}
+          title={updateTitle}
+          aria-label="Update node list"
+        >
+          <MdRefresh size={17} />
+          {isUpdating ? (
+            <span>Updating...</span>
+          ) : (
+            <span className="leading-tight text-center">
+              <span className="block">Update</span>
+              <span className="block">Node List</span>
+            </span>
+          )}
+        </button>
       </div>
 
       <div className="flex-1 overflow-y-auto py-2">
@@ -95,7 +98,7 @@ function Section({ title, items, accentClass, onDragStart }) {
             draggable
             onDragStart={(e) => onDragStart(e, item.tag)}
             className={`px-2 py-1.5 border ${accentClass} bg-white rounded text-xs cursor-grab active:cursor-grabbing hover:shadow-sm hover:-translate-y-0.5 transition-all select-none`}
-            title={`Drag onto a Control node to add ${item.tag} as a child`}
+            title={item.tag}
           >
             {item.tag}
           </div>

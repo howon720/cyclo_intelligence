@@ -43,7 +43,7 @@ services:
   # ============================================================
   cyclo_intelligence:
     container_name: cyclo_intelligence
-    image: robotis/cyclo-intelligence:${VERSION:-0.1.11}-${ARCH:-arm64}
+    image: robotis/cyclo-intelligence:${VERSION:-0.1.12}-${ARCH:-arm64}
     build:
       context: ..
       dockerfile: docker/Dockerfile.${ARCH:-arm64}
@@ -81,13 +81,9 @@ services:
     volumes:
       - /dev:/dev
       - /dev/shm:/dev/shm
-      - ./workspace:/workspace
-      - ./huggingface:/root/.cache/huggingface
-      # Policy checkpoint dropboxes. These paths intentionally match the
-      # policy containers so a path selected in the UI can be sent directly
-      # to /lerobot or /groot without translation.
-      - ../cyclo_brain/policy/lerobot/checkpoints:/policy_checkpoints/lerobot:rw
-      - ../cyclo_brain/policy/groot/checkpoints:/policy_checkpoints/groot:rw
+      - ${CYCLO_WORKSPACE_DIR:-./workspace}:/workspace
+      - ${CYCLO_HUGGINGFACE_DIR:-./huggingface}:/root/.cache/huggingface
+      # Model dropboxes live under /workspace/model/{lerobot,groot}.
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # Live-edit the ROS2 workspace at runtime so a 'colcon build'
       # inside the container sees host-side edits. The container copy
@@ -189,12 +185,9 @@ services:
     volumes:
       - /dev:/dev
       - /dev/shm:/dev/shm
-      - ./workspace:/workspace
-      # User-visible policy checkpoint dropbox. Put local LeRobot models under
-      # cyclo_brain/policy/lerobot/checkpoints/ on the host, then LOAD them
-      # from /policy_checkpoints/lerobot/<model-or-checkpoint> in the container.
-      - ../cyclo_brain/policy/lerobot/checkpoints:/policy_checkpoints/lerobot:rw
-      - ./huggingface:/root/.cache/huggingface
+      - ${CYCLO_WORKSPACE_DIR:-./workspace}:/workspace
+      # User-visible LeRobot models live under /workspace/model/lerobot.
+      - ${CYCLO_HUGGINGFACE_DIR:-./huggingface}:/root/.cache/huggingface
       # Live-edit SDKs (mounted read-only so the container can't mutate
       # the host tree accidentally).
       - ../cyclo_brain/sdk/zenoh_ros2_sdk:/zenoh_sdk:ro
@@ -312,12 +305,9 @@ services:
     volumes:
       - /dev:/dev
       - /dev/shm:/dev/shm
-      - ./workspace:/workspace
-      - ./huggingface:/root/.cache/huggingface
-      # User-visible policy checkpoint dropbox. Put local GR00T models under
-      # cyclo_brain/policy/groot/checkpoints/ on the host, then LOAD them
-      # from /policy_checkpoints/groot/<model-or-checkpoint> in the container.
-      - ../cyclo_brain/policy/groot/checkpoints:/policy_checkpoints/groot:rw
+      - ${CYCLO_WORKSPACE_DIR:-./workspace}:/workspace
+      - ${CYCLO_HUGGINGFACE_DIR:-./huggingface}:/root/.cache/huggingface
+      # User-visible GR00T models live under /workspace/model/groot.
       # Live-edit SDKs (mounted read-only so the container can't mutate
       # the host tree accidentally).
       - ../cyclo_brain/sdk/zenoh_ros2_sdk:/zenoh_sdk:ro

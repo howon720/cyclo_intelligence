@@ -65,6 +65,7 @@ logger = logging.getLogger("supervisor_api")
 _USER_SERVICES: tuple[str, ...] = (
     "orchestrator",
     "cyclo_data",
+    "bt_node",
     "web_video_server",
 )
 
@@ -134,6 +135,13 @@ class HealthResponse(BaseModel):
     s6_ready: bool
 
 
+class WorkspaceMountResponse(BaseModel):
+    container_root: str
+    host_root: Optional[str] = None
+    host_available: bool
+    message: str = ""
+
+
 class BackendStatus(BaseModel):
     name: str
     image: str
@@ -193,8 +201,8 @@ _BACKENDS: Dict[str, Dict[str, str]] = {
 }
 
 _REQUIRED_BACKEND_MOUNTS: Dict[str, tuple[str, ...]] = {
-    "lerobot": ("/policy_checkpoints/lerobot",),
-    "groot": ("/policy_checkpoints/groot",),
+    "lerobot": ("/workspace",),
+    "groot": ("/workspace",),
 }
 
 
@@ -212,6 +220,14 @@ def _require_known_backend(name: str) -> Dict[str, str]:
 
 
 _HOST_PROJECT_DIR_CACHE: Optional[str] = None
+_HOST_WORKSPACE_DIR_CACHE: Optional[str] = None
+
+
+def _mount_source_for_destination(mounts, destination: str) -> Optional[str]:
+    for mount in mounts:
+        if mount.get("Destination") == destination:
+            return mount.get("Source")
+    return None
 
 
 def _host_project_dir() -> Optional[str]:
@@ -236,18 +252,49 @@ def _host_project_dir() -> Optional[str]:
     except DockerException as e:
         logger.warning("self-inspect failed: %s", e)
         return None
-    for mount in ctr.attrs.get("Mounts", []):
-        if mount.get("Destination") == _CYCLO_REPO_MOUNT:
-            host_repo = mount.get("Source")
-            if host_repo:
-                _HOST_PROJECT_DIR_CACHE = os.path.join(host_repo, "docker")
-                return _HOST_PROJECT_DIR_CACHE
+    host_repo = _mount_source_for_destination(
+        ctr.attrs.get("Mounts", []),
+        _CYCLO_REPO_MOUNT,
+    )
+    if host_repo:
+        _HOST_PROJECT_DIR_CACHE = os.path.join(host_repo, "docker")
+        return _HOST_PROJECT_DIR_CACHE
     logger.warning(
         "no mount found for %s — compose CLI relative paths will resolve "
         "against the in-container path, which the host docker daemon "
         "cannot satisfy",
         _CYCLO_REPO_MOUNT,
     )
+    return None
+
+
+def _host_workspace_dir() -> Optional[str]:
+    """Resolve the host-side directory mounted at /workspace."""
+    global _HOST_WORKSPACE_DIR_CACHE
+    if _HOST_WORKSPACE_DIR_CACHE is not None:
+        return _HOST_WORKSPACE_DIR_CACHE
+
+    env_path = os.environ.get("CYCLO_WORKSPACE_DIR")
+    if env_path:
+        _HOST_WORKSPACE_DIR_CACHE = env_path
+        return _HOST_WORKSPACE_DIR_CACHE
+
+    own_id = os.environ.get("HOSTNAME")
+    if not own_id:
+        return None
+    try:
+        ctr = _docker_client().containers.get(own_id)
+    except DockerException as e:
+        logger.warning("self-inspect for workspace mount failed: %s", e)
+        return None
+
+    host_workspace = _mount_source_for_destination(
+        ctr.attrs.get("Mounts", []),
+        "/workspace",
+    )
+    if host_workspace:
+        _HOST_WORKSPACE_DIR_CACHE = host_workspace
+        return _HOST_WORKSPACE_DIR_CACHE
     return None
 
 
@@ -429,6 +476,25 @@ async def health() -> HealthResponse:
     container = os.environ.get("HOSTNAME", "unknown")
     s6_ready = os.path.isdir("/run/service")
     return HealthResponse(ok=True, container=container, s6_ready=s6_ready)
+
+
+@app.get("/workspace", response_model=WorkspaceMountResponse)
+async def workspace_mount() -> WorkspaceMountResponse:
+    host_root = await asyncio.to_thread(_host_workspace_dir)
+    if host_root:
+        return WorkspaceMountResponse(
+            container_root="/workspace",
+            host_root=host_root,
+            host_available=True,
+            message="/workspace host mount resolved",
+        )
+
+    return WorkspaceMountResponse(
+        container_root="/workspace",
+        host_root=None,
+        host_available=False,
+        message="Host mount for /workspace could not be resolved",
+    )
 
 
 @app.get("/services", response_model=ServiceList)

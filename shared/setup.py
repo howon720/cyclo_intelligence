@@ -34,12 +34,14 @@ packages = [
 
 
 def _walk_share_dir(src_subdir):
-    """Yield (dest, [files]) tuples to install all files under src_subdir
-    recursively into share/<package>/<rel>/<...>, where <rel> strips the
-    leading <package_name>/ prefix from src so the share tree mirrors
-    the importable layout (share/shared/robot_configs/...) rather than
-    duplicating the package name (share/shared/shared/robot_configs/...).
-    Used for the URDF mesh tree which is several levels deep."""
+    """
+    Yield file tuples for installing all files under src_subdir.
+
+    Files are installed recursively into share/<package>/<rel>/<...>, where
+    <rel> strips the leading <package_name>/ prefix from src so the share tree
+    mirrors the importable layout rather than duplicating the package name.
+    Used for the URDF mesh tree which is several levels deep.
+    """
     pairs = []
     for root, _dirs, files in os.walk(src_subdir):
         if not files:
@@ -72,7 +74,7 @@ robot_assets = [
 
 setup(
     name=package_name,
-    version='0.1.11',
+    version='0.1.12',
     packages=packages,
     # Nested layout convention (D17): root namespace '' maps to current
     # directory, so 'shared' resolves to ./shared/ and subpackages
