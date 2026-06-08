@@ -145,6 +145,19 @@ def test_groot_backend_uses_current_release_image():
     )
 
 
+def test_backend_status_model_exposes_stale_image_status():
+    status = app.BackendStatus(
+        name="groot",
+        image="robotis/groot-zenoh:1.3.0-arm64",
+        image_pulled=True,
+        image_status="stale",
+        container_state="exited",
+        raw_state="stale_image",
+    )
+
+    assert status.image_status == "stale"
+
+
 def test_host_project_dir_falls_back_to_compose_container_name(monkeypatch):
     class FakeContainers:
         def __init__(self):

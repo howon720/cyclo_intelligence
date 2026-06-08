@@ -151,6 +151,7 @@ class BackendStatus(BaseModel):
     name: str
     image: str
     image_pulled: bool
+    image_status: Literal["current", "stale", "missing"]
     container_state: Literal["running", "exited", "not_created", "unknown"]
     container_id: Optional[str] = None
     raw_state: Optional[str] = None
@@ -646,6 +647,50 @@ async def backend_restart(name: str) -> ActionResult:
     return await _ensure_backend_running(name, spec)
 
 
+@app.post("/backends/{name}/recreate", response_model=ActionResult)
+async def backend_recreate(name: str) -> ActionResult:
+    spec = _require_known_backend(name)
+
+    def _remove_existing() -> tuple[str, str]:
+        try:
+            client = _docker_client()
+        except DockerException as e:
+            raise HTTPException(500, f"docker init failed: {e}")
+        local_image = _local_backend_image(client, spec)
+        if not local_image:
+            images = ", ".join(_backend_image_candidates(spec))
+            raise HTTPException(
+                409,
+                f"No local image for {name}. Expected one of: {images}. "
+                f"Connect internet and call /backends/{name}/pull first.",
+            )
+        try:
+            ctr = client.containers.get(spec["container"])
+        except NotFound:
+            removed = "not_created"
+        except DockerException as e:
+            raise HTTPException(500, f"inspect failed: {e}")
+        else:
+            try:
+                ctr.remove(force=True)
+                removed = "removed"
+            except DockerException as e:
+                raise HTTPException(500, f"remove failed: {e}")
+        return local_image, removed
+
+    local_image, removed = await asyncio.to_thread(_remove_existing)
+    cmd = _compose_base_cmd() + ["create", "--no-build", spec["service"]]
+    result = await _run(*cmd, timeout=60.0)
+    ok = result.rc == 0
+    msg = result.stderr or result.stdout or f"rc={result.rc}"
+    if ok:
+        msg = (
+            f"{spec['container']} recreated from {local_image} "
+            f"({removed}). {msg}"
+        )
+    return ActionResult(ok=ok, message=msg)
+
+
 @app.post("/backends/{name}/stop", response_model=ActionResult)
 async def backend_stop(name: str) -> ActionResult:
     spec = _require_known_backend(name)
@@ -760,14 +805,17 @@ async def backend_status(name: str) -> BackendStatus:
     def _inspect():
         client = _docker_client()
         pulled = _local_backend_image(client, spec) is not None
+        image_status: Literal["current", "stale", "missing"] = (
+            "current" if pulled else "missing"
+        )
         try:
             ctr = client.containers.get(spec["container"])
         except NotFound:
-            return pulled, "not_created", None, None, []
+            return pulled, image_status, "not_created", None, None, []
         except DockerException as e:
             raise HTTPException(500, f"docker inspect failed: {e}")
         if _backend_container_image_mismatch(client, ctr, spec):
-            return pulled, "exited", ctr.id, "stale_image", []
+            return pulled, "stale", "exited", ctr.id, "stale_image", []
         raw = _container_raw_state(ctr)
         if raw == "running":
             mapped = "running"
@@ -777,13 +825,14 @@ async def backend_status(name: str) -> BackendStatus:
             mapped = "unknown"
         service_names = spec.get("services", ["main-runtime", "engine-process"])
         services = _backend_service_statuses(ctr, raw, service_names)
-        return pulled, mapped, ctr.id, raw, services
+        return pulled, image_status, mapped, ctr.id, raw, services
 
-    pulled, container_state, container_id, raw, services = await asyncio.to_thread(_inspect)
+    pulled, image_status, container_state, container_id, raw, services = await asyncio.to_thread(_inspect)
     return BackendStatus(
         name=name,
         image=spec["image"],
         image_pulled=pulled,
+        image_status=image_status,
         container_state=container_state,
         container_id=container_id,
         raw_state=raw,

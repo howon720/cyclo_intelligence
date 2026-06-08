@@ -221,14 +221,22 @@ export default function PolicyBackendControl({ serviceType }) {
   const isPulling = pendingAction === 'pull';
   const isRunning = state === 'running';
   const imagePulled = Boolean(status?.image_pulled);
+  const isStaleImage = status?.image_status === 'stale' ||
+    status?.raw_state === 'stale_image';
   const showPullButton = isPulling || (hasStatus && !imagePulled);
-  const showRuntimeControls = imagePulled || (hasStatus && state !== 'not_created');
+  const showUpdateButton = hasStatus && imagePulled && isStaleImage;
+  const showRuntimeControls = !isStaleImage &&
+    (imagePulled || (hasStatus && state !== 'not_created'));
   const readiness = useMemo(() => getPolicyBackendReadiness(status), [status]);
   const isWarming = isRunning && !readiness.ready &&
     (readiness.state === 'checking' || readiness.state === 'warming');
-  const statusLabel = isWarming
-    ? 'Warming up'
-    : stateLabels[state] || stateLabels.unknown;
+  const statusLabel = isStaleImage
+    ? 'Update required'
+    : (
+      isWarming
+        ? 'Warming up'
+        : stateLabels[state] || stateLabels.unknown
+    );
   const serviceRows = useMemo(
     () => getPolicyBackendServices(status),
     [status]
@@ -242,8 +250,11 @@ export default function PolicyBackendControl({ serviceType }) {
     'rounded-full',
     {
       'bg-green-100 text-green-700': isRunning && readiness.ready,
-      'bg-gray-100 text-gray-600': state === 'exited' || state === 'not_created',
-      'bg-yellow-100 text-yellow-700': state === 'unknown' || isWarming,
+      'bg-red-100 text-red-700': isStaleImage,
+      'bg-gray-100 text-gray-600': !isStaleImage &&
+        (state === 'exited' || state === 'not_created'),
+      'bg-yellow-100 text-yellow-700': !isStaleImage &&
+        (state === 'unknown' || isWarming),
     }
   );
 
@@ -278,6 +289,7 @@ export default function PolicyBackendControl({ serviceType }) {
       'bg-gray-500 text-white hover:bg-gray-600': variant === 'restart',
       'bg-red-500 text-white hover:bg-red-600': variant === 'off',
       'bg-emerald-500 text-white hover:bg-emerald-600': variant === 'pull',
+      'bg-amber-500 text-white hover:bg-amber-600': variant === 'update',
     }
   );
 
@@ -300,6 +312,16 @@ export default function PolicyBackendControl({ serviceType }) {
           <span className={statusClass}>
             {statusLabel}
           </span>
+          {isStaleImage && (
+            <Tooltip
+              position="bottom"
+              content={`Container was created from an older image. Expected ${status?.image || 'the current backend image'}.`}
+            >
+              <span className="text-xs font-semibold text-red-700 bg-red-100 px-2 py-0.5 rounded-full">
+                Container outdated
+              </span>
+            </Tooltip>
+          )}
           {!imagePulled && (
             <Tooltip
               position="bottom"
@@ -315,7 +337,7 @@ export default function PolicyBackendControl({ serviceType }) {
       <div className={clsx(
         'grid',
         'gap-2',
-        showPullButton && !showRuntimeControls ? 'grid-cols-1' : (
+        showUpdateButton || (showPullButton && !showRuntimeControls) ? 'grid-cols-1' : (
           showPullButton ? 'grid-cols-2' : 'grid-cols-3'
         )
       )}
@@ -330,6 +352,18 @@ export default function PolicyBackendControl({ serviceType }) {
           >
             <MdCloudDownload size={16} />
             Pull
+          </button>
+        )}
+        {showUpdateButton && (
+          <button
+            type="button"
+            className={buttonClass('update')}
+            disabled={isBusy}
+            onClick={() => callBackend('recreate', 'container updated')}
+            aria-label={`${label} update container`}
+          >
+            <MdRefresh size={16} />
+            Update Container
           </button>
         )}
         {showRuntimeControls && (

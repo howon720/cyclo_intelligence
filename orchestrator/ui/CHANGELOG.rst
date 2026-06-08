@@ -5,7 +5,7 @@ Changelog for package cyclo-ui
 0.1.13 (2026-06-08)
 -------------------
 * Added explicit ``3D Sim Deploy`` and ``Real Robot Deploy`` controls with a confirmation dialog before robot publishing.
-* Added policy backend image pull controls with streaming progress feedback and stale-container refresh handling.
+* Added policy backend image pull controls with streaming progress feedback and explicit stale-container update handling.
 * Hid unavailable backend start/restart controls when the required Docker image is missing.
 * Contributors: Dongyun Kim
 

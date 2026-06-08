@@ -62,6 +62,17 @@ export function getPolicyBackendReadiness(status, options = {}) {
       message: 'Checking backend...',
     };
   }
+  const imageStatus = status.image_status ||
+    (status.raw_state === 'stale_image' ? 'stale' : (
+      status.image_pulled ? 'current' : 'missing'
+    ));
+  if (imageStatus === 'stale') {
+    return {
+      ready: false,
+      state: 'update_required',
+      message: 'Policy Docker image changed. Update container before starting.',
+    };
+  }
   if (!status.image_pulled) {
     return {
       ready: false,
