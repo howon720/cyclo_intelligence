@@ -185,7 +185,7 @@ Flags (any start* command):
 
 Environment:
   GPU_ARCH         default | blackwell   (optional, amd64 only)
-  VERSION          image tag version (default: 0.1.12 for cyclo)
+  VERSION          image tag version (default: 0.1.13 for cyclo)
   ROS_DOMAIN_ID    default 30
   CYCLO_STORAGE_MODE
                    auto | ssd | local (default auto). Auto uses
