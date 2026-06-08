@@ -43,6 +43,26 @@ export function getPolicyBackendServices(status) {
   return services;
 }
 
+export function getPolicyBackendStaleReason(status) {
+  const rawState = status?.raw_state || '';
+  if (
+    rawState === 'stale_image' ||
+    rawState === 'image_mismatch'
+  ) {
+    return 'stale_image';
+  }
+  if (
+    rawState === 'workspace_mount_mismatch' ||
+    rawState.startsWith('missing_required_mounts=')
+  ) {
+    return rawState;
+  }
+  if (status?.image_status === 'stale') {
+    return 'stale_image';
+  }
+  return null;
+}
+
 async function readJsonResponse(response) {
   const text = await response.text();
   if (!text) return {};
@@ -62,15 +82,18 @@ export function getPolicyBackendReadiness(status, options = {}) {
       message: 'Checking backend...',
     };
   }
+  const staleReason = getPolicyBackendStaleReason(status);
   const imageStatus = status.image_status ||
-    (status.raw_state === 'stale_image' ? 'stale' : (
+    (staleReason ? 'stale' : (
       status.image_pulled ? 'current' : 'missing'
     ));
-  if (imageStatus === 'stale') {
+  if (imageStatus === 'stale' || staleReason) {
     return {
       ready: false,
       state: 'update_required',
-      message: 'Policy Docker image changed. Update container before starting.',
+      message: staleReason === 'stale_image'
+        ? 'Policy Docker image changed. Update container before starting.'
+        : 'Policy Docker container changed. Update container before starting.',
     };
   }
   if (!status.image_pulled) {

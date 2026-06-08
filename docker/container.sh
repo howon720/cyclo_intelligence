@@ -158,12 +158,25 @@ compose_service_image() {
         | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"][sys.argv[1]]["image"])' "$service"
 }
 
+container_workspace_source() {
+    docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' "$1" 2>/dev/null || true
+}
+
+canonical_path() {
+    readlink -f "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+paths_equal() {
+    [ "$(canonical_path "$1")" = "$(canonical_path "$2")" ]
+}
+
 remove_stale_policy_container() {
     local service="$1"
     local container="$2"
     local expected_image
     local expected_id
     local current_id
+    local current_workspace
 
     expected_image="$(compose_service_image "$service" 2>/dev/null || true)"
     if [ -z "$expected_image" ]; then
@@ -175,6 +188,18 @@ remove_stale_policy_container() {
     current_id="$(docker inspect -f '{{.Image}}' "$container" 2>/dev/null || true)"
     if [ -n "$expected_id" ] && [ -n "$current_id" ] && [ "$expected_id" != "$current_id" ]; then
         echo "[container.sh] Removing stale $container (expected $expected_image). It will be recreated on next start."
+        docker rm -f "$container" >/dev/null || true
+        return 0
+    fi
+
+    current_workspace="$(container_workspace_source "$container")"
+    if [ -n "$current_id" ] && [ -z "$current_workspace" ]; then
+        echo "[container.sh] Removing stale $container (/workspace mount missing). It will be recreated on next start."
+        docker rm -f "$container" >/dev/null || true
+        return 0
+    fi
+    if [ -n "$current_id" ] && ! paths_equal "$current_workspace" "$CYCLO_WORKSPACE_DIR"; then
+        echo "[container.sh] Removing stale $container (/workspace mounted from $current_workspace, expected $CYCLO_WORKSPACE_DIR). It will be recreated on next start."
         docker rm -f "$container" >/dev/null || true
     fi
 }

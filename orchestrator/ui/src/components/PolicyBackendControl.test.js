@@ -110,4 +110,29 @@ describe('PolicyBackendControl', () => {
       );
     });
   });
+
+  it('shows an explicit update action when the backend workspace mount is stale', async () => {
+    global.fetch.mockResolvedValueOnce(mockResponse({
+      name: 'lerobot',
+      image: 'robotis/lerobot-zenoh:1.0.1-arm64',
+      image_pulled: true,
+      image_status: 'stale',
+      container_state: 'exited',
+      raw_state: 'workspace_mount_mismatch',
+      services: [],
+    }));
+
+    render(<PolicyBackendControl serviceType="lerobot" />);
+
+    await screen.findByRole('button', {
+      name: 'LeRobot Docker update container',
+    });
+
+    expect(screen.getByText('Update required')).toBeInTheDocument();
+    expect(screen.getByText('Container outdated')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'LeRobot Docker on' }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'LeRobot Docker restart' }))
+      .not.toBeInTheDocument();
+  });
 });

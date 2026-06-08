@@ -17,6 +17,21 @@ describe('getPolicyBackendReadiness', () => {
     });
   });
 
+  it('blocks inference start when the backend workspace mount is stale', () => {
+    const readiness = getPolicyBackendReadiness({
+      image_pulled: true,
+      container_state: 'exited',
+      raw_state: 'workspace_mount_mismatch',
+      services: [],
+    });
+
+    expect(readiness).toEqual({
+      ready: false,
+      state: 'update_required',
+      message: 'Policy Docker container changed. Update container before starting.',
+    });
+  });
+
   it('treats the common main and engine runtime services as ready', () => {
     const readiness = getPolicyBackendReadiness({
       image_pulled: true,

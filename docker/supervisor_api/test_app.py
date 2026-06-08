@@ -46,6 +46,7 @@ finally:
 _missing_required_mounts = app._missing_required_mounts
 _mount_source_for_destination = app._mount_source_for_destination
 _backend_container_image_mismatch = app._backend_container_image_mismatch
+_backend_container_stale_reason = app._backend_container_stale_reason
 _require_known_service = app._require_known_service
 _BACKENDS = app._BACKENDS
 _USER_SERVICES = app._USER_SERVICES
@@ -108,6 +109,34 @@ def test_backend_container_image_mismatch_accepts_current_container_image():
         container,
         spec,
     )
+
+
+def test_backend_container_stale_reason_detects_workspace_mount_mismatch():
+    class FakeImages:
+        def get(self, image):
+            assert image == "robotis/groot-zenoh:1.3.0-arm64"
+            return SimpleNamespace(id="sha256:new")
+
+    container = SimpleNamespace(
+        attrs={
+            "Image": "sha256:new",
+            "Mounts": [
+                {
+                    "Destination": "/workspace",
+                    "Source": "/home/robot/old_workspace",
+                },
+            ],
+        }
+    )
+    spec = {"image": "robotis/groot-zenoh:1.3.0-arm64"}
+
+    assert _backend_container_stale_reason(
+        "groot",
+        SimpleNamespace(images=FakeImages()),
+        container,
+        spec,
+        "/mnt/ssd/cyclo_intelligence/workspace",
+    ) == "workspace_mount_mismatch"
 
 
 def test_mount_source_for_destination_resolves_workspace_host_path():

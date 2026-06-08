@@ -236,6 +236,12 @@ def _mount_source_for_destination(mounts, destination: str) -> Optional[str]:
     return None
 
 
+def _normalized_host_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    return os.path.realpath(path)
+
+
 def _self_container_candidates() -> List[str]:
     candidates = [
         os.environ.get("CYCLO_SUPERVISOR_API_CONTAINER_NAME"),
@@ -395,6 +401,50 @@ def _missing_required_mounts(name: str, container) -> List[str]:
         destination for destination in required_mounts
         if destination not in mounted_destinations
     ]
+
+
+def _backend_container_workspace_mount_mismatch(
+    container,
+    expected_workspace_dir: Optional[str],
+) -> bool:
+    if not expected_workspace_dir:
+        return False
+    workspace_source = _mount_source_for_destination(
+        container.attrs.get("Mounts", []),
+        "/workspace",
+    )
+    if not workspace_source:
+        return False
+    return (
+        _normalized_host_path(workspace_source)
+        != _normalized_host_path(expected_workspace_dir)
+    )
+
+
+def _backend_container_stale_reason(
+    name: str,
+    client: docker.DockerClient,
+    container,
+    spec: Dict[str, str],
+    expected_workspace_dir: Optional[str],
+) -> Optional[str]:
+    missing_mounts = _missing_required_mounts(name, container)
+    if missing_mounts:
+        return "missing_required_mounts=" + ",".join(missing_mounts)
+    if _backend_container_workspace_mount_mismatch(
+        container,
+        expected_workspace_dir,
+    ):
+        return "workspace_mount_mismatch"
+    if _backend_container_image_mismatch(client, container, spec):
+        return "image_mismatch"
+    return None
+
+
+def _backend_raw_state_for_stale_reason(reason: str) -> str:
+    if reason == "image_mismatch":
+        return "stale_image"
+    return reason
 
 
 def _backend_service_statuses(
@@ -741,13 +791,16 @@ async def _ensure_backend_running(name: str, spec: Dict[str, str]) -> ActionResu
             return False, f"inspect failed: {e}"
 
         try:
-            missing_mounts = _missing_required_mounts(name, ctr)
-            if missing_mounts:
+            stale_reason = _backend_container_stale_reason(
+                name,
+                client,
+                ctr,
+                spec,
+                _host_workspace_dir(),
+            )
+            if stale_reason:
                 ctr.remove(force=True)
-                return None, "missing_required_mounts=" + ",".join(missing_mounts)
-            if _backend_container_image_mismatch(client, ctr, spec):
-                ctr.remove(force=True)
-                return None, "image_mismatch"
+                return None, stale_reason
 
             state = _container_raw_state(ctr)
             if state == "paused":
@@ -814,8 +867,22 @@ async def backend_status(name: str) -> BackendStatus:
             return pulled, image_status, "not_created", None, None, []
         except DockerException as e:
             raise HTTPException(500, f"docker inspect failed: {e}")
-        if _backend_container_image_mismatch(client, ctr, spec):
-            return pulled, "stale", "exited", ctr.id, "stale_image", []
+        stale_reason = _backend_container_stale_reason(
+            name,
+            client,
+            ctr,
+            spec,
+            _host_workspace_dir(),
+        )
+        if stale_reason:
+            return (
+                pulled,
+                "stale",
+                "exited",
+                ctr.id,
+                _backend_raw_state_for_stale_reason(stale_reason),
+                [],
+            )
         raw = _container_raw_state(ctr)
         if raw == "running":
             mapped = "running"

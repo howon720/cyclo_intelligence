@@ -20,6 +20,7 @@ import {
   getPolicyBackendReadiness,
   getPolicyBackendServiceLabel,
   getPolicyBackendServices,
+  getPolicyBackendStaleReason,
 } from '../hooks/usePolicyBackendStatus';
 import {
   createDockerPullProgressTracker,
@@ -221,16 +222,16 @@ export default function PolicyBackendControl({ serviceType }) {
   const isPulling = pendingAction === 'pull';
   const isRunning = state === 'running';
   const imagePulled = Boolean(status?.image_pulled);
-  const isStaleImage = status?.image_status === 'stale' ||
-    status?.raw_state === 'stale_image';
+  const staleReason = getPolicyBackendStaleReason(status);
+  const isStaleContainer = Boolean(staleReason);
   const showPullButton = isPulling || (hasStatus && !imagePulled);
-  const showUpdateButton = hasStatus && imagePulled && isStaleImage;
-  const showRuntimeControls = !isStaleImage &&
+  const showUpdateButton = hasStatus && imagePulled && isStaleContainer;
+  const showRuntimeControls = !isStaleContainer &&
     (imagePulled || (hasStatus && state !== 'not_created'));
   const readiness = useMemo(() => getPolicyBackendReadiness(status), [status]);
   const isWarming = isRunning && !readiness.ready &&
     (readiness.state === 'checking' || readiness.state === 'warming');
-  const statusLabel = isStaleImage
+  const statusLabel = isStaleContainer
     ? 'Update required'
     : (
       isWarming
@@ -250,10 +251,10 @@ export default function PolicyBackendControl({ serviceType }) {
     'rounded-full',
     {
       'bg-green-100 text-green-700': isRunning && readiness.ready,
-      'bg-red-100 text-red-700': isStaleImage,
-      'bg-gray-100 text-gray-600': !isStaleImage &&
+      'bg-red-100 text-red-700': isStaleContainer,
+      'bg-gray-100 text-gray-600': !isStaleContainer &&
         (state === 'exited' || state === 'not_created'),
-      'bg-yellow-100 text-yellow-700': !isStaleImage &&
+      'bg-yellow-100 text-yellow-700': !isStaleContainer &&
         (state === 'unknown' || isWarming),
     }
   );
@@ -312,10 +313,12 @@ export default function PolicyBackendControl({ serviceType }) {
           <span className={statusClass}>
             {statusLabel}
           </span>
-          {isStaleImage && (
+          {isStaleContainer && (
             <Tooltip
               position="bottom"
-              content={`Container was created from an older image. Expected ${status?.image || 'the current backend image'}.`}
+              content={staleReason === 'stale_image'
+                ? `Container was created from an older image. Expected ${status?.image || 'the current backend image'}.`
+                : 'Container workspace or required mounts are out of date. Update it before starting.'}
             >
               <span className="text-xs font-semibold text-red-700 bg-red-100 px-2 py-0.5 rounded-full">
                 Container outdated
