@@ -9,13 +9,22 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
-import { MdPowerSettingsNew, MdRefresh, MdStop } from 'react-icons/md';
+import {
+  MdCloudDownload,
+  MdPowerSettingsNew,
+  MdRefresh,
+  MdStop,
+} from 'react-icons/md';
 import Tooltip from './Tooltip';
 import {
   getPolicyBackendReadiness,
   getPolicyBackendServiceLabel,
   getPolicyBackendServices,
 } from '../hooks/usePolicyBackendStatus';
+import {
+  createDockerPullProgressTracker,
+  parseDockerPullSseBlock,
+} from '../utils/dockerPullProgress';
 
 const API_BASE = '/api';
 
@@ -42,6 +51,65 @@ async function readJsonResponse(response) {
   }
 }
 
+function getPullErrorMessage(data) {
+  return data?.message ||
+    data?.error ||
+    data?.errorDetail?.message ||
+    'Image pull failed';
+}
+
+async function readPullStream(response, onProgress) {
+  if (!response.body) {
+    onProgress({ percent: null, message: 'Image pull started...', layers: 0 });
+    return;
+  }
+
+  const tracker = createDockerPullProgressTracker();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let completed = false;
+
+  const handleBlock = (block) => {
+    const item = parseDockerPullSseBlock(block);
+    if (!item) return;
+    if (item.event === 'error' || item.data?.error) {
+      throw new Error(getPullErrorMessage(item.data));
+    }
+    if (item.event === 'done') {
+      completed = true;
+      onProgress(tracker.complete(item.data?.message || 'Image pull complete'));
+      return;
+    }
+    onProgress(tracker.update(item.data));
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (value) {
+      buffer += decoder.decode(value, { stream: !done });
+    }
+    if (done) {
+      buffer += decoder.decode();
+    }
+
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() || '';
+    for (const block of blocks) {
+      handleBlock(block);
+    }
+
+    if (done) break;
+  }
+
+  if (buffer.trim()) {
+    handleBlock(buffer);
+  }
+  if (!completed) {
+    onProgress(tracker.complete());
+  }
+}
+
 export default function PolicyBackendControl({ serviceType }) {
   const backend = serviceType === 'groot' ? 'groot' : 'lerobot';
   const label = useMemo(
@@ -52,6 +120,14 @@ export default function PolicyBackendControl({ serviceType }) {
   const [status, setStatus] = useState(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
+  const [pullProgress, setPullProgress] = useState(null);
+
+  useEffect(() => {
+    if (!pullProgress || pendingAction === 'pull') return undefined;
+    if (pullProgress.percent !== 100 || pullProgress.error) return undefined;
+    const id = setTimeout(() => setPullProgress(null), 3000);
+    return () => clearTimeout(id);
+  }, [pendingAction, pullProgress]);
 
   const refreshStatus = useCallback(async ({ quiet = false } = {}) => {
     if (!quiet) setIsRefreshing(true);
@@ -100,10 +176,53 @@ export default function PolicyBackendControl({ serviceType }) {
     }
   }, [backend, label, refreshStatus]);
 
+  const pullBackendImage = useCallback(async () => {
+    setPendingAction('pull');
+    setPullProgress({
+      percent: null,
+      message: 'Preparing image pull...',
+      layers: 0,
+    });
+    try {
+      const response = await fetch(`${API_BASE}/backends/${backend}/pull`, {
+        method: 'POST',
+      });
+      if (!response.ok) {
+        const data = await readJsonResponse(response);
+        throw new Error(data.detail || data.message || `pull failed (${response.status})`);
+      }
+      await readPullStream(response, setPullProgress);
+      await refreshStatus({ quiet: true });
+      setPullProgress((previous) => ({
+        ...(previous || {}),
+        percent: 100,
+        layerPercent: null,
+        message: 'Image ready. Press ON.',
+        detail: '',
+      }));
+      toast.success(`${label} image ready`);
+    } catch (error) {
+      setPullProgress((previous) => ({
+        ...(previous || {}),
+        percent: previous?.percent ?? null,
+        message: error.message || 'Image pull failed',
+        error: true,
+      }));
+      toast.error(`${label} pull failed: ${error.message}`);
+      await refreshStatus({ quiet: true });
+    } finally {
+      setPendingAction(null);
+    }
+  }, [backend, label, refreshStatus]);
+
   const state = status?.container_state || 'unknown';
+  const hasStatus = Boolean(status);
   const isBusy = Boolean(pendingAction) || isRefreshing;
+  const isPulling = pendingAction === 'pull';
   const isRunning = state === 'running';
   const imagePulled = Boolean(status?.image_pulled);
+  const showPullButton = isPulling || (hasStatus && !imagePulled);
+  const showRuntimeControls = imagePulled || (hasStatus && state !== 'not_created');
   const readiness = useMemo(() => getPolicyBackendReadiness(status), [status]);
   const isWarming = isRunning && !readiness.ready &&
     (readiness.state === 'checking' || readiness.state === 'warming');
@@ -158,8 +277,20 @@ export default function PolicyBackendControl({ serviceType }) {
       'bg-blue-500 text-white hover:bg-blue-600': variant === 'on',
       'bg-gray-500 text-white hover:bg-gray-600': variant === 'restart',
       'bg-red-500 text-white hover:bg-red-600': variant === 'off',
+      'bg-emerald-500 text-white hover:bg-emerald-600': variant === 'pull',
     }
   );
+
+  const pullPercent = Number.isFinite(pullProgress?.percent)
+    ? pullProgress.percent
+    : null;
+  const layerPercent = Number.isFinite(pullProgress?.layerPercent)
+    ? pullProgress.layerPercent
+    : null;
+  const pullProgressLabel = pullPercent === null
+    ? (layerPercent === null ? '...' : `Layer ${layerPercent}%`)
+    : `${pullPercent}%`;
+  const pullBarWidth = `${pullPercent ?? layerPercent ?? (isPulling ? 8 : 0)}%`;
 
   return (
     <div className="mb-3 border-t border-b border-gray-200 py-2">
@@ -181,38 +312,129 @@ export default function PolicyBackendControl({ serviceType }) {
           )}
         </div>
       </div>
-      <div className="grid grid-cols-3 gap-2">
-        <button
-          type="button"
-          className={buttonClass('on')}
-          disabled={isBusy}
-          onClick={() => callBackend('start', 'started')}
-          aria-label={`${label} on`}
-        >
-          <MdPowerSettingsNew size={16} />
-          ON
-        </button>
-        <button
-          type="button"
-          className={buttonClass('restart')}
-          disabled={isBusy}
-          onClick={() => callBackend('restart', 'restarted')}
-          aria-label={`${label} restart`}
-        >
-          <MdRefresh size={16} />
-          Restart
-        </button>
-        <button
-          type="button"
-          className={buttonClass('off')}
-          disabled={isBusy}
-          onClick={() => callBackend('stop', 'stopped')}
-          aria-label={`${label} off`}
-        >
-          <MdStop size={16} />
-          OFF
-        </button>
+      <div className={clsx(
+        'grid',
+        'gap-2',
+        showPullButton && !showRuntimeControls ? 'grid-cols-1' : (
+          showPullButton ? 'grid-cols-2' : 'grid-cols-3'
+        )
+      )}
+      >
+        {showPullButton && (
+          <button
+            type="button"
+            className={buttonClass('pull')}
+            disabled={isBusy}
+            onClick={pullBackendImage}
+            aria-label={`${label} pull image`}
+          >
+            <MdCloudDownload size={16} />
+            Pull
+          </button>
+        )}
+        {showRuntimeControls && (
+          <>
+            {imagePulled && (
+              <>
+                <button
+                  type="button"
+                  className={buttonClass('on')}
+                  disabled={isBusy}
+                  onClick={() => callBackend('start', 'started')}
+                  aria-label={`${label} on`}
+                >
+                  <MdPowerSettingsNew size={16} />
+                  ON
+                </button>
+                <button
+                  type="button"
+                  className={buttonClass('restart')}
+                  disabled={isBusy}
+                  onClick={() => callBackend('restart', 'restarted')}
+                  aria-label={`${label} restart`}
+                >
+                  <MdRefresh size={16} />
+                  Restart
+                </button>
+              </>
+            )}
+            <button
+              type="button"
+              className={buttonClass('off')}
+              disabled={isBusy}
+              onClick={() => callBackend('stop', 'stopped')}
+              aria-label={`${label} off`}
+            >
+              <MdStop size={16} />
+              OFF
+            </button>
+          </>
+        )}
       </div>
+      {pullProgress && (
+        <Tooltip
+          position="bottom"
+          content={pullProgress.message}
+          disabled={!pullProgress.message}
+          className="w-full"
+        >
+          <div className={clsx(
+            'mt-2',
+            'w-full',
+            'rounded-md',
+            'bg-gray-50',
+            'px-2',
+            'py-2',
+            pullProgress.error && 'bg-red-50'
+          )}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className={clsx(
+                'min-w-0',
+                'truncate',
+                'text-xs',
+                'font-medium',
+                pullProgress.error ? 'text-red-700' : 'text-gray-600'
+              )}
+              >
+                {pullProgress.message || 'Pulling image...'}
+              </span>
+              <span className={clsx(
+                'shrink-0',
+                'text-xs',
+                'font-semibold',
+                pullProgress.error ? 'text-red-700' : 'text-gray-700'
+              )}
+              >
+                {pullProgressLabel}
+              </span>
+            </div>
+            {pullProgress.detail && (
+              <div className={clsx(
+                'mt-0.5',
+                'truncate',
+                'text-[11px]',
+                'font-medium',
+                pullProgress.error ? 'text-red-600' : 'text-gray-500'
+              )}
+              >
+                {pullProgress.detail}
+              </div>
+            )}
+            <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-gray-200">
+              <div
+                className={clsx(
+                  'h-full',
+                  'transition-all',
+                  'duration-300',
+                  pullProgress.error ? 'bg-red-500' : 'bg-emerald-500'
+                )}
+                style={{ width: pullBarWidth }}
+              />
+            </div>
+          </div>
+        </Tooltip>
+      )}
       {isRunning && (
         <>
           <div className="mt-2 grid grid-cols-2 gap-2">

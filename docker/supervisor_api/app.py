@@ -200,7 +200,7 @@ _BACKENDS: Dict[str, Dict[str, str]] = {
     "groot": {
         "service": "groot",
         "container": "groot_server",
-        "image": f"robotis/groot-zenoh:1.2.1-{_BACKEND_ARCH}",
+        "image": f"robotis/groot-zenoh:1.3.0-{_BACKEND_ARCH}",
         "services": ["main-runtime", "engine-process"],
     },
 }

@@ -46,6 +46,7 @@ finally:
 _missing_required_mounts = app._missing_required_mounts
 _mount_source_for_destination = app._mount_source_for_destination
 _require_known_service = app._require_known_service
+_BACKENDS = app._BACKENDS
 _USER_SERVICES = app._USER_SERVICES
 
 
@@ -102,6 +103,13 @@ def test_unknown_user_service_is_rejected():
 
 def test_zenoh_router_is_user_managed_service():
     assert "zenoh_router" in _USER_SERVICES
+
+
+def test_groot_backend_uses_current_release_image():
+    assert (
+        _BACKENDS["groot"]["image"]
+        == f"robotis/groot-zenoh:1.3.0-{app._BACKEND_ARCH}"
+    )
 
 
 def test_host_project_dir_falls_back_to_compose_container_name(monkeypatch):
