@@ -76,6 +76,10 @@ services:
       - ZENOH_ROUTER_PORT=7447
       - ZENOH_CONFIG_OVERRIDE=transport/shared_memory/enabled=true
       - CYCLO_UI_PORT=${CYCLO_UI_PORT:-80}
+      # LOAD may include first-time gated backbone downloads (e.g. Cosmos).
+      # Keep this long enough that a real download is not surfaced as a
+      # false model-load failure while the container continues downloading.
+      - INFERENCE_LOAD_TIMEOUT_SEC=${INFERENCE_LOAD_TIMEOUT_SEC:-7200}
       - PYTHONUNBUFFERED=1
 
     volumes:
@@ -292,9 +296,12 @@ services:
       # Start N1.7 in PyTorch eager mode. Enable after model-load/action
       # smoke tests pass on the target robot.
       - GROOT_TRT_ENABLED=false
-      - CONTROL_HZ=15
+      - CONTROL_HZ=100
       - INFERENCE_HZ=15
       - TARGET_CHUNK_SIZE=none
+      - REFILL_MARGIN_S=0.2
+      - REFILL_LATENCY_WARMUP_SAMPLES=1
+      - REFILL_LATENCY_SAMPLE_MAX_S=2.0
       - CMD_VEL_LINEAR_DEADBAND=0.02
       - CMD_VEL_ANGULAR_DEADBAND=0.02
       - HF_HOME=/root/.cache/huggingface

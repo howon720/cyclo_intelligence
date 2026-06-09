@@ -30,6 +30,8 @@ import TokenInputPopup from './TokenInputPopup';
 import HFStatus from '../constants/HFStatus';
 import { DEFAULT_PATHS } from '../constants/paths';
 
+const HUGGINGFACE_ENDPOINT = 'https://huggingface.co';
+
 // HuggingFace repository ID validation (includes username/repo format)
 const validateHfRepoId = (repoId) => {
   if (!repoId) return { isValid: false, message: '' };
@@ -140,7 +142,7 @@ const PolicyDownloadModal = ({ isOpen, onClose, onDownloadComplete }) => {
   const canCloseModal = !isDownloading;
 
   // Token related handlers
-  const handleTokenSubmit = async (token) => {
+  const handleTokenSubmit = async ({ token, label = '' }) => {
     if (!token || !token.trim()) {
       toast.error('Please enter a token');
       return;
@@ -148,7 +150,11 @@ const PolicyDownloadModal = ({ isOpen, onClose, onDownloadComplete }) => {
 
     setIsLoading(true);
     try {
-      const result = await registerHFUser(token);
+      const result = await registerHFUser({
+        endpoint: HUGGINGFACE_ENDPOINT,
+        label: label || 'Hugging Face',
+        token,
+      });
       console.log('registerHFUser result:', result);
 
       if (result && result.success) {
@@ -459,6 +465,8 @@ const PolicyDownloadModal = ({ isOpen, onClose, onDownloadComplete }) => {
         onClose={() => setShowTokenPopup(false)}
         onSubmit={handleTokenSubmit}
         isLoading={isLoading}
+        endpoint={HUGGINGFACE_ENDPOINT}
+        defaultLabel="Hugging Face"
       />
     </>
   );

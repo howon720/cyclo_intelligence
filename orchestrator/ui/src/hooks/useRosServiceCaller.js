@@ -239,6 +239,7 @@ export function useRosServiceCaller() {
         );
         const imageResize = options.imageResize || null;
         const inferenceMode = options.inferenceMode || taskInfo.inferenceMode || 'simulation';
+        const policyPath = String(taskInfo.policyPath || '').trim();
 
         const request = {
           task_info: {
@@ -247,7 +248,7 @@ export function useRosServiceCaller() {
             task_type: String(taskType),
             task_instruction: taskInstruction,
             subtask_instruction: subtaskInstruction,
-            policy_path: String(taskInfo.policyPath || ''),
+            policy_path: policyPath,
             record_inference_mode: Boolean(taskInfo.recordInferenceMode),
             tags: [`inference_mode:${inferenceMode}`],
             control_hz: Number(taskInfo.controlHz || 100),
@@ -282,10 +283,13 @@ export function useRosServiceCaller() {
         console.log('request:', request);
 
         console.log(`Sending command '${command}' (${command_enum}) to service`);
+        const serviceTimeoutMs = Number(options.serviceTimeoutMs || 0) ||
+          (command === 'start_inference' ? 30000 : 10000);
         const result = await callService(
           '/task/command',
           'interfaces/srv/SendCommand',
-          request
+          request,
+          serviceTimeoutMs
         );
 
         console.log(`Service response for command '${command}':`, result);

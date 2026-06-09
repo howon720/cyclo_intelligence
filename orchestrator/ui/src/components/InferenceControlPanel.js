@@ -40,7 +40,7 @@ import usePolicyBackendStatus, {
 
 const phaseGuideMessages = {
   [InferencePhase.READY]: 'Ready to start',
-  [InferencePhase.LOADING]: 'Loading model...',
+  [InferencePhase.LOADING]: 'Loading model / downloading assets...',
   [InferencePhase.INFERENCING]: 'Inferencing',
   [InferencePhase.PAUSED]: 'Paused',
 };
@@ -79,6 +79,7 @@ export default function InferenceControlPanel() {
   const isLoading = phase === InferencePhase.LOADING;
   const isInferencing = phase === InferencePhase.INFERENCING;
   const isPaused = phase === InferencePhase.PAUSED;
+  const inferencePhaseRef = useRef(phase);
   const isModelLoaded = isInferencing || isPaused;
   const shouldCheckBackend = isIdle || isPaused;
   const serverRecording =
@@ -102,6 +103,10 @@ export default function InferenceControlPanel() {
   useEffect(() => {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
+
+  useEffect(() => {
+    inferencePhaseRef.current = phase;
+  }, [phase]);
 
   useEffect(() => {
     toasts
@@ -151,9 +156,19 @@ export default function InferenceControlPanel() {
 
   const executeCommand = useCallback(
     async (commandName, commandString, options = {}) => {
+      const isStartTimeoutDuringLoading = (message = '') => (
+        commandString === 'start_inference' &&
+        String(message).toLowerCase().includes('timeout') &&
+        inferencePhaseRef.current === InferencePhase.LOADING
+      );
+
       try {
         const result = await sendRecordCommand(commandString, options);
         if (result && result.success === false) {
+          if (isStartTimeoutDuringLoading(result.message)) {
+            toast('Model loading is still running. Large downloads can take several minutes.');
+            return result;
+          }
           toast.error(`Command failed: ${result.message || 'Unknown error'}`);
           // Backend may have left phase in LOADING/INFERENCING after a failed
           // setup; force the local phase back to READY so the panel becomes
@@ -173,6 +188,12 @@ export default function InferenceControlPanel() {
           errorMessage.includes('WebSocket')
         ) {
           toast.error(`ROS connection failed: rosbridge server is not running (${rosHost})`);
+        } else if (isStartTimeoutDuringLoading(errorMessage)) {
+          toast('Model loading is still running. Large downloads can take several minutes.');
+          return {
+            success: true,
+            message: 'Model loading is still running',
+          };
         } else if (errorMessage.includes('timeout')) {
           toast.error(`Command timeout [${commandName}]: Server did not respond`);
         } else {

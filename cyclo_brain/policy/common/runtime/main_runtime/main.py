@@ -83,6 +83,13 @@ class MainRuntime:
             target_chunk_size=self._target_chunk_size_from_env(),
             postprocess_actions=self._bool_env("POSTPROCESS_ACTIONS", True),
             alignment_mode=os.environ.get("ACTION_ALIGNMENT_MODE", "l2"),
+            refill_margin_s=float(os.environ.get("REFILL_MARGIN_S", "0.2")),
+            latency_warmup_samples=int(
+                os.environ.get("REFILL_LATENCY_WARMUP_SAMPLES", "1")
+            ),
+            max_refill_latency_s=self._optional_float_env(
+                "REFILL_LATENCY_SAMPLE_MAX_S", "2.0"
+            ),
         )
         self._engine_client = engine_client
         self._command_srv = None
@@ -163,10 +170,17 @@ class MainRuntime:
 
     @staticmethod
     def _target_chunk_size_from_env() -> int | None:
-        raw = os.environ.get("TARGET_CHUNK_SIZE", "100").strip().lower()
+        raw = os.environ.get("TARGET_CHUNK_SIZE", "none").strip().lower()
         if raw in {"", "none", "off", "0"}:
             return None
         return int(raw)
+
+    @staticmethod
+    def _optional_float_env(name: str, default: str) -> float | None:
+        raw = os.environ.get(name, default).strip().lower()
+        if raw in {"", "none", "off", "0"}:
+            return None
+        return float(raw)
 
 
 def main() -> None:  # pragma: no cover - container entrypoint.

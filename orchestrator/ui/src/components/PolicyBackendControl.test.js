@@ -6,6 +6,16 @@ jest.mock('react-hot-toast', () => ({
   error: jest.fn(),
 }));
 
+const mockRegisterHFUser = jest.fn();
+const mockListHFEndpoints = jest.fn();
+
+jest.mock('../hooks/useRosServiceCaller', () => ({
+  useRosServiceCaller: () => ({
+    registerHFUser: mockRegisterHFUser,
+    listHFEndpoints: mockListHFEndpoints,
+  }),
+}));
+
 function mockResponse(data, options = {}) {
   return {
     ok: options.ok ?? true,
@@ -20,6 +30,9 @@ function mockResponse(data, options = {}) {
 describe('PolicyBackendControl', () => {
   beforeEach(() => {
     global.fetch = jest.fn();
+    mockRegisterHFUser.mockReset();
+    mockListHFEndpoints.mockReset();
+    mockListHFEndpoints.mockResolvedValue({ success: true, endpoints: [] });
   });
 
   afterEach(() => {
@@ -134,5 +147,36 @@ describe('PolicyBackendControl', () => {
       .not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'LeRobot Docker restart' }))
       .not.toBeInTheDocument();
+  });
+
+  it('lets GR00T users register a Hugging Face token from inference controls', async () => {
+    mockRegisterHFUser.mockResolvedValue({ success: true });
+    global.fetch.mockResolvedValueOnce(mockResponse({
+      name: 'groot',
+      image: 'robotis/groot-zenoh:1.3.0-arm64',
+      image_pulled: true,
+      image_status: 'current',
+      container_state: 'running',
+      services: [],
+    }));
+
+    render(<PolicyBackendControl serviceType="groot" />);
+
+    const tokenButton = await screen.findByRole('button', {
+      name: 'GR00T Docker Hugging Face token',
+    });
+    fireEvent.click(tokenButton);
+    fireEvent.change(screen.getByPlaceholderText('Enter your Hugging Face token'), {
+      target: { value: 'hf_test_token' },
+    });
+    fireEvent.click(screen.getByText('Submit'));
+
+    await waitFor(() => {
+      expect(mockRegisterHFUser).toHaveBeenCalledWith({
+        endpoint: 'https://huggingface.co',
+        label: 'Hugging Face',
+        token: 'hf_test_token',
+      });
+    });
   });
 });

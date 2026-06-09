@@ -40,6 +40,10 @@ class ActionChunkProcessor:
     ):
         self._inference_hz = float(inference_hz)
         self._control_hz = float(control_hz)
+        if self._inference_hz <= 0.0:
+            raise ValueError("inference_hz must be positive")
+        if self._control_hz <= 0.0:
+            raise ValueError("control_hz must be positive")
         self._chunk_align_window_s = max(0.0, float(chunk_align_window_s))
         self._blend_steps = max(1, int(self.BLEND_DURATION_S * self._control_hz))
         self._postprocess = bool(postprocess)
@@ -148,8 +152,11 @@ class ActionChunkProcessor:
             return chunk
         t_original = np.arange(T) / self._inference_hz
         duration = (T - 1) / self._inference_hz
-        n_interp = int(round(duration * self._control_hz)) + 1
-        t_interp = np.linspace(0, duration, n_interp)
+        # Publish one command per control tick over the source trajectory
+        # duration. The end point belongs to the next tick/chunk, so a
+        # 16-point, 15 Hz source trajectory becomes 100 outputs at 100 Hz.
+        n_interp = max(1, int(round(duration * self._control_hz)))
+        t_interp = np.arange(n_interp) / self._control_hz
         out = np.empty((n_interp, D))
         for d in range(D):
             out[:, d] = np.interp(t_interp, t_original, chunk[:, d])

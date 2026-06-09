@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import threading
@@ -54,10 +55,12 @@ class ControlLoop:
         inference_hz: float = 15.0,
         control_hz: float = 100.0,
         chunk_align_window_s: float = 0.3,
-        target_chunk_size: Optional[int] = 100,
+        target_chunk_size: Optional[int] = None,
         postprocess_actions: bool = True,
         alignment_mode: str = "l2",
         refill_margin_s: float = 0.2,
+        latency_warmup_samples: int = 1,
+        max_refill_latency_s: Optional[float] = 2.0,
     ) -> None:
         self._requester = requester
         self._inference_hz = float(inference_hz)
@@ -67,6 +70,15 @@ class ControlLoop:
         self._postprocess_actions = bool(postprocess_actions)
         self._alignment_mode = alignment_mode
         self._refill_margin_s = float(refill_margin_s)
+        self._request_latency_ema_s: Optional[float] = None
+        self._request_latency_alpha = 0.2
+        self._latency_warmup_samples = max(0, int(latency_warmup_samples))
+        self._latency_warmup_remaining = self._latency_warmup_samples
+        self._max_refill_latency_s = (
+            None
+            if max_refill_latency_s is None or max_refill_latency_s <= 0.0
+            else float(max_refill_latency_s)
+        )
 
         self._lock = threading.RLock()
         self._robot: Optional[RobotClient] = None
@@ -105,6 +117,7 @@ class ControlLoop:
             self._task_instruction = task_instruction or ""
             self._action_keys = list(action_keys or self._robot.action_keys)
             self._publish_to_robot = bool(publish_to_robot)
+            self._reset_request_latency_locked()
             self._generation += 1
             logger.info(
                 "configured RobotClient command path for %s (publish_to_robot=%s)",
@@ -123,6 +136,7 @@ class ControlLoop:
             if self._robot is not None:
                 self._robot.close()
                 self._robot = None
+            self._reset_request_latency_locked()
 
     def start(self, publish_to_robot: Optional[bool] = None) -> None:
         with self._lock:
@@ -206,7 +220,7 @@ class ControlLoop:
                 if publish_to_robot:
                     robot.publish_action(action, action_keys)
 
-            refill_threshold = max(1, int(self._refill_margin_s * processor.output_hz))
+            refill_threshold = self._refill_threshold(processor)
             should_request = (
                 processor.buffer_size < refill_threshold
                 and (self._request_thread is None or not self._request_thread.is_alive())
@@ -221,7 +235,14 @@ class ControlLoop:
             self._request_thread.start()
 
     def _request_and_buffer(self, task_instruction: str, generation: int) -> None:
-        response = self._requester.get_action(task_instruction)
+        started_at = time.monotonic()
+        try:
+            response = self._requester.get_action(task_instruction)
+        except Exception as e:
+            self._record_request_latency(time.monotonic() - started_at)
+            logger.warning("get_action raised: %s", e)
+            return
+        self._record_request_latency(time.monotonic() - started_at)
         if not response.success:
             logger.warning("get_action failed: %s", response.message)
             return
@@ -245,6 +266,41 @@ class ControlLoop:
                 and self._processor is not None
             ):
                 self._processor.push_actions(chunk)
+
+    def _refill_threshold(self, processor: ActionChunkProcessor) -> int:
+        threshold_s = max(0.0, self._refill_margin_s)
+        if self._request_latency_ema_s is not None:
+            threshold_s += max(0.0, self._request_latency_ema_s)
+        return max(1, int(math.ceil(threshold_s * processor.output_hz)))
+
+    def _record_request_latency(self, latency_s: float) -> None:
+        latency_s = max(0.0, float(latency_s))
+        with self._lock:
+            if self._latency_warmup_remaining > 0:
+                self._latency_warmup_remaining -= 1
+                return
+            if (
+                self._max_refill_latency_s is not None
+                and latency_s > self._max_refill_latency_s
+            ):
+                logger.debug(
+                    "ignoring GET_ACTION latency sample %.3fs above %.3fs",
+                    latency_s,
+                    self._max_refill_latency_s,
+                )
+                return
+            if self._request_latency_ema_s is None:
+                self._request_latency_ema_s = latency_s
+            else:
+                alpha = self._request_latency_alpha
+                self._request_latency_ema_s = (
+                    alpha * latency_s
+                    + (1.0 - alpha) * self._request_latency_ema_s
+                )
+
+    def _reset_request_latency_locked(self) -> None:
+        self._request_latency_ema_s = None
+        self._latency_warmup_remaining = self._latency_warmup_samples
 
     def _tick_period(self) -> float:
         with self._lock:

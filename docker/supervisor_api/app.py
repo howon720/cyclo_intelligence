@@ -227,6 +227,7 @@ def _require_known_backend(name: str) -> Dict[str, str]:
 
 _HOST_PROJECT_DIR_CACHE: Optional[str] = None
 _HOST_WORKSPACE_DIR_CACHE: Optional[str] = None
+_HOST_HUGGINGFACE_DIR_CACHE: Optional[str] = None
 
 
 def _mount_source_for_destination(mounts, destination: str) -> Optional[str]:
@@ -309,23 +310,76 @@ def _host_workspace_dir() -> Optional[str]:
         _HOST_WORKSPACE_DIR_CACHE = env_path
         return _HOST_WORKSPACE_DIR_CACHE
 
-    own_id = os.environ.get("HOSTNAME")
-    if not own_id:
-        return None
     try:
-        ctr = _docker_client().containers.get(own_id)
+        client = _docker_client()
     except DockerException as e:
-        logger.warning("self-inspect for workspace mount failed: %s", e)
+        logger.warning("docker init failed during workspace self-inspect: %s", e)
         return None
 
-    host_workspace = _mount_source_for_destination(
-        ctr.attrs.get("Mounts", []),
-        "/workspace",
-    )
-    if host_workspace:
-        _HOST_WORKSPACE_DIR_CACHE = host_workspace
-        return _HOST_WORKSPACE_DIR_CACHE
+    for own_id in _self_container_candidates():
+        try:
+            ctr = client.containers.get(own_id)
+        except NotFound:
+            continue
+        except DockerException as e:
+            logger.warning("self-inspect for workspace mount failed: %s", e)
+            continue
+        host_workspace = _mount_source_for_destination(
+            ctr.attrs.get("Mounts", []),
+            "/workspace",
+        )
+        if host_workspace:
+            _HOST_WORKSPACE_DIR_CACHE = host_workspace
+            return _HOST_WORKSPACE_DIR_CACHE
     return None
+
+
+def _host_huggingface_dir() -> Optional[str]:
+    """Resolve the host-side directory mounted at /root/.cache/huggingface."""
+    global _HOST_HUGGINGFACE_DIR_CACHE
+    if _HOST_HUGGINGFACE_DIR_CACHE is not None:
+        return _HOST_HUGGINGFACE_DIR_CACHE
+
+    env_path = os.environ.get("CYCLO_HUGGINGFACE_DIR")
+    if env_path:
+        _HOST_HUGGINGFACE_DIR_CACHE = env_path
+        return _HOST_HUGGINGFACE_DIR_CACHE
+
+    try:
+        client = _docker_client()
+    except DockerException as e:
+        logger.warning("docker init failed during huggingface self-inspect: %s", e)
+        return None
+
+    for own_id in _self_container_candidates():
+        try:
+            ctr = client.containers.get(own_id)
+        except NotFound:
+            continue
+        except DockerException as e:
+            logger.warning("self-inspect for huggingface mount failed: %s", e)
+            continue
+        host_huggingface = _mount_source_for_destination(
+            ctr.attrs.get("Mounts", []),
+            "/root/.cache/huggingface",
+        )
+        if host_huggingface:
+            _HOST_HUGGINGFACE_DIR_CACHE = host_huggingface
+            return _HOST_HUGGINGFACE_DIR_CACHE
+    return None
+
+
+def _compose_env() -> Dict[str, str]:
+    """Build env for host docker compose calls made from this container."""
+    env = os.environ.copy()
+    workspace_dir = _host_workspace_dir()
+    huggingface_dir = _host_huggingface_dir()
+    if workspace_dir:
+        env["CYCLO_WORKSPACE_DIR"] = workspace_dir
+    if huggingface_dir:
+        env["CYCLO_HUGGINGFACE_DIR"] = huggingface_dir
+    env.setdefault("ARCH", _BACKEND_ARCH)
+    return env
 
 
 def _compose_base_cmd() -> List[str]:
@@ -730,7 +784,7 @@ async def backend_recreate(name: str) -> ActionResult:
 
     local_image, removed = await asyncio.to_thread(_remove_existing)
     cmd = _compose_base_cmd() + ["create", "--no-build", spec["service"]]
-    result = await _run(*cmd, timeout=60.0)
+    result = await _run(*cmd, timeout=60.0, env=_compose_env())
     ok = result.rc == 0
     msg = result.stderr or result.stdout or f"rc={result.rc}"
     if ok:
@@ -837,7 +891,7 @@ async def _ensure_backend_running(name: str, spec: Dict[str, str]) -> ActionResu
         )
 
     cmd = _compose_base_cmd() + ["up", "-d", "--no-build", spec["service"]]
-    result = await _run(*cmd, timeout=60.0)
+    result = await _run(*cmd, timeout=60.0, env=_compose_env())
     ok = result.rc == 0
     msg = result.stderr or result.stdout or f"rc={result.rc}"
     if ok:

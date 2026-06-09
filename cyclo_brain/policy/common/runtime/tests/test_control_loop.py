@@ -110,6 +110,39 @@ class ControlLoopSafetyTests(unittest.TestCase):
 
         self.assertEqual(processor.clear_count, 1)
 
+    def test_refill_threshold_includes_observed_request_latency(self) -> None:
+        processor = FakeProcessor()
+        robot = FakeRobot()
+        loop = self._make_loop(processor, robot)
+        loop._refill_margin_s = 0.25
+        loop._request_latency_ema_s = 0.25
+
+        self.assertEqual(loop._refill_threshold(processor), 50)
+
+    def test_initial_latency_sample_is_ignored_for_warmup(self) -> None:
+        processor = FakeProcessor()
+        robot = FakeRobot()
+        loop = self._make_loop(processor, robot)
+        loop._latency_warmup_remaining = 1
+
+        loop._record_request_latency(5.0)
+        self.assertIsNone(loop._request_latency_ema_s)
+
+        loop._record_request_latency(0.25)
+        self.assertEqual(loop._request_latency_ema_s, 0.25)
+
+    def test_refill_latency_outlier_is_ignored(self) -> None:
+        processor = FakeProcessor()
+        robot = FakeRobot()
+        loop = self._make_loop(processor, robot)
+        loop._latency_warmup_remaining = 0
+        loop._max_refill_latency_s = 1.0
+
+        loop._record_request_latency(0.2)
+        loop._record_request_latency(5.0)
+
+        self.assertEqual(loop._request_latency_ema_s, 0.2)
+
 
 if __name__ == "__main__":
     unittest.main()

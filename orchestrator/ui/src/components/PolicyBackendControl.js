@@ -11,23 +11,27 @@ import clsx from 'clsx';
 import toast from 'react-hot-toast';
 import {
   MdCloudDownload,
+  MdKey,
   MdPowerSettingsNew,
   MdRefresh,
   MdStop,
 } from 'react-icons/md';
 import Tooltip from './Tooltip';
+import TokenInputPopup from './TokenInputPopup';
 import {
   getPolicyBackendReadiness,
   getPolicyBackendServiceLabel,
   getPolicyBackendServices,
   getPolicyBackendStaleReason,
 } from '../hooks/usePolicyBackendStatus';
+import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
 import {
   createDockerPullProgressTracker,
   parseDockerPullSseBlock,
 } from '../utils/dockerPullProgress';
 
 const API_BASE = '/api';
+const HUGGINGFACE_ENDPOINT = 'https://huggingface.co';
 
 const stateLabels = {
   running: 'Running',
@@ -122,6 +126,10 @@ export default function PolicyBackendControl({ serviceType }) {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
   const [pullProgress, setPullProgress] = useState(null);
+  const [showTokenPopup, setShowTokenPopup] = useState(false);
+  const [isRegisteringToken, setIsRegisteringToken] = useState(false);
+  const [tokenRegistered, setTokenRegistered] = useState(false);
+  const { registerHFUser, listHFEndpoints } = useRosServiceCaller();
 
   useEffect(() => {
     if (!pullProgress || pendingAction === 'pull') return undefined;
@@ -156,6 +164,23 @@ export default function PolicyBackendControl({ serviceType }) {
     const id = setInterval(() => refreshStatus({ quiet: true }), 5000);
     return () => clearInterval(id);
   }, [refreshStatus]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (backend !== 'groot') return undefined;
+    listHFEndpoints()
+      .then((result) => {
+        if (cancelled || !result?.success) return;
+        const endpoints = result.endpoints || [];
+        setTokenRegistered(
+          endpoints.some((entry) => entry.endpoint === HUGGINGFACE_ENDPOINT)
+        );
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [backend, listHFEndpoints]);
 
   const callBackend = useCallback(async (action, successLabel) => {
     setPendingAction(action);
@@ -216,6 +241,31 @@ export default function PolicyBackendControl({ serviceType }) {
     }
   }, [backend, label, refreshStatus]);
 
+  const handleTokenSubmit = useCallback(async ({ token, label: tokenLabel = '' }) => {
+    if (!token || !token.trim()) {
+      toast.error('Please enter a Hugging Face token');
+      return;
+    }
+    setIsRegisteringToken(true);
+    try {
+      const result = await registerHFUser({
+        endpoint: HUGGINGFACE_ENDPOINT,
+        label: tokenLabel || 'Hugging Face',
+        token,
+      });
+      if (!result?.success) {
+        throw new Error(result?.message || 'Token registration failed');
+      }
+      setTokenRegistered(true);
+      setShowTokenPopup(false);
+      toast.success('Hugging Face token registered');
+    } catch (error) {
+      toast.error(`HF token registration failed: ${error.message}`);
+    } finally {
+      setIsRegisteringToken(false);
+    }
+  }, [registerHFUser]);
+
   const state = status?.container_state || 'unknown';
   const hasStatus = Boolean(status);
   const isBusy = Boolean(pendingAction) || isRefreshing;
@@ -228,6 +278,7 @@ export default function PolicyBackendControl({ serviceType }) {
   const showUpdateButton = hasStatus && imagePulled && isStaleContainer;
   const showRuntimeControls = !isStaleContainer &&
     (imagePulled || (hasStatus && state !== 'not_created'));
+  const showTokenControl = backend === 'groot';
   const readiness = useMemo(() => getPolicyBackendReadiness(status), [status]);
   const isWarming = isRunning && !readiness.ready &&
     (readiness.state === 'checking' || readiness.state === 'warming');
@@ -291,6 +342,7 @@ export default function PolicyBackendControl({ serviceType }) {
       'bg-red-500 text-white hover:bg-red-600': variant === 'off',
       'bg-emerald-500 text-white hover:bg-emerald-600': variant === 'pull',
       'bg-amber-500 text-white hover:bg-amber-600': variant === 'update',
+      'bg-violet-500 text-white hover:bg-violet-600': variant === 'token',
     }
   );
 
@@ -341,7 +393,9 @@ export default function PolicyBackendControl({ serviceType }) {
         'grid',
         'gap-2',
         showUpdateButton || (showPullButton && !showRuntimeControls) ? 'grid-cols-1' : (
-          showPullButton ? 'grid-cols-2' : 'grid-cols-3'
+          showPullButton ? 'grid-cols-2' : (
+            showTokenControl ? 'grid-cols-2' : 'grid-cols-3'
+          )
         )
       )}
       >
@@ -383,6 +437,18 @@ export default function PolicyBackendControl({ serviceType }) {
                   <MdPowerSettingsNew size={16} />
                   ON
                 </button>
+                {showTokenControl && (
+                  <button
+                    type="button"
+                    className={buttonClass('token')}
+                    disabled={isBusy || isRegisteringToken}
+                    onClick={() => setShowTokenPopup(true)}
+                    aria-label={`${label} Hugging Face token`}
+                  >
+                    <MdKey size={16} />
+                    HF Token
+                  </button>
+                )}
                 <button
                   type="button"
                   className={buttonClass('restart')}
@@ -506,6 +572,20 @@ export default function PolicyBackendControl({ serviceType }) {
           )}
         </>
       )}
+      {showTokenControl && tokenRegistered && (
+        <div className="mt-2 text-xs text-green-700">
+          Hugging Face token registered for GR00T gated backbone downloads.
+        </div>
+      )}
+      <TokenInputPopup
+        isOpen={showTokenPopup}
+        onClose={() => setShowTokenPopup(false)}
+        onSubmit={handleTokenSubmit}
+        isLoading={isRegisteringToken}
+        title="Register Hugging Face Token"
+        endpoint={HUGGINGFACE_ENDPOINT}
+        defaultLabel="Hugging Face"
+      />
     </div>
   );
 }

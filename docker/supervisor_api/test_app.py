@@ -47,6 +47,7 @@ _missing_required_mounts = app._missing_required_mounts
 _mount_source_for_destination = app._mount_source_for_destination
 _backend_container_image_mismatch = app._backend_container_image_mismatch
 _backend_container_stale_reason = app._backend_container_stale_reason
+_compose_env = app._compose_env
 _require_known_service = app._require_known_service
 _BACKENDS = app._BACKENDS
 _USER_SERVICES = app._USER_SERVICES
@@ -222,3 +223,59 @@ def test_host_project_dir_falls_back_to_compose_container_name(monkeypatch):
         assert fake_containers.requested == ["ubuntu", "cyclo_intelligence"]
     finally:
         app._HOST_PROJECT_DIR_CACHE = None
+
+
+def test_compose_env_uses_current_container_mounts(monkeypatch):
+    class FakeContainers:
+        def __init__(self):
+            self.requested = []
+
+        def get(self, name):
+            self.requested.append(name)
+            if name != "cyclo_intelligence":
+                raise NotFound(name)
+            return SimpleNamespace(
+                attrs={
+                    "Mounts": [
+                        {
+                            "Destination": "/workspace",
+                            "Source": "/mnt/ssd/cyclo_intelligence/workspace",
+                        },
+                        {
+                            "Destination": "/root/.cache/huggingface",
+                            "Source": "/mnt/ssd/cyclo_intelligence/huggingface",
+                        },
+                    ]
+                }
+            )
+
+    fake_containers = FakeContainers()
+    fake_client = SimpleNamespace(containers=fake_containers)
+
+    monkeypatch.setenv("HOSTNAME", "container-id")
+    monkeypatch.delenv("CYCLO_WORKSPACE_DIR", raising=False)
+    monkeypatch.delenv("CYCLO_HUGGINGFACE_DIR", raising=False)
+    monkeypatch.setattr(app, "_docker_client", lambda: fake_client)
+    app._HOST_WORKSPACE_DIR_CACHE = None
+    app._HOST_HUGGINGFACE_DIR_CACHE = None
+
+    try:
+        env = _compose_env()
+        assert (
+            env["CYCLO_WORKSPACE_DIR"]
+            == "/mnt/ssd/cyclo_intelligence/workspace"
+        )
+        assert (
+            env["CYCLO_HUGGINGFACE_DIR"]
+            == "/mnt/ssd/cyclo_intelligence/huggingface"
+        )
+        assert env["ARCH"] == app._BACKEND_ARCH
+        assert fake_containers.requested == [
+            "container-id",
+            "cyclo_intelligence",
+            "container-id",
+            "cyclo_intelligence",
+        ]
+    finally:
+        app._HOST_WORKSPACE_DIR_CACHE = None
+        app._HOST_HUGGINGFACE_DIR_CACHE = None

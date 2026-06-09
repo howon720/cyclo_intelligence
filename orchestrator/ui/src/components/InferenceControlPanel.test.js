@@ -1,8 +1,9 @@
 import { configureStore } from '@reduxjs/toolkit';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Provider } from 'react-redux';
+import toast from 'react-hot-toast';
 import InferenceControlPanel from './InferenceControlPanel';
-import taskReducer from '../features/tasks/taskSlice';
+import taskReducer, { setInferenceStatus } from '../features/tasks/taskSlice';
 import rosReducer from '../features/ros/rosSlice';
 import { InferencePhase } from '../constants/taskPhases';
 import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
@@ -36,8 +37,8 @@ jest.mock('../hooks/usePolicyBackendStatus', () => ({
   getPolicyBackendReadiness: (status) => status,
 }));
 
-const renderPanel = ({ inferenceMode = 'robot' } = {}) => {
-  const sendRecordCommand = jest.fn().mockResolvedValue({
+const renderPanel = ({ inferenceMode = 'robot', sendRecordCommand: sendOverride = null } = {}) => {
+  const sendRecordCommand = sendOverride || jest.fn().mockResolvedValue({
     success: true,
     message: 'ok',
   });
@@ -119,5 +120,40 @@ describe('InferenceControlPanel deploy safety', () => {
         inferenceMode: 'simulation',
       });
     });
+  });
+
+  test('keeps loading state when start command times out after LOADING begins', async () => {
+    let rejectStart;
+    const sendRecordCommand = jest.fn(() => new Promise((_, reject) => {
+      rejectStart = reject;
+    }));
+    const { store } = renderPanel({
+      inferenceMode: 'simulation',
+      sendRecordCommand,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /start inference/i }));
+
+    await waitFor(() => {
+      expect(sendRecordCommand).toHaveBeenCalledWith('start_inference', {
+        inferenceMode: 'simulation',
+      });
+    });
+
+    act(() => {
+      store.dispatch(setInferenceStatus({ inferencePhase: InferencePhase.LOADING }));
+      rejectStart(new Error('Service call timeout for /task/command'));
+    });
+
+    await waitFor(() => {
+      expect(toast).toHaveBeenCalledWith(
+        'Model loading is still running. Large downloads can take several minutes.'
+      );
+    });
+    expect(toast.error).not.toHaveBeenCalledWith(
+      expect.stringContaining('Command timeout')
+    );
+    expect(store.getState().tasks.inferenceStatus.inferencePhase)
+      .toBe(InferencePhase.LOADING);
   });
 });

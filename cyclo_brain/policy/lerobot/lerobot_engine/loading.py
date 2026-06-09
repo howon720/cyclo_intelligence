@@ -49,7 +49,7 @@ class LoadingMixin:
         ``pretrained_model/`` next to ``training_state/``. Strip that
         wrapper if needed so ``from_pretrained`` finds ``config.json``.
         """
-        root = Path(model_path)
+        root = Path((model_path or "").strip())
         nested = root / "pretrained_model"
         if not (root / "config.json").exists() and (nested / "config.json").exists():
             logger.info("Descending into pretrained_model: %s", nested)

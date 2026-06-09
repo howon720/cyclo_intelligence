@@ -8,6 +8,7 @@
 #   docker/container.sh start-lerobot      # → lerobot (idle until LOAD)
 #   docker/container.sh start-groot        # → groot (idle until LOAD)
 #   docker/container.sh enter              # → shell in cyclo_intelligence
+#   docker/container.sh build-ui           # → rebuild React UI only
 #   docker/container.sh enter-lerobot      # → shell in lerobot_server
 #   docker/container.sh enter-groot        # → shell in groot_server
 #   docker/container.sh logs               # → compose logs -f
@@ -234,6 +235,13 @@ Lifecycle:
   stop             compose down (prompts for confirmation)
   help             Show this help
 
+UI development:
+  build-ui         Rebuild only orchestrator/ui and copy the static build into
+                   the running cyclo_intelligence nginx root. Uses npm inside
+                   cyclo_intelligence when available, with a node:22 fallback.
+  test-ui [args]   Run React tests. Extra args are passed after npm test,
+                   e.g. test-ui -- --watchAll=false
+
 Flags (any start* command):
   --build, -b      Rebuild image from local Dockerfile instead of using
                    the pre-built image pulled from Docker Hub. Default
@@ -250,7 +258,118 @@ Environment:
                    docker/workspace and docker/huggingface.
   CYCLO_WORKSPACE_DIR / CYCLO_HUGGINGFACE_DIR
                    Override the host bind-mount paths directly.
+  CYCLO_UI_NODE_IMAGE
+                   Node image for build-ui/test-ui (default node:22).
 EOF
+}
+
+ui_dir() {
+    canonical_path "${SCRIPT_DIR}/../orchestrator/ui"
+}
+
+main_ui_dir() {
+    printf '%s\n' "/root/ros2_ws/src/cyclo_intelligence/orchestrator/ui"
+}
+
+main_container_has_npm() {
+    container_running "$MAIN_CONTAINER" \
+        && docker exec "$MAIN_CONTAINER" sh -lc 'command -v npm >/dev/null 2>&1'
+}
+
+run_ui_npm_in_main() {
+    docker exec \
+        -u "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -w "$(main_ui_dir)" \
+        "$MAIN_CONTAINER" \
+        npm "$@"
+}
+
+run_ui_npm_external() {
+    local dir
+    dir="$(ui_dir)"
+    docker run --rm --network host \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "${dir}:/ui" \
+        -w /ui \
+        "${CYCLO_UI_NODE_IMAGE:-node:22}" \
+        npm "$@"
+}
+
+run_ui_npm() {
+    if main_container_has_npm; then
+        run_ui_npm_in_main "$@"
+    else
+        run_ui_npm_external "$@"
+    fi
+}
+
+ensure_ui_dependencies() {
+    local dir
+    if main_container_has_npm; then
+        if docker exec "$MAIN_CONTAINER" test -x "$(main_ui_dir)/node_modules/.bin/react-scripts"; then
+            return 0
+        fi
+
+        echo "[container.sh] Installing UI dependencies inside ${MAIN_CONTAINER}..."
+        run_ui_npm_in_main ci --legacy-peer-deps
+        return 0
+    fi
+
+    dir="$(ui_dir)"
+    if [ -x "${dir}/node_modules/.bin/react-scripts" ]; then
+        return 0
+    fi
+
+    echo "[container.sh] Installing UI dependencies with ${CYCLO_UI_NODE_IMAGE:-node:22}..."
+    run_ui_npm ci --legacy-peer-deps
+}
+
+clean_ui_build_dir() {
+    local dir
+    if container_running "$MAIN_CONTAINER"; then
+        docker exec "$MAIN_CONTAINER" sh -lc "rm -rf '$(main_ui_dir)/build'"
+        return 0
+    fi
+
+    dir="$(ui_dir)"
+    docker run --rm --network none \
+        -v "${dir}:/ui" \
+        -w /ui \
+        "${CYCLO_UI_NODE_IMAGE:-node:22}" \
+        sh -c 'rm -rf build'
+}
+
+build_ui() {
+    local dir
+    dir="$(ui_dir)"
+    ensure_ui_dependencies
+
+    echo "[container.sh] Building React UI only..."
+    clean_ui_build_dir
+    run_ui_npm run build
+
+    if ! container_running "$MAIN_CONTAINER"; then
+        echo "[container.sh] UI build complete: ${dir}/build"
+        echo "[container.sh] ${MAIN_CONTAINER} is not running, so nginx was not updated."
+        return 0
+    fi
+
+    echo "[container.sh] Copying UI build into ${MAIN_CONTAINER} nginx root..."
+    docker cp "${dir}/build/." "${MAIN_CONTAINER}:/usr/share/nginx/html/"
+    docker exec "$MAIN_CONTAINER" sh -c 'nginx -s reload 2>/dev/null || true'
+    echo "[container.sh] UI updated. Refresh the browser to load the new bundle."
+}
+
+test_ui() {
+    ensure_ui_dependencies
+    echo "[container.sh] Running React UI tests..."
+    if [ "$#" -eq 0 ]; then
+        run_ui_npm test -- --watchAll=false
+    else
+        run_ui_npm test "$@"
+    fi
 }
 
 start_main() {
@@ -269,6 +388,7 @@ start_lerobot() {
     setup_x11
     echo "[container.sh] Pulling pre-built images..."
     $COMPOSE pull --ignore-pull-failures "$LEROBOT_SERVICE" || true
+    remove_stale_policy_container "$LEROBOT_SERVICE" "$LEROBOT_CONTAINER"
     echo "[container.sh] Starting $LEROBOT_SERVICE (ARCH=$ARCH${BUILD_FLAG:+, rebuild on})..."
     $COMPOSE up -d $BUILD_FLAG "$LEROBOT_SERVICE"
 }
@@ -278,6 +398,7 @@ start_groot() {
     setup_x11
     echo "[container.sh] Pulling pre-built images..."
     $COMPOSE pull --ignore-pull-failures "$GROOT_SERVICE" || true
+    remove_stale_policy_container "$GROOT_SERVICE" "$GROOT_CONTAINER"
     echo "[container.sh] Starting $GROOT_SERVICE (ARCH=$ARCH${BUILD_FLAG:+, rebuild on})..."
     $COMPOSE up -d $BUILD_FLAG "$GROOT_SERVICE"
 }
@@ -380,6 +501,8 @@ case "${1:-help}" in
     enter)           enter_main ;;
     enter-lerobot)   enter_lerobot ;;
     enter-groot)     enter_groot ;;
+    build-ui)        build_ui ;;
+    test-ui)         shift; test_ui "$@" ;;
     logs)            show_logs ;;
     status)          show_status ;;
     stop)            stop_all ;;

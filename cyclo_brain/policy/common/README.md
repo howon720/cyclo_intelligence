@@ -67,7 +67,19 @@ For LeRobot, user-trained models can be placed under
 | `POLICY_ENGINE_FACTORY` | no | `create_engine` | Engine process |
 | `GET_ACTION_TIMEOUT_S` | no | `5.0` | Main -> Engine request |
 | `LOAD_POLICY_TIMEOUT_S` | no | `300.0` | Main -> Engine request |
+| `INFERENCE_HZ` | no | `15.0` | Main action waypoint timing |
+| `CONTROL_HZ` | no | `100.0` | Main robot command loop |
+| `TARGET_CHUNK_SIZE` | no | `none` | Fixed-size resampling override; `none` keeps chunk duration |
+| `REFILL_MARGIN_S` | no | `0.2` | Extra buffer time after observed GET_ACTION latency |
+| `REFILL_LATENCY_WARMUP_SAMPLES` | no | `1` | Initial GET_ACTION latency samples ignored for warmup |
+| `REFILL_LATENCY_SAMPLE_MAX_S` | no | `2.0` | Ignore longer latency samples; `none` disables filtering |
 | `ZENOH_ROUTER_IP` / `ZENOH_ROUTER_PORT` / `ROS_DOMAIN_ID` | no | `127.0.0.1 / 7447 / 30` | both |
+
+For GR00T N1.7, the trained checkpoint may reference the gated
+`nvidia/Cosmos-Reason2-2B` backbone instead of vendoring those weights. Register
+a Hugging Face token for an approved account before first inference, or pre-cache
+the Cosmos files under the shared Hugging Face cache. Policy containers sync the
+Cyclo endpoint token store to the standard Hugging Face token file on startup.
 
 ## Adding a new policy
 
