@@ -45,6 +45,8 @@ def generate_launch_description():
             'fragment_timeout': 600,
             'max_message_size': 100000000,  # 100MB
             'unregister_timeout': 10.0,
+            'default_call_service_timeout': 0.0,
+            'call_services_in_new_thread': True,
         }],
     )
 

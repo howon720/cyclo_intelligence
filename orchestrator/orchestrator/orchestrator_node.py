@@ -292,7 +292,7 @@ class OrchestratorNode(Node):
             else []
         )
         urdf_path = self.params.get('urdf_path', '') if self.params else ''
-        timeout_sec = 120.0 if command in {
+        timeout_sec = 0.0 if command in {
             RecordingCommand.Request.STOP,
             RecordingCommand.Request.MOVE_TO_NEXT,
             RecordingCommand.Request.FINISH,
@@ -1546,27 +1546,17 @@ class OrchestratorNode(Node):
                 else:
                     if request.command == SendCommand.Request.STOP:
                         self.get_logger().info('Stopping and saving recording (forwarder)')
-                        cd_result = self._cyclo_data.send_recording_command(
-                            command=RecordingCommand.Request.STOP,
+                        cd_result = self._forward_recording(
+                            RecordingCommand.Request.STOP,
                             task_info=request.task_info,
-                            robot_type=self.robot_type,
-                            urdf_path=(
-                                self.params.get('urdf_path', '')
-                                if self.params else ''
-                            ),
                         )
                         self._apply_cyclo_data_response(cd_result, response)
 
                     elif request.command == SendCommand.Request.MOVE_TO_NEXT:
                         self.get_logger().info('Saving current episode (forwarder)')
-                        cd_result = self._cyclo_data.send_recording_command(
-                            command=RecordingCommand.Request.MOVE_TO_NEXT,
+                        cd_result = self._forward_recording(
+                            RecordingCommand.Request.MOVE_TO_NEXT,
                             task_info=request.task_info,
-                            robot_type=self.robot_type,
-                            urdf_path=(
-                                self.params.get('urdf_path', '')
-                                if self.params else ''
-                            ),
                         )
                         self._apply_cyclo_data_response(cd_result, response)
 
@@ -1575,14 +1565,9 @@ class OrchestratorNode(Node):
                         # flag — that field was removed); orchestrator
                         # still owns inference teardown + timer_manager.
                         self.get_logger().info('Cancelling current recording (forwarder)')
-                        cd_result = self._cyclo_data.send_recording_command(
-                            command=RecordingCommand.Request.RERECORD,
+                        cd_result = self._forward_recording(
+                            RecordingCommand.Request.RERECORD,
                             task_info=request.task_info,
-                            robot_type=self.robot_type,
-                            urdf_path=(
-                                self.params.get('urdf_path', '')
-                                if self.params else ''
-                            ),
                         )
                         if (cd_result.success
                                 and cd_result.response is not None

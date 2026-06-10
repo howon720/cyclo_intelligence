@@ -37,7 +37,7 @@ class InferenceRequesterTests(unittest.TestCase):
 
         requester.load_policy(type("Req", (), {"model_path": "/models/policy"})())
 
-        self.assertEqual(client.calls[0][1], 300.0)
+        self.assertEqual(client.calls[0][1], 7200.0)
 
     def test_get_action_uses_monotonic_seq_id(self) -> None:
         client = FakeEngineClient(

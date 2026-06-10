@@ -24,6 +24,39 @@ import EditDatasetCommand from '../constants/commands';
 import rosConnectionManager from '../utils/rosConnectionManager';
 import { DEFAULT_PATHS } from '../constants/paths';
 
+const DEFAULT_SERVICE_TIMEOUT_MS = 10000;
+const START_INFERENCE_SERVICE_TIMEOUT_MS = 30000;
+const NO_SERVICE_TIMEOUT_MS = 0;
+
+const LONG_RECORDING_COMMANDS = new Set([
+  'stop',
+  'next',
+  'rerecord',
+  'finish',
+  'cancel',
+  'skip_task',
+  'stop_segment',
+  'cancel_segment',
+  'discard_segment',
+  'finish_episode',
+  'discard_episode',
+  'stop_inference_record',
+  'cancel_inference_record',
+]);
+
+export function getRecordCommandServiceTimeoutMs(command, options = {}) {
+  const override = Number(options.serviceTimeoutMs || 0);
+  if (override > 0) {
+    return override;
+  }
+  if (LONG_RECORDING_COMMANDS.has(command)) {
+    return NO_SERVICE_TIMEOUT_MS;
+  }
+  return command === 'start_inference'
+    ? START_INFERENCE_SERVICE_TIMEOUT_MS
+    : DEFAULT_SERVICE_TIMEOUT_MS;
+}
+
 export function useRosServiceCaller() {
   const taskInfo = useSelector((state) => state.tasks.taskInfo);
   const trainingInfo = useSelector((state) => state.training.trainingInfo);
@@ -54,7 +87,7 @@ export function useRosServiceCaller() {
   useEffect(() => { pageRef.current = page; }, [page]);
 
   const callService = useCallback(
-    async (serviceName, serviceType, request, timeoutMs = 10000) => {
+    async (serviceName, serviceType, request, timeoutMs = DEFAULT_SERVICE_TIMEOUT_MS) => {
       try {
         console.log(`Attempting to call service: ${serviceName}`);
         const ros = await rosConnectionManager.getConnection(rosbridgeUrl);
@@ -65,33 +98,56 @@ export function useRosServiceCaller() {
         }
 
         return new Promise((resolve, reject) => {
-          const service = new ROSLIB.Service({
-            ros,
-            name: serviceName,
-            serviceType: serviceType,
-          });
           const req = new ROSLIB.ServiceRequest(request);
+          const serviceCallId = `call_service:${serviceName}:${++ros.idCounter}`;
+          let settled = false;
+          let serviceTimeout;
 
-          // Set a timeout for the service call
-          const serviceTimeout = setTimeout(() => {
-            reject(new Error(`Service call timeout for ${serviceName}`));
-          }, timeoutMs);
+          const finish = (handler) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(serviceTimeout);
+            handler();
+          };
 
-          service.callService(
-            req,
-            (result) => {
-              clearTimeout(serviceTimeout);
+          // Set a local guard only for finite-timeout calls. Long recording
+          // saves pass timeout=0 through rosbridge so the service response can
+          // arrive whenever the storage backend actually finishes.
+          if (timeoutMs > 0) {
+            serviceTimeout = setTimeout(() => {
+              finish(() => reject(new Error(`Service call timeout for ${serviceName}`)));
+            }, timeoutMs + 5000);
+          }
+
+          ros.once(serviceCallId, (message) => {
+            if (message.result !== undefined && message.result === false) {
+              finish(() => {
+                const error = message.values;
+                console.error('Service call failed:', error);
+                reject(
+                  new Error(`Service call failed for ${serviceName}: ${error.message || error}`)
+                );
+              });
+              return;
+            }
+
+            finish(() => {
+              const result = typeof ROSLIB.ServiceResponse === 'function'
+                ? new ROSLIB.ServiceResponse(message.values)
+                : (message.values || {});
               console.log('Service call successful:', result);
               resolve(result);
-            },
-            (error) => {
-              clearTimeout(serviceTimeout);
-              console.error('Service call failed:', error);
-              reject(
-                new Error(`Service call failed for ${serviceName}: ${error.message || error}`)
-              );
-            }
-          );
+            });
+          });
+
+          ros.callOnConnection({
+            op: 'call_service',
+            id: serviceCallId,
+            service: serviceName,
+            type: serviceType,
+            args: req,
+            timeout: timeoutMs > 0 ? timeoutMs / 1000 : 0,
+          });
         });
       } catch (error) {
         console.error('Failed to establish ROS connection for service call:', error);
@@ -283,8 +339,7 @@ export function useRosServiceCaller() {
         console.log('request:', request);
 
         console.log(`Sending command '${command}' (${command_enum}) to service`);
-        const serviceTimeoutMs = Number(options.serviceTimeoutMs || 0) ||
-          (command === 'start_inference' ? 30000 : 10000);
+        const serviceTimeoutMs = getRecordCommandServiceTimeoutMs(command, options);
         const result = await callService(
           '/task/command',
           'interfaces/srv/SendCommand',

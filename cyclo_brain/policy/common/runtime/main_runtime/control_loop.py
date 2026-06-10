@@ -239,10 +239,12 @@ class ControlLoop:
         try:
             response = self._requester.get_action(task_instruction)
         except Exception as e:
-            self._record_request_latency(time.monotonic() - started_at)
+            latency_s = time.monotonic() - started_at
+            self._record_request_latency(latency_s)
             logger.warning("get_action raised: %s", e)
             return
-        self._record_request_latency(time.monotonic() - started_at)
+        latency_s = time.monotonic() - started_at
+        self._record_request_latency(latency_s)
         if not response.success:
             logger.warning("get_action failed: %s", response.message)
             return
@@ -265,7 +267,24 @@ class ControlLoop:
                 and self._running
                 and self._processor is not None
             ):
-                self._processor.push_actions(chunk)
+                buffer_delay_s = self._processor.buffer_size / max(
+                    1.0,
+                    self._processor.output_hz,
+                )
+                scheduled_start_delay_s = latency_s + buffer_delay_s
+                produced = self._processor.push_actions(
+                    chunk,
+                    scheduled_start_delay_s=scheduled_start_delay_s,
+                )
+                logger.debug(
+                    "buffered action chunk: source=%d produced=%d "
+                    "latency=%.3fs buffer_delay=%.3fs scheduled_start=%.3fs",
+                    response.chunk_size,
+                    produced,
+                    latency_s,
+                    buffer_delay_s,
+                    scheduled_start_delay_s,
+                )
 
     def _refill_threshold(self, processor: ActionChunkProcessor) -> int:
         threshold_s = max(0.0, self._refill_margin_s)

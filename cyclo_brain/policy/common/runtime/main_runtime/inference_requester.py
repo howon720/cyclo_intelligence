@@ -21,6 +21,9 @@ from engine_process.protocol import (
 )
 
 
+DEFAULT_LOAD_POLICY_TIMEOUT_S = 7200.0
+
+
 class InferenceRequester:
     """Synchronous Engine process requester with seq_id stale-response guard."""
 
@@ -28,7 +31,7 @@ class InferenceRequester:
         self,
         client: Any,
         get_action_timeout_s: float = 5.0,
-        load_policy_timeout_s: float = 300.0,
+        load_policy_timeout_s: float = DEFAULT_LOAD_POLICY_TIMEOUT_S,
     ) -> None:
         self._client = client
         self._get_action_timeout_s = float(get_action_timeout_s)

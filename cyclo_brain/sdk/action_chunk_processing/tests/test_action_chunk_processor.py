@@ -78,6 +78,30 @@ class ActionChunkProcessorTests(unittest.TestCase):
         np.testing.assert_allclose(first, np.asarray([1.0, 2.0]))
         self.assertIsNone(second)
 
+    def test_async_chunk_alignment_uses_scheduled_start_delay(self) -> None:
+        processor = ActionChunkProcessor(
+            inference_hz=10.0,
+            control_hz=10.0,
+            chunk_align_window_s=0.3,
+        )
+        processor.push_actions(np.arange(11, dtype=np.float64).reshape(11, 1))
+
+        for _ in range(7):
+            processor.pop_action()
+
+        produced = processor.push_actions(
+            np.arange(5, 16, dtype=np.float64).reshape(11, 1),
+            scheduled_start_delay_s=0.4,
+        )
+
+        self.assertGreater(produced, 0)
+        for _ in range(3):
+            last_old_action = processor.pop_action()
+        first_new_action = processor.pop_action()
+
+        np.testing.assert_allclose(last_old_action, np.asarray([9.0]))
+        self.assertGreater(first_new_action[0], last_old_action[0])
+
 
 if __name__ == "__main__":
     unittest.main()

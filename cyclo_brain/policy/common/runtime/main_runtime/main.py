@@ -36,7 +36,10 @@ from robot_client.messages import (  # noqa: E402
 )
 
 from .control_loop import ControlLoop  # noqa: E402
-from .inference_requester import InferenceRequester  # noqa: E402
+from .inference_requester import (  # noqa: E402
+    DEFAULT_LOAD_POLICY_TIMEOUT_S,
+    InferenceRequester,
+)
 from .service_handler import ServiceHandler  # noqa: E402
 from .session_state import SessionState  # noqa: E402
 from .zenoh_client import ZenohEngineCommandClient  # noqa: E402
@@ -72,7 +75,12 @@ class MainRuntime:
         self._requester = InferenceRequester(
             engine_client,
             get_action_timeout_s=float(os.environ.get("GET_ACTION_TIMEOUT_S", "5.0")),
-            load_policy_timeout_s=float(os.environ.get("LOAD_POLICY_TIMEOUT_S", "300.0")),
+            load_policy_timeout_s=float(
+                os.environ.get(
+                    "LOAD_POLICY_TIMEOUT_S",
+                    str(DEFAULT_LOAD_POLICY_TIMEOUT_S),
+                )
+            ),
         )
         self._session = SessionState()
         self._control_loop = ControlLoop(

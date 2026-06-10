@@ -185,6 +185,9 @@ services:
       # Drives Zenoh service prefixes and the default engine module name.
       - POLICY_BACKEND=lerobot
       - POLICY_ENGINE_MODULE=lerobot_engine
+      # Main-runtime waits on the local engine process while weights and
+      # first-time gated backbones download/load.
+      - LOAD_POLICY_TIMEOUT_S=${LOAD_POLICY_TIMEOUT_S:-7200}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
       - PYTHONUNBUFFERED=1
@@ -296,6 +299,9 @@ services:
       # Start N1.7 in PyTorch eager mode. Enable after model-load/action
       # smoke tests pass on the target robot.
       - GROOT_TRT_ENABLED=false
+      # Main-runtime waits on the local engine process while weights and
+      # first-time gated backbones download/load.
+      - LOAD_POLICY_TIMEOUT_S=${LOAD_POLICY_TIMEOUT_S:-7200}
       - CONTROL_HZ=100
       - INFERENCE_HZ=15
       - TARGET_CHUNK_SIZE=none
