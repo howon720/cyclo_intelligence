@@ -195,7 +195,7 @@ _BACKENDS: Dict[str, Dict[str, str]] = {
     "lerobot": {
         "service": "lerobot",
         "container": "lerobot_server",
-        "image": f"robotis/lerobot-zenoh:1.0.1-{_BACKEND_ARCH}",
+        "image": f"robotis/lerobot-zenoh:1.3.0-{_BACKEND_ARCH}",
         "services": ["main-runtime", "engine-process"],
     },
     "groot": {

@@ -2,7 +2,7 @@
 Changelog for package cyclo-ui
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-0.1.13 (2026-06-08)
+0.1.13 (2026-06-11)
 -------------------
 * Added explicit ``3D Sim Deploy`` and ``Real Robot Deploy`` controls with a confirmation dialog before robot publishing.
 * Added policy backend image pull controls with streaming progress feedback and explicit stale-container update handling.

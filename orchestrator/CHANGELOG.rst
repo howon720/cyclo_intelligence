@@ -2,7 +2,7 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-0.1.13 (2026-06-08)
+0.1.13 (2026-06-11)
 -------------------
 * Added simulation-first inference mode handling so policy actions can be previewed without publishing robot commands.
 * Added Real Robot Deploy command gating and inference-mode propagation through task information.
