@@ -8,6 +8,7 @@ Changelog for package cyclo_brain
 * Added simulation-safe action handling so empty action buffers stop publishing stale robot commands.
 * Standardized LeRobot and GR00T camera/model IO mapping around dataset keys, including legacy camera aliases.
 * Switched policy submodules to ROBOTIS forks, updated LeRobot and GR00T image support to ``robotis/lerobot-zenoh:1.3.0`` and ``robotis/groot-zenoh:1.3.0``, and removed parent-side GR00T training wrappers.
+* Fixed amd64 LeRobot and GR00T policy image builds for Blackwell-capable training smoke validation.
 * Contributors: Dongyun Kim
 
 0.1.12 (2026-06-05)

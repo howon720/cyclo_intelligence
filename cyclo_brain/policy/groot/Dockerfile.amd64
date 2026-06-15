@@ -73,7 +73,7 @@ RUN sed -i s/dill==0.3.9/dill==0.3.8/g /etc/pip/constraint.txt 2>/dev/null || tr
 # Core dependencies
 RUN pip install --no-cache-dir \
     "albumentations==1.4.18" \
-    "av==15.0.0" \
+    "av==16.1.0" \
     "diffusers==0.35.1" \
     "dm-tree==0.1.8" \
     "lmdb==1.7.5" \
@@ -82,11 +82,14 @@ RUN pip install --no-cache-dir \
     "pandas==2.2.3" \
     "peft==0.17.1" \
     "termcolor==3.2.0" \
-    "transformers==4.53.0" \
+    "transformers==4.57.3" \
     "tyro==0.9.17" \
     "click==8.1.8" \
     "datasets==3.6.0" \
+    "cryptography==42.0.8" \
     "einops==0.8.1" \
+    "gitpython==3.1.46" \
+    "jsonlines==4.0.0" \
     "gymnasium==1.2.2" \
     "matplotlib==3.10.1" \
     "numpy==1.26.4" \
@@ -96,6 +99,8 @@ RUN pip install --no-cache-dir \
     "wandb==0.23.0" \
     "pyzmq==27.0.1" \
     "deepspeed==0.17.6"
+
+RUN PIP_CONSTRAINT= pip install --no-cache-dir "onnx>=1.20.0"
 
 # Additional dependencies from official Dockerfile
 RUN pip install --no-cache-dir \
@@ -125,14 +130,26 @@ RUN sed -i 's/requires-python = "==3.10.\*"/requires-python = ">=3.10"/' pyproje
 
 # Install GR00T package (use pip directly, not uv with --system)
 RUN pip install -e . --no-deps && \
-    pip install flash-attn --no-build-isolation
+    PIP_CONSTRAINT= pip install --no-cache-dir --no-deps \
+      https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+
+# Some optional packages pulled in above can downgrade transformers. Keep the
+# final image on the Qwen3-VL capable version required by GR00T N1.7.
+RUN PIP_CONSTRAINT= pip install --no-cache-dir --upgrade --force-reinstall --no-deps \
+    "huggingface-hub==0.36.2" \
+    "safetensors==0.8.0" \
+    "tokenizers==0.22.2" \
+    "transformers==4.57.3"
 
 # Blackwell (sm_120) support: override PyTorch with nightly cu128 build
 RUN if [ "$GPU_ARCH" = "blackwell" ]; then \
       echo "=== Installing PyTorch nightly (cu128) for Blackwell ===" && \
       PIP_CONSTRAINT= pip install --no-cache-dir --pre --upgrade --force-reinstall \
         --index-url https://download.pytorch.org/whl/nightly/cu128 \
-        torch torchvision torchcodec && \
+        torch && \
+      PIP_CONSTRAINT= pip install --no-cache-dir --pre --upgrade --force-reinstall --no-deps \
+        --index-url https://download.pytorch.org/whl/nightly/cu128 \
+        torchvision torchcodec && \
       PIP_CONSTRAINT= pip install --no-cache-dir flash-attn --no-build-isolation --force-reinstall --no-deps && \
       python -c "import torch; print(f'PyTorch: {torch.__version__}, Arch: {torch.cuda.get_arch_list()}')"; \
     fi
