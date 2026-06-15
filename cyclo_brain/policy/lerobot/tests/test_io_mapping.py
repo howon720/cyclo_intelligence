@@ -69,6 +69,27 @@ class IoMappingCameraAliasTest(unittest.TestCase):
             {"rgb.cam_left_head": "observation.images.rgb.cam_left_head"},
         )
 
+    def test_maps_legacy_single_head_policy_key_to_left_head_camera(self):
+        self.assertEqual(
+            IoMappingMixin._resolve_camera_mappings(
+                [
+                    "cam_left_head",
+                    "cam_left_wrist",
+                    "cam_right_wrist",
+                ],
+                {
+                    "observation.images.rgb.cam_head",
+                    "observation.images.cam_wrist_left",
+                    "observation.images.cam_wrist_right",
+                },
+            ),
+            {
+                "cam_left_head": "observation.images.rgb.cam_head",
+                "cam_left_wrist": "observation.images.cam_wrist_left",
+                "cam_right_wrist": "observation.images.cam_wrist_right",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

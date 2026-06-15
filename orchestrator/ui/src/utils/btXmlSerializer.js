@@ -21,6 +21,7 @@ const SEND_COMMAND_PARAMS_BY_COMMAND = {
     'model',
     'policy_path',
     'task_instruction',
+    'inference_mode',
     'inference_hz',
     'control_hz',
     'chunk_align_window_s',

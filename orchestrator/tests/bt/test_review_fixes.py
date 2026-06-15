@@ -42,18 +42,68 @@ def _install_ros_stubs():
     trajectory_msgs_msg_mod.JointTrajectory = object
     trajectory_msgs_msg_mod.JointTrajectoryPoint = object
 
+    interfaces_mod = types.ModuleType('interfaces')
+    interfaces_msg_mod = types.ModuleType('interfaces.msg')
+    interfaces_srv_mod = types.ModuleType('interfaces.srv')
+
+    class _InferenceStatus:
+        READY = 0
+        INFERENCING = 2
+        PAUSED = 3
+
+    class _TaskInfo:
+        pass
+
+    class _SendCommandRequest:
+        START_INFERENCE = 1
+        STOP_INFERENCE = 2
+        RESUME_INFERENCE = 3
+        FINISH = 4
+
+    class _SendCommand:
+        Request = _SendCommandRequest
+
+    interfaces_msg_mod.InferenceStatus = _InferenceStatus
+    interfaces_msg_mod.TaskInfo = _TaskInfo
+    interfaces_srv_mod.SendCommand = _SendCommand
+
     sys.modules.setdefault('rclpy', rclpy_mod)
     sys.modules.setdefault('rclpy.qos', qos_mod)
     sys.modules.setdefault('sensor_msgs', sensor_msgs_mod)
     sys.modules.setdefault('sensor_msgs.msg', sensor_msgs_msg_mod)
     sys.modules.setdefault('trajectory_msgs', trajectory_msgs_mod)
     sys.modules.setdefault('trajectory_msgs.msg', trajectory_msgs_msg_mod)
+    sys.modules.setdefault('interfaces', interfaces_mod)
+    sys.modules.setdefault('interfaces.msg', interfaces_msg_mod)
+    sys.modules.setdefault('interfaces.srv', interfaces_srv_mod)
 
 
 _install_ros_stubs()
 
 from orchestrator.bt.actions.joint_control import _coerce_positions  # noqa: E402
+from orchestrator.bt.actions.send_command import SendCommand  # noqa: E402
 from orchestrator.bt.node_registry import _annotation_to_port_type  # noqa: E402
+
+
+class _DummyNode:
+    def create_client(self, *args, **kwargs):
+        return object()
+
+    def create_subscription(self, *args, **kwargs):
+        return object()
+
+    def get_logger(self):
+        class _Logger:
+            def info(self, *args, **kwargs):
+                pass
+
+            def warn(self, *args, **kwargs):
+                pass
+
+            def error(self, *args, **kwargs):
+                pass
+
+        return _Logger()
 
 
 def test_coerce_positions_accepts_comma_separated_strings():
@@ -66,3 +116,15 @@ def test_stringified_annotations_map_to_port_types():
     assert _annotation_to_port_type('list[float]', None) == 'number'
     assert _annotation_to_port_type('Optional[int]', None) == 'number'
     assert _annotation_to_port_type('str', None) == 'string'
+
+
+def test_resume_send_command_legacy_simulation_ignores_mode():
+    context = types.SimpleNamespace(node=_DummyNode())
+
+    action = SendCommand.from_xml_params(
+        context,
+        'ResumeInference',
+        {'command': 'RESUME', 'inference_mode': 'simulation'},
+    )
+
+    assert action.inference_mode == ''

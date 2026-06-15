@@ -3,11 +3,12 @@
 # Multi-stage build:
 #   Stage 1 (ui-builder, node:22): npm build of orchestrator/ui/ React app
 #   Stage 2 (runtime, ROBOTIS ROS2 base): colcon workspace + UI static +
+#                                         Node/npm for research iteration +
 #                                         nginx + s6-overlay supervising
 #                                         orchestrator / cyclo_data nodes
 #
 # Build context: cyclo_intelligence/ (repo root)
-#   docker build -f docker/Dockerfile.arm64 -t robotis/cyclo-intelligence:0.1.12-arm64 .
+#   docker build -f docker/Dockerfile.arm64 -t robotis/cyclo-intelligence:0.1.13-arm64 .
 #
 # lerobot / groot are separate containers (PLAN §4.8 on-demand pull);
 # this image intentionally does NOT bundle PyTorch / CUDA / LeRobot.
@@ -56,6 +57,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # System dependencies:
 #   nginx          — serves the UI + proxies /api/* to supervisor_api / rosbridge
 #   docker.io      — supervisor_api manages lerobot / groot containers on-demand
+#   docker-compose-v2
+#                  — recreates missing policy containers from compose
 #                    (PLAN §4.8); needs /var/run/docker.sock mount at runtime
 #   rmw-zenoh-cpp  — ROS2 ↔ policy-container IPC
 #   ffmpeg / xz    — MCAP→MP4 conversion pipeline (cyclo_data) + s6 overlay
@@ -66,11 +69,22 @@ RUN apt-get update && apt-get install -y \
     nano \
     nginx \
     docker.io \
+    docker-compose-v2 \
     python3-pip \
     ros-${ROS_DISTRO}-rmw-zenoh-cpp \
     ros-${ROS_DISTRO}-rosbridge-server \
     ros-${ROS_DISTRO}-web-video-server \
     && rm -rf /var/lib/apt/lists/*
+
+# Keep Node/npm available in the runtime image too. Cyclo is a research
+# platform, so being able to rebuild/test the React UI from inside the
+# running container is worth the extra image size. Copy from the same
+# node:22 stage that builds the production bundle so versions stay aligned.
+COPY --from=ui-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=ui-builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    node --version && npm --version
 
 ENV COLCON_WS=/root/ros2_ws
 WORKDIR ${COLCON_WS}

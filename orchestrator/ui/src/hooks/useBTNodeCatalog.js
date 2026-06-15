@@ -24,12 +24,45 @@ import {
 } from '../features/btmanager/btCatalogSlice';
 import { useRosServiceCaller } from './useRosServiceCaller';
 
+const API_BASE = '/api';
+
 // Fire-once-per-app guard. The slice's `source` field also tracks this,
 // but if a component mounts → fetch starts → component unmounts before
 // the response arrives, `source` stays at 'loading' and the next mount
 // would re-fetch. The module-level ref keeps a single in-flight fetch
 // per page load — good enough for PR1.
 let fetchStarted = false;
+
+async function readJsonResponse(response) {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { detail: text };
+  }
+}
+
+async function getBtNodeStatus() {
+  const response = await fetch(`${API_BASE}/services/bt_node/status`);
+  const data = await readJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(data.detail || `bt_node status failed (${response.status})`);
+  }
+  return data;
+}
+
+async function canFetchLiveCatalog() {
+  try {
+    const status = await getBtNodeStatus();
+    return status.state === 'up';
+  } catch {
+    // Supervisor API may be unavailable in test/dev setups. Let the ROS service
+    // call below decide whether the catalog can be fetched, but never start the
+    // BT node implicitly from this hook.
+    return true;
+  }
+}
 
 /**
  * Subscribe to the BT node catalog Redux slice and lazy-fetch it from
@@ -51,9 +84,17 @@ export function useBTNodeCatalog() {
 
     dispatch(catalogFetchStarted());
     try {
+      const canFetch = await canFetchLiveCatalog();
+      if (!canFetch) {
+        fetchStarted = false;
+        dispatch(catalogFetchFailed('BT node is stopped. Press BT Node ON to update the live node list.'));
+        return;
+      }
+
       const result = await getNodeCatalog();
       if (!result || !result.success) {
         const msg = (result && result.message) || 'Service returned failure';
+        fetchStarted = false;
         dispatch(catalogFetchFailed(msg));
         return;
       }
@@ -61,10 +102,12 @@ export function useBTNodeCatalog() {
       try {
         parsed = JSON.parse(result.catalog_json || '[]');
       } catch (e) {
+        fetchStarted = false;
         dispatch(catalogFetchFailed(`Invalid catalog JSON: ${e.message}`));
         return;
       }
       if (!Array.isArray(parsed)) {
+        fetchStarted = false;
         dispatch(catalogFetchFailed('Catalog JSON is not an array'));
         return;
       }
@@ -73,7 +116,7 @@ export function useBTNodeCatalog() {
         schemaVersion: result.schema_version || '',
       }));
     } catch (err) {
-      // Reset the guard so a later reconnect can try again.
+      // Reset the guard so a later manual BT Node ON can try again.
       fetchStarted = false;
       dispatch(catalogFetchFailed(err.message || String(err)));
     }

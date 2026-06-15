@@ -31,6 +31,7 @@ Supports both inference and training services:
 
 from dataclasses import dataclass
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -47,6 +48,23 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value.strip() == '':
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.1fs",
+            name,
+            value,
+            default,
+        )
+        return default
+    return parsed if parsed > 0 else default
 
 
 @dataclass
@@ -121,6 +139,14 @@ class ContainerServiceClient:
         self._node = node
         self._service_prefix = service_prefix
         self.timeout_sec = timeout_sec
+        self.load_timeout_sec = _env_float(
+            "INFERENCE_LOAD_TIMEOUT_SEC",
+            7200.0,
+        )
+        self.load_availability_timeout_sec = _env_float(
+            "INFERENCE_LOAD_AVAILABILITY_TIMEOUT_SEC",
+            180.0,
+        )
         self._connected = False
         self._cancelled = threading.Event()
         self._callback_group = callback_group
@@ -329,6 +355,7 @@ class ContainerServiceClient:
         embodiment_tag: str = "",
         robot_type: str = "",
         task_instruction: str = "",
+        publish_to_robot: bool = False,
         timeout_sec: Optional[float] = None,
     ) -> ServiceResponse:
         """Call /{prefix}/inference_command (InferenceCommand.srv).
@@ -336,10 +363,13 @@ class ContainerServiceClient:
         Use the ``CMD_*`` class constants for ``command``. Only LOAD needs
         the model/embodiment/robot_type fields; pass empty strings for the
         other commands. ``task_instruction`` is used by LOAD (training-time
-        conditioning) and RESUME (online re-conditioning).
+        conditioning) and RESUME (online re-conditioning). ``publish_to_robot``
+        gates the policy container's robot command publishers; false is
+        simulation / 3D preview only.
 
-        Timeout defaults to 600 s for LOAD (CUDA init + weight load) and
-        10 s for everything else; override via ``timeout_sec``.
+        Timeout defaults to INFERENCE_LOAD_TIMEOUT_SEC for LOAD (CUDA init,
+        weight load, and first-time gated backbone downloads) and 10 s for
+        everything else; override via ``timeout_sec``.
         """
         request = InferenceCommand.Request()
         request.command = int(command)
@@ -347,10 +377,18 @@ class ContainerServiceClient:
         request.embodiment_tag = embodiment_tag
         request.robot_type = robot_type
         request.task_instruction = task_instruction
+        if hasattr(request, "publish_to_robot"):
+            request.publish_to_robot = bool(publish_to_robot)
 
         if timeout_sec is None:
-            timeout_sec = 600.0 if command == self.CMD_LOAD else 10.0
-        availability_timeout_sec = 180.0 if command == self.CMD_LOAD else 10.0
+            timeout_sec = (
+                self.load_timeout_sec if command == self.CMD_LOAD else 10.0
+            )
+        availability_timeout_sec = (
+            self.load_availability_timeout_sec
+            if command == self.CMD_LOAD
+            else 10.0
+        )
 
         return self._call_service(
             self._inference_command_client,

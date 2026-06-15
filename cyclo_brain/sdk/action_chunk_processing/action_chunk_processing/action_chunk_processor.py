@@ -40,6 +40,10 @@ class ActionChunkProcessor:
     ):
         self._inference_hz = float(inference_hz)
         self._control_hz = float(control_hz)
+        if self._inference_hz <= 0.0:
+            raise ValueError("inference_hz must be positive")
+        if self._control_hz <= 0.0:
+            raise ValueError("control_hz must be positive")
         self._chunk_align_window_s = max(0.0, float(chunk_align_window_s))
         self._blend_steps = max(1, int(self.BLEND_DURATION_S * self._control_hz))
         self._postprocess = bool(postprocess)
@@ -52,6 +56,7 @@ class ActionChunkProcessor:
 
         self._buffer: collections.deque = collections.deque()
         self._last_action: Optional[np.ndarray] = None
+        self._last_output_action: Optional[np.ndarray] = None
         self._lock = threading.Lock()
 
     @property
@@ -68,11 +73,16 @@ class ActionChunkProcessor:
     def output_hz(self) -> float:
         return self._control_hz if self._postprocess else self._inference_hz
 
-    def push_chunk(self, chunk: np.ndarray) -> int:
+    def push_chunk(
+        self,
+        chunk: np.ndarray,
+        scheduled_start_delay_s: Optional[float] = None,
+    ) -> int:
         if chunk.ndim != 2:
             raise ValueError(f"chunk must be 2D (T, D); got shape {chunk.shape}")
 
         with self._lock:
+            anchor = self._alignment_anchor()
             if not self._postprocess:
                 for action in chunk:
                     self._buffer.append(np.asarray(action).copy())
@@ -80,12 +90,12 @@ class ActionChunkProcessor:
                     self._last_action = np.asarray(chunk[-1]).copy()
                 return len(chunk)
 
-            aligned = self._align(chunk)
+            aligned = self._align(chunk, anchor, scheduled_start_delay_s)
             if len(aligned) == 0:
                 return 0
 
             interpolated = self._interpolate(aligned)
-            blended = self._blend(interpolated)
+            blended = self._blend(interpolated, anchor)
 
             for action in blended:
                 self._buffer.append(action)
@@ -94,34 +104,71 @@ class ActionChunkProcessor:
                 self._last_action = blended[-1].copy()
             return len(blended)
 
-    def push_actions(self, actions: np.ndarray) -> int:
-        return self.push_chunk(actions)
+    def push_actions(
+        self,
+        actions: np.ndarray,
+        scheduled_start_delay_s: Optional[float] = None,
+    ) -> int:
+        return self.push_chunk(actions, scheduled_start_delay_s)
 
     def pop_action(self) -> Optional[np.ndarray]:
         with self._lock:
             if self._buffer:
-                return self._buffer.popleft()
-            return None if self._last_action is None else self._last_action.copy()
+                action = self._buffer.popleft()
+                self._last_output_action = np.asarray(action).copy()
+                return action
+            return None
 
     def clear(self) -> None:
         with self._lock:
             self._buffer.clear()
             self._last_action = None
+            self._last_output_action = None
 
-    def _align(self, chunk: np.ndarray) -> np.ndarray:
+    def _alignment_anchor(self) -> Optional[np.ndarray]:
+        if self._buffer:
+            return np.asarray(self._buffer[-1]).copy()
+        if self._last_output_action is not None:
+            return self._last_output_action.copy()
+        if self._last_action is not None:
+            return self._last_action.copy()
+        return None
+
+    def _align(
+        self,
+        chunk: np.ndarray,
+        anchor: Optional[np.ndarray],
+        scheduled_start_delay_s: Optional[float],
+    ) -> np.ndarray:
         if self._alignment_mode == "none":
             return chunk
         if self._alignment_mode == "rtc":
             return self._rtc_align(chunk)
-        return self._l2_align(chunk)
+        return self._l2_align(chunk, anchor, scheduled_start_delay_s)
 
-    def _l2_align(self, chunk: np.ndarray) -> np.ndarray:
-        if self._last_action is None or len(chunk) <= 1:
+    def _l2_align(
+        self,
+        chunk: np.ndarray,
+        anchor: Optional[np.ndarray],
+        scheduled_start_delay_s: Optional[float],
+    ) -> np.ndarray:
+        if anchor is None or len(chunk) <= 1:
             return chunk
-        search_n = int(round(self._chunk_align_window_s * self._inference_hz))
-        search_n = max(1, min(search_n, len(chunk)))
-        distances = np.linalg.norm(chunk[:search_n] - self._last_action, axis=1)
-        best_idx = int(np.argmin(distances))
+        window_n = int(round(self._chunk_align_window_s * self._inference_hz))
+        window_n = max(1, window_n)
+        if scheduled_start_delay_s is None:
+            search_start = 0
+            search_stop = min(window_n, len(chunk))
+        else:
+            expected_idx = int(
+                round(max(0.0, scheduled_start_delay_s) * self._inference_hz)
+            )
+            if expected_idx >= len(chunk):
+                return chunk[:0]
+            search_start = max(0, expected_idx - window_n)
+            search_stop = min(len(chunk), expected_idx + window_n + 1)
+        distances = np.linalg.norm(chunk[search_start:search_stop] - anchor, axis=1)
+        best_idx = search_start + int(np.argmin(distances))
         start_idx = best_idx + 1
         if start_idx >= len(chunk):
             return chunk[:0]
@@ -148,21 +195,24 @@ class ActionChunkProcessor:
             return chunk
         t_original = np.arange(T) / self._inference_hz
         duration = (T - 1) / self._inference_hz
-        n_interp = int(round(duration * self._control_hz)) + 1
-        t_interp = np.linspace(0, duration, n_interp)
+        # Publish one command per control tick over the source trajectory
+        # duration. The end point belongs to the next tick/chunk, so a
+        # 16-point, 15 Hz source trajectory becomes 100 outputs at 100 Hz.
+        n_interp = max(1, int(round(duration * self._control_hz)))
+        t_interp = np.arange(n_interp) / self._control_hz
         out = np.empty((n_interp, D))
         for d in range(D):
             out[:, d] = np.interp(t_interp, t_original, chunk[:, d])
         return out
 
-    def _blend(self, chunk: np.ndarray) -> np.ndarray:
-        if self._last_action is None or len(chunk) == 0:
+    def _blend(self, chunk: np.ndarray, anchor: Optional[np.ndarray]) -> np.ndarray:
+        if anchor is None or len(chunk) == 0:
             return chunk
         chunk = chunk.copy()
         n_blend = min(self._blend_steps, len(chunk))
         for i in range(n_blend):
             alpha = (i + 1) / (n_blend + 1)
-            chunk[i] = (1 - alpha) * self._last_action + alpha * chunk[i]
+            chunk[i] = (1 - alpha) * anchor + alpha * chunk[i]
         return chunk
 
 

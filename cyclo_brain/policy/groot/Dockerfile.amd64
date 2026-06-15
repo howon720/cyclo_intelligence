@@ -1,10 +1,10 @@
-# NVIDIA Isaac GR00T N1.6 Docker Container with Zenoh Communication Support (AMD64)
-# This container provides isolated GR00T environment with Zenoh-based communication
-# for training (finetuning) and inference commands from orchestrator (ROS2)
+# NVIDIA Isaac GR00T N1.7 Docker Container with Zenoh Communication Support (AMD64)
+# This image is inference-focused. GR00T training/finetuning is owned by the
+# forked Isaac-GR00T repo and its official entrypoints.
 #
 # Based on official NVIDIA GR00T Dockerfile with Cyclo Intelligence integration
 # Build context: cyclo_intelligence/cyclo_brain/policy/groot/
-# Usage: docker build -f Dockerfile.amd64 -t robotis/groot-zenoh:amd64 .
+# Usage: docker build -f Dockerfile.amd64 -t robotis/groot-zenoh:1.3.0-amd64 .
 
 # NVIDIA PyTorch base image (same as official GR00T Dockerfile)
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.04-py3
@@ -47,8 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libegl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install s6-overlay (supervises the two-process runtime — Process A
-# inference_server and Process B control_publisher).
+# Install s6-overlay (supervises main-runtime and engine-process).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl xz-utils \
     && rm -rf /var/lib/apt/lists/* \
@@ -74,7 +73,7 @@ RUN sed -i s/dill==0.3.9/dill==0.3.8/g /etc/pip/constraint.txt 2>/dev/null || tr
 # Core dependencies
 RUN pip install --no-cache-dir \
     "albumentations==1.4.18" \
-    "av==15.0.0" \
+    "av==16.1.0" \
     "diffusers==0.35.1" \
     "dm-tree==0.1.8" \
     "lmdb==1.7.5" \
@@ -83,11 +82,14 @@ RUN pip install --no-cache-dir \
     "pandas==2.2.3" \
     "peft==0.17.1" \
     "termcolor==3.2.0" \
-    "transformers==4.53.0" \
+    "transformers==4.57.3" \
     "tyro==0.9.17" \
     "click==8.1.8" \
     "datasets==3.6.0" \
+    "cryptography==42.0.8" \
     "einops==0.8.1" \
+    "gitpython==3.1.46" \
+    "jsonlines==4.0.0" \
     "gymnasium==1.2.2" \
     "matplotlib==3.10.1" \
     "numpy==1.26.4" \
@@ -97,6 +99,8 @@ RUN pip install --no-cache-dir \
     "wandb==0.23.0" \
     "pyzmq==27.0.1" \
     "deepspeed==0.17.6"
+
+RUN PIP_CONSTRAINT= pip install --no-cache-dir "onnx>=1.20.0"
 
 # Additional dependencies from official Dockerfile
 RUN pip install --no-cache-dir \
@@ -126,35 +130,49 @@ RUN sed -i 's/requires-python = "==3.10.\*"/requires-python = ">=3.10"/' pyproje
 
 # Install GR00T package (use pip directly, not uv with --system)
 RUN pip install -e . --no-deps && \
-    pip install flash-attn --no-build-isolation
+    PIP_CONSTRAINT= pip install --no-cache-dir --no-deps \
+      https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+
+# Some optional packages pulled in above can downgrade transformers. Keep the
+# final image on the Qwen3-VL capable version required by GR00T N1.7.
+RUN PIP_CONSTRAINT= pip install --no-cache-dir --upgrade --force-reinstall --no-deps \
+    "huggingface-hub==0.36.2" \
+    "safetensors==0.8.0" \
+    "tokenizers==0.22.2" \
+    "transformers==4.57.3"
 
 # Blackwell (sm_120) support: override PyTorch with nightly cu128 build
 RUN if [ "$GPU_ARCH" = "blackwell" ]; then \
       echo "=== Installing PyTorch nightly (cu128) for Blackwell ===" && \
-      pip install --no-cache-dir \
+      PIP_CONSTRAINT= pip install --no-cache-dir --pre --upgrade --force-reinstall \
         --index-url https://download.pytorch.org/whl/nightly/cu128 \
-        torch torchvision torchcodec && \
-      pip install --no-cache-dir flash-attn --no-build-isolation --force-reinstall && \
+        torch && \
+      PIP_CONSTRAINT= pip install --no-cache-dir --pre --upgrade --force-reinstall --no-deps \
+        --index-url https://download.pytorch.org/whl/nightly/cu128 \
+        torchvision torchcodec && \
+      PIP_CONSTRAINT= pip install --no-cache-dir flash-attn --no-build-isolation --force-reinstall --no-deps && \
       python -c "import torch; print(f'PyTorch: {torch.__version__}, Arch: {torch.cuda.get_arch_list()}')"; \
     fi
 
 # Zenoh + runtime Python dependencies. zenoh_ros2_sdk / robot_client /
-# post_processing are mounted as volumes (see docker-compose.yml).
+# action_chunk_processing are mounted as volumes (see docker-compose.yml).
 # IMPORTANT: eclipse-zenoh version MUST match rmw_zenoh_cpp's bundled zenoh-c version (1.6.x)
 # Mismatched versions (e.g., 1.7.x vs 1.6.x) cause service call failures despite discovery working
 RUN pip install "eclipse-zenoh>=1.6.0,<1.7.0" rosbags>=0.11.0 GitPython>=3.1.18 json5>=0.9.14 pyyaml \
-    && mkdir -p /zenoh_sdk /robot_client_sdk /post_processing_sdk /orchestrator_config
+    && mkdir -p /zenoh_sdk /robot_client_sdk /action_chunk_processing_sdk /orchestrator_config \
+                /policy_runtime
 
 # Create application directory for the two-process runtime
 WORKDIR /app
 
 # Copy the two-process runtime into the image
 COPY runtime/ /app/runtime/
+COPY groot_engine/ /app/groot_engine/
 
 # Copy the s6 service definitions
 COPY s6-services/ /etc/s6-overlay/s6-rc.d/
-RUN chmod +x /etc/s6-overlay/s6-rc.d/inference-server/run \
-             /etc/s6-overlay/s6-rc.d/control-publisher/run
+RUN chmod +x /etc/s6-overlay/s6-rc.d/main-runtime/run \
+             /etc/s6-overlay/s6-rc.d/engine-process/run
 
 # Setup EGL/Vulkan configuration (from official GR00T Dockerfile)
 RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
@@ -191,22 +209,25 @@ ENV ZENOH_SDK_PATH=/zenoh_sdk
 # Shared Memory configuration for Zenoh
 ENV ZENOH_TRANSPORT_SHM_ENABLED=true
 
-# Runtime SDK paths (consumed by runtime/inference_server.py and
-# runtime/control_publisher.py). Match docker-compose.yml volume mounts.
+# Runtime SDK paths. Match docker-compose.yml volume mounts.
 ENV ROBOT_CLIENT_SDK_PATH=/robot_client_sdk
-ENV POST_PROCESSING_SDK_PATH=/post_processing_sdk
+ENV ACTION_CHUNK_PROCESSING_SDK_PATH=/action_chunk_processing_sdk
 ENV ORCHESTRATOR_CONFIG_PATH=/orchestrator_config
 
 # GR00T workspace configuration
 ENV GROOT_WORKSPACE=/workspace
+ENV POLICY_BACKEND=groot
+ENV POLICY_ENGINE_MODULE=groot_engine
 
 # Default working directory
 WORKDIR /gr00t
 
 # Healthcheck — both supervised processes must be up.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD s6-svstat /run/service/inference-server 2>&1 | grep -q "up" \
-     && s6-svstat /run/service/control-publisher 2>&1 | grep -q "up" \
+    CMD S6_SVSTAT="$(ls /package/admin/s6-*/command/s6-svstat 2>/dev/null | head -1)" \
+     && [ -n "$S6_SVSTAT" ] \
+     && "$S6_SVSTAT" /run/service/main-runtime 2>&1 | grep -q "up" \
+     && "$S6_SVSTAT" /run/service/engine-process 2>&1 | grep -q "up" \
      || exit 1
 
 # s6-overlay init — launches both supervised services in parallel.

@@ -4,9 +4,64 @@ const API_BASE = '/api';
 const DEFAULT_POLL_MS = 2000;
 export const BACKEND_WARMUP_MIN_UPTIME_S = 45;
 
+export const POLICY_BACKEND_SERVICE_LABELS = {
+  'main-runtime': 'Main',
+  'engine-process': 'Engine',
+  'inference-server': 'Inference',
+  'control-publisher': 'Control',
+};
+
+const POLICY_BACKEND_SERVICE_GROUPS = [
+  ['main-runtime', 'engine-process'],
+  ['inference-server', 'control-publisher'],
+];
+
 export const getPolicyBackendName = (serviceType) => (
   serviceType === 'groot' ? 'groot' : 'lerobot'
 );
+
+export function getPolicyBackendServiceLabel(name) {
+  return POLICY_BACKEND_SERVICE_LABELS[name] || name;
+}
+
+export function getPolicyBackendServices(status) {
+  const services = status?.services || [];
+  if (services.length === 0) return [];
+
+  for (const group of POLICY_BACKEND_SERVICE_GROUPS) {
+    if (group.some((name) => services.some((service) => service.name === name))) {
+      return group.map((name) => (
+        services.find((service) => service.name === name) || {
+          name,
+          state: 'unknown',
+          raw: 'not reported',
+        }
+      ));
+    }
+  }
+
+  return services;
+}
+
+export function getPolicyBackendStaleReason(status) {
+  const rawState = status?.raw_state || '';
+  if (
+    rawState === 'stale_image' ||
+    rawState === 'image_mismatch'
+  ) {
+    return 'stale_image';
+  }
+  if (
+    rawState === 'workspace_mount_mismatch' ||
+    rawState.startsWith('missing_required_mounts=')
+  ) {
+    return rawState;
+  }
+  if (status?.image_status === 'stale') {
+    return 'stale_image';
+  }
+  return null;
+}
 
 async function readJsonResponse(response) {
   const text = await response.text();
@@ -27,6 +82,20 @@ export function getPolicyBackendReadiness(status, options = {}) {
       message: 'Checking backend...',
     };
   }
+  const staleReason = getPolicyBackendStaleReason(status);
+  const imageStatus = status.image_status ||
+    (staleReason ? 'stale' : (
+      status.image_pulled ? 'current' : 'missing'
+    ));
+  if (imageStatus === 'stale' || staleReason) {
+    return {
+      ready: false,
+      state: 'update_required',
+      message: staleReason === 'stale_image'
+        ? 'Policy Docker image changed. Update container before starting.'
+        : 'Policy Docker container changed. Update container before starting.',
+    };
+  }
   if (!status.image_pulled) {
     return {
       ready: false,
@@ -42,10 +111,8 @@ export function getPolicyBackendReadiness(status, options = {}) {
     };
   }
 
-  const services = status.services || [];
-  const main = services.find((service) => service.name === 'main-runtime');
-  const engine = services.find((service) => service.name === 'engine-process');
-  if (main?.state !== 'up' || engine?.state !== 'up') {
+  const services = getPolicyBackendServices(status);
+  if (services.length === 0 || services.some((service) => service.state !== 'up')) {
     return {
       ready: false,
       state: 'warming',
@@ -53,6 +120,7 @@ export function getPolicyBackendReadiness(status, options = {}) {
     };
   }
 
+  const main = services[0];
   const mainUptime = Number(main.uptime_s || 0);
   if (mainUptime < minMainUptimeS) {
     const waitS = Math.max(1, Math.ceil(minMainUptimeS - mainUptime));

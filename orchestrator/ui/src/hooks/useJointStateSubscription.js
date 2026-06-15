@@ -79,6 +79,16 @@ export default function useJointStateSubscription(
     (msg) => {
       if (!msg.joint_names || !msg.points || msg.points.length === 0) return;
 
+      const firstPoint = msg.points[0];
+      const positions = firstPoint?.positions;
+      if (visualizationSource === 'action' && positions && positions.length > 0) {
+        const now = Date.now();
+        if (now - lastActionUpdateRef.current >= throttleMs) {
+          lastActionUpdateRef.current = now;
+          setJointValues({ name: msg.joint_names, position: positions });
+        }
+      }
+
       if (setActionChunk) {
         setActionChunk({
           names: msg.joint_names,
@@ -86,7 +96,7 @@ export default function useJointStateSubscription(
         });
       }
     },
-    [setActionChunk]
+    [setJointValues, setActionChunk, visualizationSource, throttleMs]
   );
 
   const handleActionCommand = useCallback(

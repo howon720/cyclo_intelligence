@@ -2,6 +2,11 @@
 Changelog for package interfaces
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.13 (2026-06-11)
+-------------------
+* Added inference mode task metadata and command fields for 3D simulation versus real robot deployment.
+* Contributors: Dongyun Kim
+
 0.1.12 (2026-06-05)
 -------------------
 * None

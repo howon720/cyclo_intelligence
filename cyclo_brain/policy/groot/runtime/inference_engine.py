@@ -50,6 +50,12 @@ import gr00t.model  # noqa: F401 - register custom models
 from gr00t.data.embodiment_tags import EmbodimentTag  # noqa: E402
 from gr00t.policy.gr00t_policy import Gr00tPolicy  # noqa: E402
 from robot_client import RobotClient  # noqa: E402
+from robot_client.camera_mapping import resolve_camera_feature_sources  # noqa: E402
+
+try:
+    from hf_token_sync import sync_token_file  # noqa: E402
+except Exception:  # pragma: no cover - helper is mounted in policy containers.
+    sync_token_file = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -240,6 +246,7 @@ class GR00TInference:
                 }
 
             self.logger.info("Loading GR00T policy from: %s", model_path)
+            self._sync_hf_token_for_gated_backbones()
 
             self.policy = Gr00tPolicy(
                 embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
@@ -287,8 +294,39 @@ class GR00TInference:
                 "action_keys": list(self.policy_info["action"]),
             }
         except Exception as e:
-            self.logger.error("Failed to start inference: %s", e, exc_info=True)
-            return self.fail(str(e))
+            message = self._format_load_error(e)
+            self.logger.error("Failed to start inference: %s", message, exc_info=True)
+            return self.fail(message)
+
+    def _sync_hf_token_for_gated_backbones(self) -> None:
+        if sync_token_file is None:
+            self.logger.warning("HF token sync helper unavailable")
+            return
+        if not sync_token_file():
+            self.logger.warning(
+                "No Hugging Face token found. GR00T N1.7 may need a token "
+                "to download the gated Cosmos-Reason2-2B backbone unless it "
+                "is already cached."
+            )
+
+    def _format_load_error(self, error: Exception) -> str:
+        message = str(error)
+        marker_text = message.lower()
+        gated_markers = (
+            "cannot access gated repo",
+            "access to model nvidia/cosmos-reason2-2b is restricted",
+            "401 client error",
+        )
+        if "cosmos-reason2-2b" in marker_text and any(
+            marker in marker_text for marker in gated_markers
+        ):
+            return (
+                "GR00T N1.7 needs access to the gated Hugging Face repo "
+                "nvidia/Cosmos-Reason2-2B. Register a Hugging Face token for "
+                "an approved account before loading the model, or pre-cache "
+                "the Cosmos backbone in the shared Hugging Face cache."
+            )
+        return message
 
     def _build_dummy_observation(self, task_instruction: str = "") -> dict:
         """Build a real observation from robot sensors for TRT engine building."""
@@ -323,11 +361,10 @@ class GR00TInference:
         cam_config = self.robot._config.get("cameras", {})
         available_cameras = set(self.robot.camera_names)
 
-        camera_sources = {}
-        for policy_key in self.policy_info["video"]:
-            source_key = self._resolve_camera_source(policy_key, available_cameras)
-            if source_key:
-                camera_sources[policy_key] = source_key
+        camera_sources = resolve_camera_feature_sources(
+            self.policy_info["video"],
+            available_cameras,
+        )
 
         self.robot_info["cameras"] = list(camera_sources.keys())
         self.robot_info["camera_sources"] = camera_sources
@@ -359,35 +396,6 @@ class GR00TInference:
         self.robot_info["sensor_states"] = sensor_states
 
         self.logger.info("Robot info: %s", self.robot_info)
-
-    def _resolve_camera_source(self, policy_key: str, available_cameras: set) -> Optional[str]:
-        if policy_key in available_cameras:
-            return policy_key
-
-        explicit_aliases = {
-            "cam_left_head": "cam_head_left",
-            "cam_right_head": "cam_head_right",
-            "cam_left_wrist": "cam_wrist_left",
-            "cam_right_wrist": "cam_wrist_right",
-        }
-        alias = explicit_aliases.get(policy_key)
-        if alias in available_cameras:
-            self.logger.info("Camera alias: %s <- %s", policy_key, alias)
-            return alias
-
-        parts = policy_key.split("_")
-        if len(parts) == 3 and parts[0] == "cam":
-            swapped = "_".join((parts[0], parts[2], parts[1]))
-            if swapped in available_cameras:
-                self.logger.info("Camera alias: %s <- %s", policy_key, swapped)
-                return swapped
-
-        self.logger.warning(
-            "No robot camera source matched policy camera key %s; available=%s",
-            policy_key,
-            sorted(available_cameras),
-        )
-        return None
 
     def get_action_chunk(self, request) -> dict:
         """Build observation from RobotClient, run inference, return action chunk."""
@@ -498,3 +506,8 @@ class GR00TInference:
     @staticmethod
     def fail(message: str) -> dict:
         return {"success": False, "message": message}
+
+
+def create_engine() -> GR00TInference:
+    """Factory used by the shared Engine process."""
+    return GR00TInference()

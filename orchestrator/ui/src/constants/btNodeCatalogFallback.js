@@ -64,6 +64,7 @@ export const FALLBACK_CATALOG = [
       { name: 'model', type: 'string', default: 'lerobot:act' },
       { name: 'policy_path', type: 'string', default: '' },
       { name: 'task_instruction', type: 'string', default: '' },
+      { name: 'inference_mode', type: 'string', default: 'simulation' },
       { name: 'inference_hz', type: 'number', default: '15' },
       { name: 'control_hz', type: 'number', default: '100' },
       { name: 'chunk_align_window_s', type: 'number', default: '0.3' },

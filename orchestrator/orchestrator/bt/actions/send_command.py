@@ -148,15 +148,23 @@ class SendCommand(BaseAction):
         task_instruction = params.get('task_instruction', '')
         if isinstance(task_instruction, list):
             task_instruction = ', '.join(task_instruction)
+        command = params.get('command', 'LOAD')
+        command_str = str(command or '').strip().upper()
+        inference_mode = (
+            params.get('inference_mode', 'simulation')
+            if command_str == 'LOAD'
+            else ''
+        )
         action = cls(
             node=context.node,
-            command=params.get('command', 'LOAD'),
+            command=command,
             model=params.get('model', 'lerobot:act'),
             policy_path=params.get('policy_path', ''),
             task_instruction=task_instruction,
             inference_hz=params.get('inference_hz', 15),
             control_hz=params.get('control_hz', 100),
             chunk_align_window_s=params.get('chunk_align_window_s', 0.3),
+            inference_mode=inference_mode,
         )
         action.name = name
         return action
@@ -176,6 +184,7 @@ class SendCommand(BaseAction):
         inference_hz: int = 15,
         control_hz: int = 100,
         chunk_align_window_s: float = 0.3,
+        inference_mode: str = 'simulation',
         service_name: str = '/task/command',
     ):
         super().__init__(node, name='SendCommand')
@@ -187,6 +196,11 @@ class SendCommand(BaseAction):
         self.control_hz = int(control_hz) if control_hz else 0
         self.chunk_align_window_s = (
             float(chunk_align_window_s) if chunk_align_window_s else 0.0
+        )
+        self.inference_mode = (
+            (inference_mode or 'simulation').strip().lower()
+            if self.command_str == 'LOAD'
+            else ''
         )
 
         self._client = self.node.create_client(SendCommandSrv, service_name)
@@ -233,7 +247,24 @@ class SendCommand(BaseAction):
                 self._state = self._STATE_DONE
                 self._result = False
                 return NodeStatus.FAILURE
-            self.log_info(f'SendCommand started (command={self.command_str})')
+            if self.command_str == 'LOAD':
+                self.log_info(
+                    'SendCommand started '
+                    f'(command={self.command_str}, model={self.model}, '
+                    f'inference_mode={self.inference_mode}, '
+                    f'publish_to_robot={self.inference_mode == "robot"})'
+                )
+                if self.inference_mode == 'simulation':
+                    self.log_warn(
+                        'simulation mode selected; inference previews may update, '
+                        'but robot command topics will not be published'
+                    )
+            else:
+                self.log_info(
+                    'SendCommand started '
+                    f'(command={self.command_str}, model={self.model}, '
+                    'publish_to_robot=loaded)'
+                )
             self._state = self._STATE_BEGIN_STAGE
             return NodeStatus.RUNNING
 
@@ -347,6 +378,13 @@ class SendCommand(BaseAction):
         ti.task_type = 'inference'
         ti.policy_path = self.policy_path
         ti.service_type = _service_type_from_model(self.model)
+        if self.command_str == 'LOAD' and hasattr(ti, 'inference_mode'):
+            ti.inference_mode = self.inference_mode
+        ti.tags = (
+            [f'inference_mode:{self.inference_mode}']
+            if self.command_str == 'LOAD'
+            else []
+        )
         if self.control_hz:
             ti.control_hz = self.control_hz
         if self.inference_hz:

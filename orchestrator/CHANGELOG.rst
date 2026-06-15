@@ -2,6 +2,13 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.13 (2026-06-11)
+-------------------
+* Added simulation-first inference mode handling so policy actions can be previewed without publishing robot commands.
+* Added Real Robot Deploy command gating and inference-mode propagation through task information.
+* Improved policy backend lifecycle handling for Docker Compose recreation and backend process status checks.
+* Contributors: Dongyun Kim
+
 0.1.12 (2026-06-05)
 -------------------
 * Added BT Manager lifecycle control for starting and stopping the ``bt_node`` runtime through supervisor-managed s6 services.

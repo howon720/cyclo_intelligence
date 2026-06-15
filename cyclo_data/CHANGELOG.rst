@@ -2,6 +2,10 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.13 (2026-06-11)
+-------------------
+* None
+
 0.1.12 (2026-06-05)
 -------------------
 * Restored Hugging Face dataset and model download defaults to workspace rosbag and LeRobot model paths.

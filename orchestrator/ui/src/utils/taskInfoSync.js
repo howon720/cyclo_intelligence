@@ -21,6 +21,7 @@ export const rosTaskInfoToUiTaskInfo = (taskInfo = {}) => ({
   subtaskInstruction: taskInfo.subtask_instruction || [],
   policyPath: taskInfo.policy_path || '',
   recordInferenceMode: Boolean(taskInfo.record_inference_mode),
+  inferenceMode: taskInfo.inference_mode || 'simulation',
   userId: taskInfo.user_id || '',
   controlHz: taskInfo.control_hz || 100,
   inferenceHz: taskInfo.inference_hz || 15,

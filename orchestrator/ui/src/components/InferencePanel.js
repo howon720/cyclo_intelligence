@@ -18,14 +18,20 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
-import { MdFolderOpen, MdInfoOutline } from 'react-icons/md';
+import {
+  MdFolderOpen,
+  MdInfoOutline,
+  MdPrecisionManufacturing,
+  MdViewInAr,
+  MdWarningAmber,
+} from 'react-icons/md';
 import FileBrowserModal from './FileBrowserModal';
 import InferenceModelSelector from './InferenceModelSelector';
 import PolicyBackendControl from './PolicyBackendControl';
 import Tooltip from './Tooltip';
 import { InferencePhase } from '../constants/taskPhases';
 import { DEFAULT_PATHS } from '../constants/paths';
-import { setTaskInfo } from '../features/tasks/taskSlice';
+import { setInferenceMode, setTaskInfo } from '../features/tasks/taskSlice';
 import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
 import { requiresInstruction } from '../constants/policyCapabilities';
 
@@ -47,6 +53,14 @@ const InferencePanel = () => {
   const isTaskRunning = inferenceStatus.inferencePhase !== InferencePhase.READY;
   const isInferencing =
     inferenceStatus.inferencePhase === InferencePhase.INFERENCING;
+  const inferenceMode = info.inferenceMode || 'simulation';
+  const isRobotMode = inferenceMode === 'robot';
+  const isModeSwitchLocked =
+    inferenceStatus.inferencePhase === InferencePhase.LOADING;
+  const isModelActive = [
+    InferencePhase.INFERENCING,
+    InferencePhase.PAUSED,
+  ].includes(inferenceStatus.inferencePhase);
   const disabled = isTaskRunning;
   const [isEditable, setIsEditable] = useState(!disabled);
   const [isUpdatingInstruction, setIsUpdatingInstruction] = useState(false);
@@ -62,6 +76,33 @@ const InferencePanel = () => {
       dispatch(setTaskInfo({ ...info, [field]: value }));
     },
     [isEditable, info, dispatch]
+  );
+
+  const handleDeployModeChange = useCallback(
+    async (mode) => {
+      if (mode === inferenceMode || isModeSwitchLocked) return;
+
+      if (isModelActive) {
+        const result = await sendRecordCommand('finish').catch((error) => {
+          toast.error(`Deploy target reset failed: ${error.message || error}`);
+          return null;
+        });
+        if (!result || result.success === false) {
+          toast.error(result?.message || 'Inference reset failed');
+          return;
+        }
+        toast('Inference reset before deploy target switch');
+      }
+
+      dispatch(setInferenceMode(mode));
+    },
+    [
+      dispatch,
+      inferenceMode,
+      isModeSwitchLocked,
+      isModelActive,
+      sendRecordCommand,
+    ]
   );
 
   const currentInstruction = (info.taskInstruction?.[0] || '').trim();
@@ -266,6 +307,32 @@ const InferencePanel = () => {
     }
   );
 
+  const deployButtonClass = (active, danger = false) => clsx(
+    'h-9',
+    'min-w-0',
+    'px-2',
+    'rounded-md',
+    'flex',
+    'items-center',
+    'justify-center',
+    'gap-1.5',
+    'text-xs',
+    'font-semibold',
+    'whitespace-nowrap',
+    'transition-colors',
+    'focus:outline-none',
+    'focus:ring-2',
+    active
+      ? danger
+        ? 'bg-orange-500 text-white focus:ring-orange-300'
+        : 'bg-emerald-500 text-white focus:ring-emerald-300'
+      : 'bg-white text-gray-600 hover:bg-gray-50 focus:ring-gray-300 border border-gray-200',
+    {
+      'opacity-50 cursor-not-allowed': isModeSwitchLocked,
+      'cursor-pointer': !isModeSwitchLocked,
+    }
+  );
+
   return (
     <div className={classInfoPanel}>
       <div className={clsx('text-lg', 'font-semibold', 'mb-3', 'text-gray-800')}>
@@ -277,6 +344,45 @@ const InferencePanel = () => {
       <PolicyBackendControl
         serviceType={info.serviceType}
       />
+
+      <div className="mb-3 rounded-lg border border-gray-200 bg-gray-50 p-2">
+        <div className="flex items-center justify-between gap-2 mb-1.5">
+          <span className="text-sm font-medium text-gray-600">Deploy Target</span>
+          <span className={clsx(
+            'inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-semibold whitespace-nowrap',
+            isRobotMode
+              ? 'bg-orange-100 text-orange-700'
+              : 'bg-emerald-100 text-emerald-700'
+          )}>
+            {isRobotMode ? <MdWarningAmber size={14} /> : <MdViewInAr size={14} />}
+            {isRobotMode ? 'Commands Enabled' : 'Commands Blocked'}
+          </span>
+        </div>
+        <div className="grid grid-cols-2 gap-1">
+          <button
+            type="button"
+            onClick={() => handleDeployModeChange('simulation')}
+            disabled={isModeSwitchLocked}
+            className={deployButtonClass(!isRobotMode)}
+            aria-label="Use 3D Sim Deploy"
+            title="3D Sim Deploy"
+          >
+            <MdViewInAr size={17} className="shrink-0" />
+            <span className="truncate">3D Sim Deploy</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handleDeployModeChange('robot')}
+            disabled={isModeSwitchLocked}
+            className={deployButtonClass(isRobotMode, true)}
+            aria-label="Use Real Robot Deploy"
+            title="Real Robot Deploy"
+          >
+            <MdPrecisionManufacturing size={17} className="shrink-0" />
+            <span className="truncate">Real Robot Deploy</span>
+          </button>
+        </div>
+      </div>
 
       {/* Edit mode indicator */}
       <div

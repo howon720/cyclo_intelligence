@@ -80,6 +80,7 @@ const initialState = {
     // visibility via constants/policyCapabilities.js).
     serviceType: 'lerobot',
     policyType: 'act',
+    inferenceMode: 'simulation',
   },
 
   taskInfoSync: { ...syncInitialState },
@@ -177,6 +178,9 @@ const taskSlice = createSlice({
     },
     setRecordInferenceMode: (state, action) => {
       state.taskInfo.recordInferenceMode = action.payload;
+    },
+    setInferenceMode: (state, action) => {
+      state.taskInfo.inferenceMode = action.payload || 'simulation';
     },
     setHeartbeatStatus: (state, action) => {
       state.heartbeatStatus = action.payload;
@@ -326,6 +330,7 @@ export const {
   setTaskInstruction,
   setPolicyPath,
   setRecordInferenceMode,
+  setInferenceMode,
   setHeartbeatStatus,
   setLastHeartbeatTime,
   setJoystickMode,

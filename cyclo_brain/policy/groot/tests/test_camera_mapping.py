@@ -36,8 +36,19 @@ class GrootCameraMappingTest(unittest.TestCase):
             },
         )
 
-    def test_requires_every_policy_camera_to_be_mapped_once(self):
-        with self.assertRaisesRegex(RuntimeError, "Missing camera mappings"):
+    def test_maps_full_dataset_key_to_canonical_robot_source(self):
+        self.assertEqual(
+            resolve_camera_mappings(
+                ["cam_left_head"],
+                ["observation.images.rgb.cam_left_head"],
+            ),
+            {
+                "cam_left_head": "observation.images.rgb.cam_left_head",
+            },
+        )
+
+    def test_rejects_two_policy_keys_for_one_robot_source(self):
+        with self.assertRaisesRegex(RuntimeError, "matched multiple model keys"):
             resolve_camera_mappings(
                 ["rgb.cam_left_head"],
                 ["rgb.cam_left_head", "cam_left_head"],

@@ -36,6 +36,10 @@ Environment overrides:
                                       (default /root/ros2_ws/src/cyclo_intelligence)
     CYCLO_SUPERVISOR_API_COMPOSE_FILE absolute path to docker-compose.yml inside
                                       this container (default <repo-mount>/docker/docker-compose.yml)
+    CYCLO_SUPERVISOR_API_CONTAINER_NAME
+                                      Docker container name to inspect for
+                                      host-side bind mount paths
+                                      (default cyclo_intelligence fallback)
 """
 
 from __future__ import annotations
@@ -63,6 +67,7 @@ logger = logging.getLogger("supervisor_api")
 # Names the UI may start/stop. Kept explicit so a stray POST can't
 # poke at s6-agent or the log pipelines.
 _USER_SERVICES: tuple[str, ...] = (
+    "zenoh_router",
     "orchestrator",
     "cyclo_data",
     "bt_node",
@@ -146,6 +151,7 @@ class BackendStatus(BaseModel):
     name: str
     image: str
     image_pulled: bool
+    image_status: Literal["current", "stale", "missing"]
     container_state: Literal["running", "exited", "not_created", "unknown"]
     container_id: Optional[str] = None
     raw_state: Optional[str] = None
@@ -189,14 +195,14 @@ _BACKENDS: Dict[str, Dict[str, str]] = {
     "lerobot": {
         "service": "lerobot",
         "container": "lerobot_server",
-        "image": f"robotis/lerobot-zenoh:1.0.1-{_BACKEND_ARCH}",
+        "image": f"robotis/lerobot-zenoh:1.3.0-{_BACKEND_ARCH}",
         "services": ["main-runtime", "engine-process"],
     },
     "groot": {
         "service": "groot",
         "container": "groot_server",
-        "image": f"robotis/groot-zenoh:1.2.1-{_BACKEND_ARCH}",
-        "services": ["inference-server", "control-publisher"],
+        "image": f"robotis/groot-zenoh:1.3.0-{_BACKEND_ARCH}",
+        "services": ["main-runtime", "engine-process"],
     },
 }
 
@@ -221,6 +227,7 @@ def _require_known_backend(name: str) -> Dict[str, str]:
 
 _HOST_PROJECT_DIR_CACHE: Optional[str] = None
 _HOST_WORKSPACE_DIR_CACHE: Optional[str] = None
+_HOST_HUGGINGFACE_DIR_CACHE: Optional[str] = None
 
 
 def _mount_source_for_destination(mounts, destination: str) -> Optional[str]:
@@ -228,6 +235,25 @@ def _mount_source_for_destination(mounts, destination: str) -> Optional[str]:
         if mount.get("Destination") == destination:
             return mount.get("Source")
     return None
+
+
+def _normalized_host_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    return os.path.realpath(path)
+
+
+def _self_container_candidates() -> List[str]:
+    candidates = [
+        os.environ.get("CYCLO_SUPERVISOR_API_CONTAINER_NAME"),
+        os.environ.get("HOSTNAME"),
+        "cyclo_intelligence",
+    ]
+    seen: List[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+    return seen
 
 
 def _host_project_dir() -> Optional[str]:
@@ -244,21 +270,26 @@ def _host_project_dir() -> Optional[str]:
     global _HOST_PROJECT_DIR_CACHE
     if _HOST_PROJECT_DIR_CACHE is not None:
         return _HOST_PROJECT_DIR_CACHE
-    own_id = os.environ.get("HOSTNAME")
-    if not own_id:
-        return None
     try:
-        ctr = _docker_client().containers.get(own_id)
+        client = _docker_client()
     except DockerException as e:
-        logger.warning("self-inspect failed: %s", e)
+        logger.warning("docker init failed during self-inspect: %s", e)
         return None
-    host_repo = _mount_source_for_destination(
-        ctr.attrs.get("Mounts", []),
-        _CYCLO_REPO_MOUNT,
-    )
-    if host_repo:
-        _HOST_PROJECT_DIR_CACHE = os.path.join(host_repo, "docker")
-        return _HOST_PROJECT_DIR_CACHE
+    for own_id in _self_container_candidates():
+        try:
+            ctr = client.containers.get(own_id)
+        except NotFound:
+            continue
+        except DockerException as e:
+            logger.warning("self-inspect failed for %s: %s", own_id, e)
+            continue
+        host_repo = _mount_source_for_destination(
+            ctr.attrs.get("Mounts", []),
+            _CYCLO_REPO_MOUNT,
+        )
+        if host_repo:
+            _HOST_PROJECT_DIR_CACHE = os.path.join(host_repo, "docker")
+            return _HOST_PROJECT_DIR_CACHE
     logger.warning(
         "no mount found for %s — compose CLI relative paths will resolve "
         "against the in-container path, which the host docker daemon "
@@ -279,23 +310,76 @@ def _host_workspace_dir() -> Optional[str]:
         _HOST_WORKSPACE_DIR_CACHE = env_path
         return _HOST_WORKSPACE_DIR_CACHE
 
-    own_id = os.environ.get("HOSTNAME")
-    if not own_id:
-        return None
     try:
-        ctr = _docker_client().containers.get(own_id)
+        client = _docker_client()
     except DockerException as e:
-        logger.warning("self-inspect for workspace mount failed: %s", e)
+        logger.warning("docker init failed during workspace self-inspect: %s", e)
         return None
 
-    host_workspace = _mount_source_for_destination(
-        ctr.attrs.get("Mounts", []),
-        "/workspace",
-    )
-    if host_workspace:
-        _HOST_WORKSPACE_DIR_CACHE = host_workspace
-        return _HOST_WORKSPACE_DIR_CACHE
+    for own_id in _self_container_candidates():
+        try:
+            ctr = client.containers.get(own_id)
+        except NotFound:
+            continue
+        except DockerException as e:
+            logger.warning("self-inspect for workspace mount failed: %s", e)
+            continue
+        host_workspace = _mount_source_for_destination(
+            ctr.attrs.get("Mounts", []),
+            "/workspace",
+        )
+        if host_workspace:
+            _HOST_WORKSPACE_DIR_CACHE = host_workspace
+            return _HOST_WORKSPACE_DIR_CACHE
     return None
+
+
+def _host_huggingface_dir() -> Optional[str]:
+    """Resolve the host-side directory mounted at /root/.cache/huggingface."""
+    global _HOST_HUGGINGFACE_DIR_CACHE
+    if _HOST_HUGGINGFACE_DIR_CACHE is not None:
+        return _HOST_HUGGINGFACE_DIR_CACHE
+
+    env_path = os.environ.get("CYCLO_HUGGINGFACE_DIR")
+    if env_path:
+        _HOST_HUGGINGFACE_DIR_CACHE = env_path
+        return _HOST_HUGGINGFACE_DIR_CACHE
+
+    try:
+        client = _docker_client()
+    except DockerException as e:
+        logger.warning("docker init failed during huggingface self-inspect: %s", e)
+        return None
+
+    for own_id in _self_container_candidates():
+        try:
+            ctr = client.containers.get(own_id)
+        except NotFound:
+            continue
+        except DockerException as e:
+            logger.warning("self-inspect for huggingface mount failed: %s", e)
+            continue
+        host_huggingface = _mount_source_for_destination(
+            ctr.attrs.get("Mounts", []),
+            "/root/.cache/huggingface",
+        )
+        if host_huggingface:
+            _HOST_HUGGINGFACE_DIR_CACHE = host_huggingface
+            return _HOST_HUGGINGFACE_DIR_CACHE
+    return None
+
+
+def _compose_env() -> Dict[str, str]:
+    """Build env for host docker compose calls made from this container."""
+    env = os.environ.copy()
+    workspace_dir = _host_workspace_dir()
+    huggingface_dir = _host_huggingface_dir()
+    if workspace_dir:
+        env["CYCLO_WORKSPACE_DIR"] = workspace_dir
+    if huggingface_dir:
+        env["CYCLO_HUGGINGFACE_DIR"] = huggingface_dir
+    env.setdefault("ARCH", _BACKEND_ARCH)
+    return env
 
 
 def _compose_base_cmd() -> List[str]:
@@ -335,18 +419,28 @@ def _container_raw_state(container) -> str:
     return container.attrs.get("State", {}).get("Status", "unknown")
 
 
-def _missing_required_mounts(name: str, container) -> List[str]:
-    required_mounts = _REQUIRED_BACKEND_MOUNTS.get(name, ())
-    if not required_mounts:
-        return []
-    mounted_destinations = {
-        mount.get("Destination")
-        for mount in container.attrs.get("Mounts", [])
-    }
-    return [
-        destination for destination in required_mounts
-        if destination not in mounted_destinations
-    ]
+def _backend_container_image_mismatch(
+    client: docker.DockerClient,
+    container,
+    spec: Dict[str, str],
+) -> bool:
+    """Return True when an existing backend container uses an older image ID."""
+    container_image_id = container.attrs.get("Image")
+    if not container_image_id:
+        return False
+
+    found_local_image = False
+    for image in _backend_image_candidates(spec):
+        try:
+            expected_image = client.images.get(image)
+        except ImageNotFound:
+            continue
+        found_local_image = True
+        expected_image_id = getattr(expected_image, "id", None)
+        if expected_image_id and expected_image_id == container_image_id:
+            return False
+
+    return found_local_image
 
 
 def _missing_required_mounts(name: str, container) -> List[str]:
@@ -361,6 +455,50 @@ def _missing_required_mounts(name: str, container) -> List[str]:
         destination for destination in required_mounts
         if destination not in mounted_destinations
     ]
+
+
+def _backend_container_workspace_mount_mismatch(
+    container,
+    expected_workspace_dir: Optional[str],
+) -> bool:
+    if not expected_workspace_dir:
+        return False
+    workspace_source = _mount_source_for_destination(
+        container.attrs.get("Mounts", []),
+        "/workspace",
+    )
+    if not workspace_source:
+        return False
+    return (
+        _normalized_host_path(workspace_source)
+        != _normalized_host_path(expected_workspace_dir)
+    )
+
+
+def _backend_container_stale_reason(
+    name: str,
+    client: docker.DockerClient,
+    container,
+    spec: Dict[str, str],
+    expected_workspace_dir: Optional[str],
+) -> Optional[str]:
+    missing_mounts = _missing_required_mounts(name, container)
+    if missing_mounts:
+        return "missing_required_mounts=" + ",".join(missing_mounts)
+    if _backend_container_workspace_mount_mismatch(
+        container,
+        expected_workspace_dir,
+    ):
+        return "workspace_mount_mismatch"
+    if _backend_container_image_mismatch(client, container, spec):
+        return "image_mismatch"
+    return None
+
+
+def _backend_raw_state_for_stale_reason(reason: str) -> str:
+    if reason == "image_mismatch":
+        return "stale_image"
+    return reason
 
 
 def _backend_service_statuses(
@@ -613,6 +751,50 @@ async def backend_restart(name: str) -> ActionResult:
     return await _ensure_backend_running(name, spec)
 
 
+@app.post("/backends/{name}/recreate", response_model=ActionResult)
+async def backend_recreate(name: str) -> ActionResult:
+    spec = _require_known_backend(name)
+
+    def _remove_existing() -> tuple[str, str]:
+        try:
+            client = _docker_client()
+        except DockerException as e:
+            raise HTTPException(500, f"docker init failed: {e}")
+        local_image = _local_backend_image(client, spec)
+        if not local_image:
+            images = ", ".join(_backend_image_candidates(spec))
+            raise HTTPException(
+                409,
+                f"No local image for {name}. Expected one of: {images}. "
+                f"Connect internet and call /backends/{name}/pull first.",
+            )
+        try:
+            ctr = client.containers.get(spec["container"])
+        except NotFound:
+            removed = "not_created"
+        except DockerException as e:
+            raise HTTPException(500, f"inspect failed: {e}")
+        else:
+            try:
+                ctr.remove(force=True)
+                removed = "removed"
+            except DockerException as e:
+                raise HTTPException(500, f"remove failed: {e}")
+        return local_image, removed
+
+    local_image, removed = await asyncio.to_thread(_remove_existing)
+    cmd = _compose_base_cmd() + ["create", "--no-build", spec["service"]]
+    result = await _run(*cmd, timeout=60.0, env=_compose_env())
+    ok = result.rc == 0
+    msg = result.stderr or result.stdout or f"rc={result.rc}"
+    if ok:
+        msg = (
+            f"{spec['container']} recreated from {local_image} "
+            f"({removed}). {msg}"
+        )
+    return ActionResult(ok=ok, message=msg)
+
+
 @app.post("/backends/{name}/stop", response_model=ActionResult)
 async def backend_stop(name: str) -> ActionResult:
     spec = _require_known_backend(name)
@@ -663,10 +845,16 @@ async def _ensure_backend_running(name: str, spec: Dict[str, str]) -> ActionResu
             return False, f"inspect failed: {e}"
 
         try:
-            missing_mounts = _missing_required_mounts(name, ctr)
-            if missing_mounts:
+            stale_reason = _backend_container_stale_reason(
+                name,
+                client,
+                ctr,
+                spec,
+                _host_workspace_dir(),
+            )
+            if stale_reason:
                 ctr.remove(force=True)
-                return None, "missing_required_mounts=" + ",".join(missing_mounts)
+                return None, stale_reason
 
             state = _container_raw_state(ctr)
             if state == "paused":
@@ -703,12 +891,12 @@ async def _ensure_backend_running(name: str, spec: Dict[str, str]) -> ActionResu
         )
 
     cmd = _compose_base_cmd() + ["up", "-d", "--no-build", spec["service"]]
-    result = await _run(*cmd, timeout=60.0)
+    result = await _run(*cmd, timeout=60.0, env=_compose_env())
     ok = result.rc == 0
     msg = result.stderr or result.stdout or f"rc={result.rc}"
     if ok:
         reason = ""
-        if compose_reason.startswith("missing_required_mounts="):
+        if compose_reason != "not_created":
             reason = f" after recreating stale container ({compose_reason})"
         msg = (
             f"{spec['container']} created/started{reason} "
@@ -724,12 +912,31 @@ async def backend_status(name: str) -> BackendStatus:
     def _inspect():
         client = _docker_client()
         pulled = _local_backend_image(client, spec) is not None
+        image_status: Literal["current", "stale", "missing"] = (
+            "current" if pulled else "missing"
+        )
         try:
             ctr = client.containers.get(spec["container"])
         except NotFound:
-            return pulled, "not_created", None, None, []
+            return pulled, image_status, "not_created", None, None, []
         except DockerException as e:
             raise HTTPException(500, f"docker inspect failed: {e}")
+        stale_reason = _backend_container_stale_reason(
+            name,
+            client,
+            ctr,
+            spec,
+            _host_workspace_dir(),
+        )
+        if stale_reason:
+            return (
+                pulled,
+                "stale",
+                "exited",
+                ctr.id,
+                _backend_raw_state_for_stale_reason(stale_reason),
+                [],
+            )
         raw = _container_raw_state(ctr)
         if raw == "running":
             mapped = "running"
@@ -739,13 +946,14 @@ async def backend_status(name: str) -> BackendStatus:
             mapped = "unknown"
         service_names = spec.get("services", ["main-runtime", "engine-process"])
         services = _backend_service_statuses(ctr, raw, service_names)
-        return pulled, mapped, ctr.id, raw, services
+        return pulled, image_status, mapped, ctr.id, raw, services
 
-    pulled, container_state, container_id, raw, services = await asyncio.to_thread(_inspect)
+    pulled, image_status, container_state, container_id, raw, services = await asyncio.to_thread(_inspect)
     return BackendStatus(
         name=name,
         image=spec["image"],
         image_pulled=pulled,
+        image_status=image_status,
         container_state=container_state,
         container_id=container_id,
         raw_state=raw,

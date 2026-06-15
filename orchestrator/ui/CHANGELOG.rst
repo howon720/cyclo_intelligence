@@ -2,6 +2,13 @@
 Changelog for package cyclo-ui
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.13 (2026-06-11)
+-------------------
+* Added explicit ``3D Sim Deploy`` and ``Real Robot Deploy`` controls with a confirmation dialog before robot publishing.
+* Added policy backend image pull controls with streaming progress feedback and explicit stale-container update handling.
+* Hid unavailable backend start/restart controls when the required Docker image is missing.
+* Contributors: Dongyun Kim
+
 0.1.12 (2026-06-05)
 -------------------
 * Fixed workspace mount path handling in dataset and Hugging Face tools.

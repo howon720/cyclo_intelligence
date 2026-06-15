@@ -8,6 +8,7 @@
 #   docker/container.sh start-lerobot      # → lerobot (idle until LOAD)
 #   docker/container.sh start-groot        # → groot (idle until LOAD)
 #   docker/container.sh enter              # → shell in cyclo_intelligence
+#   docker/container.sh build-ui           # → rebuild React UI only
 #   docker/container.sh enter-lerobot      # → shell in lerobot_server
 #   docker/container.sh enter-groot        # → shell in groot_server
 #   docker/container.sh logs               # → compose logs -f
@@ -152,6 +153,63 @@ container_running() {
     docker ps --format '{{.Names}}' | grep -q "^$1\$"
 }
 
+compose_service_image() {
+    local service="$1"
+    $COMPOSE config --format json 2>/dev/null \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"][sys.argv[1]]["image"])' "$service"
+}
+
+container_workspace_source() {
+    docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' "$1" 2>/dev/null || true
+}
+
+canonical_path() {
+    readlink -f "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+paths_equal() {
+    [ "$(canonical_path "$1")" = "$(canonical_path "$2")" ]
+}
+
+remove_stale_policy_container() {
+    local service="$1"
+    local container="$2"
+    local expected_image
+    local expected_id
+    local current_id
+    local current_workspace
+
+    expected_image="$(compose_service_image "$service" 2>/dev/null || true)"
+    if [ -z "$expected_image" ]; then
+        echo "[container.sh] Warning: could not resolve compose image for $service; skipping stale-container check."
+        return 0
+    fi
+
+    expected_id="$(docker image inspect -f '{{.Id}}' "$expected_image" 2>/dev/null || true)"
+    current_id="$(docker inspect -f '{{.Image}}' "$container" 2>/dev/null || true)"
+    if [ -n "$expected_id" ] && [ -n "$current_id" ] && [ "$expected_id" != "$current_id" ]; then
+        echo "[container.sh] Removing stale $container (expected $expected_image). It will be recreated on next start."
+        docker rm -f "$container" >/dev/null || true
+        return 0
+    fi
+
+    current_workspace="$(container_workspace_source "$container")"
+    if [ -n "$current_id" ] && [ -z "$current_workspace" ]; then
+        echo "[container.sh] Removing stale $container (/workspace mount missing). It will be recreated on next start."
+        docker rm -f "$container" >/dev/null || true
+        return 0
+    fi
+    if [ -n "$current_id" ] && ! paths_equal "$current_workspace" "$CYCLO_WORKSPACE_DIR"; then
+        echo "[container.sh] Removing stale $container (/workspace mounted from $current_workspace, expected $CYCLO_WORKSPACE_DIR). It will be recreated on next start."
+        docker rm -f "$container" >/dev/null || true
+    fi
+}
+
+remove_stale_policy_containers() {
+    remove_stale_policy_container "$LEROBOT_SERVICE" "$LEROBOT_CONTAINER"
+    remove_stale_policy_container "$GROOT_SERVICE" "$GROOT_CONTAINER"
+}
+
 show_help() {
     cat <<EOF
 Usage: $0 <command>
@@ -177,6 +235,13 @@ Lifecycle:
   stop             compose down (prompts for confirmation)
   help             Show this help
 
+UI development:
+  build-ui         Rebuild only orchestrator/ui and copy the static build into
+                   the running cyclo_intelligence nginx root. Uses npm inside
+                   cyclo_intelligence when available, with a node:22 fallback.
+  test-ui [args]   Run React tests. Extra args are passed after npm test,
+                   e.g. test-ui -- --watchAll=false
+
 Flags (any start* command):
   --build, -b      Rebuild image from local Dockerfile instead of using
                    the pre-built image pulled from Docker Hub. Default
@@ -185,7 +250,7 @@ Flags (any start* command):
 
 Environment:
   GPU_ARCH         default | blackwell   (optional, amd64 only)
-  VERSION          image tag version (default: 0.1.12 for cyclo)
+  VERSION          image tag version (default: 0.1.13 for cyclo)
   ROS_DOMAIN_ID    default 30
   CYCLO_STORAGE_MODE
                    auto | ssd | local (default auto). Auto uses
@@ -193,14 +258,126 @@ Environment:
                    docker/workspace and docker/huggingface.
   CYCLO_WORKSPACE_DIR / CYCLO_HUGGINGFACE_DIR
                    Override the host bind-mount paths directly.
+  CYCLO_UI_NODE_IMAGE
+                   Node image for build-ui/test-ui (default node:22).
 EOF
+}
+
+ui_dir() {
+    canonical_path "${SCRIPT_DIR}/../orchestrator/ui"
+}
+
+main_ui_dir() {
+    printf '%s\n' "/root/ros2_ws/src/cyclo_intelligence/orchestrator/ui"
+}
+
+main_container_has_npm() {
+    container_running "$MAIN_CONTAINER" \
+        && docker exec "$MAIN_CONTAINER" sh -lc 'command -v npm >/dev/null 2>&1'
+}
+
+run_ui_npm_in_main() {
+    docker exec \
+        -u "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -w "$(main_ui_dir)" \
+        "$MAIN_CONTAINER" \
+        npm "$@"
+}
+
+run_ui_npm_external() {
+    local dir
+    dir="$(ui_dir)"
+    docker run --rm --network host \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "${dir}:/ui" \
+        -w /ui \
+        "${CYCLO_UI_NODE_IMAGE:-node:22}" \
+        npm "$@"
+}
+
+run_ui_npm() {
+    if main_container_has_npm; then
+        run_ui_npm_in_main "$@"
+    else
+        run_ui_npm_external "$@"
+    fi
+}
+
+ensure_ui_dependencies() {
+    local dir
+    if main_container_has_npm; then
+        if docker exec "$MAIN_CONTAINER" test -x "$(main_ui_dir)/node_modules/.bin/react-scripts"; then
+            return 0
+        fi
+
+        echo "[container.sh] Installing UI dependencies inside ${MAIN_CONTAINER}..."
+        run_ui_npm_in_main ci --legacy-peer-deps
+        return 0
+    fi
+
+    dir="$(ui_dir)"
+    if [ -x "${dir}/node_modules/.bin/react-scripts" ]; then
+        return 0
+    fi
+
+    echo "[container.sh] Installing UI dependencies with ${CYCLO_UI_NODE_IMAGE:-node:22}..."
+    run_ui_npm ci --legacy-peer-deps
+}
+
+clean_ui_build_dir() {
+    local dir
+    if container_running "$MAIN_CONTAINER"; then
+        docker exec "$MAIN_CONTAINER" sh -lc "rm -rf '$(main_ui_dir)/build'"
+        return 0
+    fi
+
+    dir="$(ui_dir)"
+    docker run --rm --network none \
+        -v "${dir}:/ui" \
+        -w /ui \
+        "${CYCLO_UI_NODE_IMAGE:-node:22}" \
+        sh -c 'rm -rf build'
+}
+
+build_ui() {
+    local dir
+    dir="$(ui_dir)"
+    ensure_ui_dependencies
+
+    echo "[container.sh] Building React UI only..."
+    clean_ui_build_dir
+    run_ui_npm run build
+
+    if ! container_running "$MAIN_CONTAINER"; then
+        echo "[container.sh] UI build complete: ${dir}/build"
+        echo "[container.sh] ${MAIN_CONTAINER} is not running, so nginx was not updated."
+        return 0
+    fi
+
+    echo "[container.sh] Copying UI build into ${MAIN_CONTAINER} nginx root..."
+    docker cp "${dir}/build/." "${MAIN_CONTAINER}:/usr/share/nginx/html/"
+    docker exec "$MAIN_CONTAINER" sh -c 'nginx -s reload 2>/dev/null || true'
+    echo "[container.sh] UI updated. Refresh the browser to load the new bundle."
+}
+
+test_ui() {
+    ensure_ui_dependencies
+    echo "[container.sh] Running React UI tests..."
+    if [ "$#" -eq 0 ]; then
+        run_ui_npm test -- --watchAll=false
+    else
+        run_ui_npm test "$@"
+    fi
 }
 
 start_main() {
     setup_storage
     setup_x11
     echo "[container.sh] Pulling pre-built images (ignoring local-only failures)..."
-    $COMPOSE pull --ignore-pull-failures "$MAIN_SERVICE" || true
+    $COMPOSE pull --ignore-pull-failures "$MAIN_SERVICE" "$LEROBOT_SERVICE" "$GROOT_SERVICE" || true
+    remove_stale_policy_containers
     echo "[container.sh] Starting $MAIN_SERVICE (ARCH=$ARCH${BUILD_FLAG:+, rebuild on})..."
     $COMPOSE up -d $BUILD_FLAG "$MAIN_SERVICE"
     echo "[container.sh] Done. 'docker/container.sh status' to check s6 services."
@@ -211,6 +388,7 @@ start_lerobot() {
     setup_x11
     echo "[container.sh] Pulling pre-built images..."
     $COMPOSE pull --ignore-pull-failures "$LEROBOT_SERVICE" || true
+    remove_stale_policy_container "$LEROBOT_SERVICE" "$LEROBOT_CONTAINER"
     echo "[container.sh] Starting $LEROBOT_SERVICE (ARCH=$ARCH${BUILD_FLAG:+, rebuild on})..."
     $COMPOSE up -d $BUILD_FLAG "$LEROBOT_SERVICE"
 }
@@ -220,6 +398,7 @@ start_groot() {
     setup_x11
     echo "[container.sh] Pulling pre-built images..."
     $COMPOSE pull --ignore-pull-failures "$GROOT_SERVICE" || true
+    remove_stale_policy_container "$GROOT_SERVICE" "$GROOT_CONTAINER"
     echo "[container.sh] Starting $GROOT_SERVICE (ARCH=$ARCH${BUILD_FLAG:+, rebuild on})..."
     $COMPOSE up -d $BUILD_FLAG "$GROOT_SERVICE"
 }
@@ -322,6 +501,8 @@ case "${1:-help}" in
     enter)           enter_main ;;
     enter-lerobot)   enter_lerobot ;;
     enter-groot)     enter_groot ;;
+    build-ui)        build_ui ;;
+    test-ui)         shift; test_ui "$@" ;;
     logs)            show_logs ;;
     status)          show_status ;;
     stop)            stop_all ;;

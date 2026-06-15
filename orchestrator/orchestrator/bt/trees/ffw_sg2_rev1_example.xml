@@ -5,8 +5,9 @@
       <SendCommand name="LoadModel"
         command="LOAD"
         model="groot:n17"
-        policy_path="/workspace/model/groot/your_repo_id"
-        task_instruction="Place the paper cups in to the basket."
+        policy_path="/workspace/model/groot/your_model_path"
+        task_instruction="Pick up the paper cup."
+        inference_mode="robot"
         inference_hz="15"
         control_hz="100"
         chunk_align_window_s="0.3"/>
@@ -21,7 +22,9 @@
         duration="2.0"/>
       <Rotate name="TurnLeft" angle_deg="90.0"/>
       <Loop name="RepeatPick&amp;Place" max_iterations="3">
-        <SendCommand name="ResumeInference" command="RESUME"/>
+        <SendCommand name="ResumeInference"
+          command="RESUME"
+          task_instruction="Pick up the paper cup."/>
         <Wait name="HoldInference" duration="3.0"/>
         <SendCommand name="StopInference" command="STOP"/>
         <JointControl name="InitArms"

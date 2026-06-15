@@ -1,85 +1,46 @@
 #!/usr/bin/env python3
-"""Camera-name alias resolution for GR00T runtime inputs."""
+"""Compatibility wrapper for the shared robot_client camera mapping helper."""
 
 from __future__ import annotations
 
-import re
-from typing import Dict, Iterable
+import importlib.util
+import os
+from pathlib import Path
 
 
-_CAMERA_SEMANTIC_RE = re.compile(
-    r"^cam_(?P<a>left|right|head|wrist)_(?P<b>left|right|head|wrist)$"
-)
+def _load_shared_camera_mapping():
+    candidates = []
+    sdk_path = os.environ.get("ROBOT_CLIENT_SDK_PATH")
+    if sdk_path:
+        candidates.append(Path(sdk_path) / "robot_client" / "camera_mapping.py")
 
-
-def resolve_camera_mappings(
-    robot_camera_names: Iterable[str],
-    policy_video_keys: Iterable[str],
-) -> Dict[str, str]:
-    """Map RobotClient camera names to GR00T policy video keys.
-
-    The canonical Cyclo camera names are ``cam_<side>_<part>`` such as
-    ``cam_left_head``. Some runtime configs or checkpoints may expose
-    ``rgb.`` prefixes; exact matches remain preferred.
-    """
-    camera_names = list(robot_camera_names)
-    policy_keys = set(policy_video_keys)
-    if not policy_keys:
-        return {cam: cam for cam in camera_names}
-
-    active: Dict[str, str] = {}
-    used_policy_keys = set()
-    for cam in camera_names:
-        candidates = camera_policy_key_candidates(cam)
-        matches = sorted(policy_keys & candidates)
-        if not matches:
-            continue
-
-        if cam in matches:
-            chosen = cam
-        elif len(matches) == 1:
-            chosen = matches[0]
-        else:
-            raise RuntimeError(f"Ambiguous camera mapping for {cam}: matches {matches}")
-
-        if chosen in used_policy_keys:
-            raise RuntimeError(
-                f"Policy camera key {chosen} matched multiple robot cameras"
-            )
-        active[cam] = chosen
-        used_policy_keys.add(chosen)
-
-    missing = sorted(policy_keys - used_policy_keys)
-    if missing:
-        raise RuntimeError(
-            "Missing camera mappings for policy video keys: "
-            f"{missing}; robot has {camera_names}; matched {active}"
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidates.append(
+            parent / "sdk" / "robot_client" / "robot_client" / "camera_mapping.py"
         )
-    return active
+
+    for candidate in candidates:
+        if candidate.exists():
+            spec = importlib.util.spec_from_file_location(
+                "_shared_camera_mapping",
+                candidate,
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+    raise ImportError(f"robot_client camera_mapping.py not found in {candidates}")
 
 
-def camera_policy_key_candidates(camera_name: str) -> set[str]:
-    aliases = {camera_name}
-    parts = camera_name.split(".")
-    suffix = parts[-1]
-    prefixes = parts[:-1]
-    aliases.add(suffix)
+_shared = _load_shared_camera_mapping()
 
-    semantic_names = {suffix}
-    match = _CAMERA_SEMANTIC_RE.match(suffix)
-    if match:
-        first = match.group("a")
-        second = match.group("b")
-        side = first if first in {"left", "right"} else second
-        part = first if first in {"head", "wrist"} else second
-        if side in {"left", "right"} and part in {"head", "wrist"}:
-            semantic_names.add(f"cam_{side}_{part}")
-            semantic_names.add(f"cam_{part}_{side}")
+camera_key_aliases = _shared.camera_key_aliases
+resolve_camera_feature_sources = _shared.resolve_camera_feature_sources
+resolve_camera_mappings = _shared.resolve_camera_mappings
 
-    for name in semantic_names:
-        aliases.add(name)
-        aliases.add(f"rgb.{name}")
-        if prefixes:
-            aliases.add(".".join([*prefixes, name]))
-
-    return aliases
+__all__ = [
+    "camera_key_aliases",
+    "resolve_camera_feature_sources",
+    "resolve_camera_mappings",
+]

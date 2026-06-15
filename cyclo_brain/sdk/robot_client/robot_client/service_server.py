@@ -24,7 +24,7 @@ cyclo_brain/policy/common/runtime/main_runtime. This framework now only covers
 training + status.
 
 Usage:
-    server = RobotServiceServer(name="groot", domain_id=30)
+    server = RobotServiceServer(name="lerobot", domain_id=30)
 
     @server.on_train
     def handle_train(request):

@@ -61,6 +61,7 @@ string model_path
 string embodiment_tag
 string robot_type
 string task_instruction
+bool publish_to_robot
 """
 
 INFERENCE_COMMAND_RESPONSE_DEF = """\

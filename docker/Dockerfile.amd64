@@ -44,11 +44,22 @@ RUN apt-get update && apt-get install -y \
     nano \
     nginx \
     docker.io \
+    docker-compose-v2 \
     python3-pip \
     ros-${ROS_DISTRO}-rmw-zenoh-cpp \
     ros-${ROS_DISTRO}-rosbridge-server \
     ros-${ROS_DISTRO}-web-video-server \
     && rm -rf /var/lib/apt/lists/*
+
+# Keep Node/npm available in the runtime image too. Cyclo is a research
+# platform, so being able to rebuild/test the React UI from inside the
+# running container is worth the extra image size. Copy from the same
+# node:22 stage that builds the production bundle so versions stay aligned.
+COPY --from=ui-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=ui-builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    node --version && npm --version
 
 ENV COLCON_WS=/root/ros2_ws
 WORKDIR ${COLCON_WS}

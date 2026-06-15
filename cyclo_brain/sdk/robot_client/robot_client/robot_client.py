@@ -177,6 +177,7 @@ class RobotClient:
         router_port: int = 7447,
         domain_id: Optional[int] = None,
         enable_command_publishers: bool = False,
+        enable_preview_publisher: bool = False,
     ):
         section = robot_schema.load_robot_section(robot_type)
         # Phase 4: yaml is VLA-semantic (observation.images / state +
@@ -192,6 +193,7 @@ class RobotClient:
         self._router_port = router_port
         self._domain_id = domain_id
         self._enable_command_publishers = bool(enable_command_publishers)
+        self._enable_preview_publisher = bool(enable_preview_publisher)
         self._action_groups = robot_schema.get_action_groups(section)
 
         # Thread-safe data stores
@@ -208,6 +210,7 @@ class RobotClient:
 
         self._subscribers: list = []
         self._command_publishers: dict[str, ROS2Publisher] = {}
+        self._preview_publisher: Optional[ROS2Publisher] = None
         self._command_msg_types: dict[str, str] = {}
         self._command_joint_names: dict[str, list[str]] = {}
         self._action_keys = sorted(self._action_groups.keys())
@@ -230,6 +233,8 @@ class RobotClient:
                     self._cmd_vel_linear_deadband,
                     self._cmd_vel_angular_deadband,
                 )
+        if self._enable_preview_publisher:
+            self._init_preview_publisher()
         logger.info(f"RobotClient initialized: {robot_type} "
                      f"({len(self._config.get('cameras', {}))} cameras, "
                      f"{len(self._config.get('joint_groups', {}))} joint groups)")
@@ -321,6 +326,21 @@ class RobotClient:
                 cfg["topic"],
                 cfg["msg_type"],
             )
+
+    def _init_preview_publisher(self):
+        """Create a unified trajectory preview publisher for the 3D viewer."""
+        common = {
+            "router_ip": self._router_ip,
+            "router_port": self._router_port,
+        }
+        if self._domain_id is not None:
+            common["domain_id"] = self._domain_id
+        self._preview_publisher = ROS2Publisher(
+            topic="/inference/trajectory_preview",
+            msg_type="trajectory_msgs/msg/JointTrajectory",
+            **common,
+        )
+        logger.debug("Action preview publisher: /inference/trajectory_preview")
 
     # ------------------------------------------------------------------ #
     # Callback handlers
@@ -593,6 +613,46 @@ class RobotClient:
                     segment,
                 )
 
+    def build_action_preview(
+        self,
+        action: np.ndarray,
+        action_keys: Optional[list[str]] = None,
+    ) -> tuple[list[str], np.ndarray]:
+        """Build a single joint trajectory point for preview-only consumers."""
+        keys = list(action_keys) if action_keys else self._action_keys
+        values = np.asarray(action, dtype=np.float64).reshape(-1)
+        joint_names: list[str] = []
+        positions: list[float] = []
+        offset = 0
+        for action_key in keys:
+            publish_key = self._resolve_action_key(action_key)
+            cfg = self._action_groups.get(publish_key)
+            if cfg is None:
+                continue
+            msg_type = cfg["msg_type"]
+            width = 3 if msg_type == "geometry_msgs/msg/Twist" else len(cfg["joint_names"])
+            segment = values[offset:offset + width]
+            offset += width
+            if msg_type == "geometry_msgs/msg/Twist":
+                continue
+            names = list(cfg.get("joint_names", []))
+            joint_names.extend(names)
+            positions.extend(float(v) for v in segment[:len(names)])
+        return joint_names, np.asarray(positions, dtype=np.float64)
+
+    def publish_action_preview(
+        self,
+        action: np.ndarray,
+        action_keys: Optional[list[str]] = None,
+    ) -> None:
+        """Publish preview-only action data for the 3D viewer."""
+        if self._preview_publisher is None:
+            return
+        joint_names, positions = self.build_action_preview(action, action_keys)
+        if not joint_names or len(joint_names) != len(positions):
+            return
+        self._publish_joint_trajectory(self._preview_publisher, joint_names, positions)
+
     def _resolve_action_key(self, action_key: str) -> str:
         if action_key in self._action_groups:
             return action_key
@@ -802,6 +862,12 @@ class RobotClient:
             except Exception as e:
                 logger.debug(f"Error closing command publisher: {e}")
         self._command_publishers.clear()
+        if self._preview_publisher is not None:
+            try:
+                self._preview_publisher.close()
+            except Exception as e:
+                logger.debug(f"Error closing preview publisher: {e}")
+            self._preview_publisher = None
         logger.info("RobotClient closed")
 
     def __del__(self):

@@ -25,11 +25,14 @@ import {
   MdFiberManualRecord,
   MdSave,
   MdClose,
+  MdPrecisionManufacturing,
+  MdViewInAr,
+  MdWarningAmber,
 } from 'react-icons/md';
 import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
 import Tooltip from './Tooltip';
 import { InferencePhase, RecordPhase } from '../constants/taskPhases';
-import { setInferenceStatus } from '../features/tasks/taskSlice';
+import { setInferenceMode, setInferenceStatus } from '../features/tasks/taskSlice';
 import { requiresInstruction } from '../constants/policyCapabilities';
 import usePolicyBackendStatus, {
   getPolicyBackendReadiness,
@@ -37,7 +40,7 @@ import usePolicyBackendStatus, {
 
 const phaseGuideMessages = {
   [InferencePhase.READY]: 'Ready to start',
-  [InferencePhase.LOADING]: 'Loading model...',
+  [InferencePhase.LOADING]: 'Loading model / downloading assets...',
   [InferencePhase.INFERENCING]: 'Inferencing',
   [InferencePhase.PAUSED]: 'Paused',
 };
@@ -64,6 +67,7 @@ export default function InferenceControlPanel() {
   const [localRecording, setLocalRecording] = useState(false);
   const [lastPolicyPath, setLastPolicyPath] = useState('');
   const [spinnerIndex, setSpinnerIndex] = useState(0);
+  const [pendingRobotDeployIntent, setPendingRobotDeployIntent] = useState(null);
 
   const { sendRecordCommand } = useRosServiceCaller();
 
@@ -75,6 +79,7 @@ export default function InferenceControlPanel() {
   const isLoading = phase === InferencePhase.LOADING;
   const isInferencing = phase === InferencePhase.INFERENCING;
   const isPaused = phase === InferencePhase.PAUSED;
+  const inferencePhaseRef = useRef(phase);
   const isModelLoaded = isInferencing || isPaused;
   const shouldCheckBackend = isIdle || isPaused;
   const serverRecording =
@@ -98,6 +103,10 @@ export default function InferenceControlPanel() {
   useEffect(() => {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
+
+  useEffect(() => {
+    inferencePhaseRef.current = phase;
+  }, [phase]);
 
   useEffect(() => {
     toasts
@@ -146,10 +155,20 @@ export default function InferenceControlPanel() {
   }, [taskInfo]);
 
   const executeCommand = useCallback(
-    async (commandName, commandString) => {
+    async (commandName, commandString, options = {}) => {
+      const isStartTimeoutDuringLoading = (message = '') => (
+        commandString === 'start_inference' &&
+        String(message).toLowerCase().includes('timeout') &&
+        inferencePhaseRef.current === InferencePhase.LOADING
+      );
+
       try {
-        const result = await sendRecordCommand(commandString);
+        const result = await sendRecordCommand(commandString, options);
         if (result && result.success === false) {
+          if (isStartTimeoutDuringLoading(result.message)) {
+            toast('Model loading is still running. Large downloads can take several minutes.');
+            return result;
+          }
           toast.error(`Command failed: ${result.message || 'Unknown error'}`);
           // Backend may have left phase in LOADING/INFERENCING after a failed
           // setup; force the local phase back to READY so the panel becomes
@@ -169,6 +188,12 @@ export default function InferenceControlPanel() {
           errorMessage.includes('WebSocket')
         ) {
           toast.error(`ROS connection failed: rosbridge server is not running (${rosHost})`);
+        } else if (isStartTimeoutDuringLoading(errorMessage)) {
+          toast('Model loading is still running. Large downloads can take several minutes.');
+          return {
+            success: true,
+            message: 'Model loading is still running',
+          };
         } else if (errorMessage.includes('timeout')) {
           toast.error(`Command timeout [${commandName}]: Server did not respond`);
         } else {
@@ -181,6 +206,16 @@ export default function InferenceControlPanel() {
     },
     [sendRecordCommand, rosHost, dispatch]
   );
+
+  const executeStartIntent = useCallback(async (intent, inferenceMode) => {
+    if (!intent) return;
+    if (intent.policyPath) {
+      setLastPolicyPath(intent.policyPath);
+    }
+    await executeCommand(intent.commandName, intent.commandString, {
+      inferenceMode,
+    });
+  }, [executeCommand]);
 
   const handleStart = useCallback(async () => {
     let readiness = backendReadiness;
@@ -198,26 +233,60 @@ export default function InferenceControlPanel() {
       return;
     }
 
+    let startIntent;
     if (isPaused && taskInfo.policyPath === lastPolicyPath) {
-      await executeCommand('Resume', 'resume_inference');
+      startIntent = {
+        commandName: 'Resume',
+        commandString: 'resume_inference',
+        policyPath: '',
+      };
     } else {
       const validation = validateTaskInfo();
       if (!validation.isValid) {
         toast.error(`Missing required fields: ${validation.missingFields.join(', ')}`);
         return;
       }
-      setLastPolicyPath(taskInfo.policyPath);
-      await executeCommand('Start Inference', 'start_inference');
+      startIntent = {
+        commandName: 'Start Inference',
+        commandString: 'start_inference',
+        policyPath: taskInfo.policyPath,
+      };
     }
+
+    const inferenceMode = taskInfo.inferenceMode || 'simulation';
+    if (inferenceMode === 'robot') {
+      setPendingRobotDeployIntent(startIntent);
+      return;
+    }
+
+    await executeStartIntent(startIntent, 'simulation');
   }, [
     backendReadiness,
     refreshBackendStatus,
     isPaused,
     taskInfo.policyPath,
+    taskInfo.inferenceMode,
     lastPolicyPath,
-    executeCommand,
+    executeStartIntent,
     validateTaskInfo,
   ]);
+
+  const handleConfirmRobotDeploy = useCallback(async () => {
+    const intent = pendingRobotDeployIntent;
+    setPendingRobotDeployIntent(null);
+    await executeStartIntent(intent, 'robot');
+  }, [executeStartIntent, pendingRobotDeployIntent]);
+
+  const handleUseSimDeploy = useCallback(async () => {
+    const intent = pendingRobotDeployIntent;
+    setPendingRobotDeployIntent(null);
+    dispatch(setInferenceMode('simulation'));
+    await executeStartIntent(intent, 'simulation');
+  }, [dispatch, executeStartIntent, pendingRobotDeployIntent]);
+
+  const handleCloseRobotDeployWarning = useCallback(() => {
+    setPendingRobotDeployIntent(null);
+  }, []);
 
   const handleStop = useCallback(async () => {
     await executeCommand('Stop', 'stop_inference');
@@ -424,137 +493,194 @@ export default function InferenceControlPanel() {
   ];
 
   return (
-    <div className={classBody}>
-      <span className="text-lg font-semibold text-gray-500 whitespace-nowrap px-1 shrink-0">Inference</span>
-      <div className="w-px h-2/3 bg-gray-300 shrink-0"></div>
-      {controlButtons.map(({ label, icon: Icon, color, enabled, handler, description, shortcut }) => {
-        const isDisabled = !enabled;
-        return (
-          <Tooltip
-            key={label}
-            position="bottom"
-            content={
-              <div className="text-center">
-                <div className="font-semibold">{description}</div>
-                {!isDisabled && (
-                  <div className="text-sm mt-1 text-gray-300">
-                    <span className="font-mono bg-gray-700 px-1 rounded">{shortcut}</span>
-                  </div>
-                )}
-              </div>
-            }
-            disabled={false}
-            className="relative h-full shrink-0"
-          >
-            <button
-              className={classBtn(label, isDisabled)}
-              onClick={() => !isDisabled && handler()}
-              onMouseEnter={() => !isDisabled && setHovered(label)}
-              onMouseLeave={() => { setHovered(null); setPressed(null); }}
-              onMouseDown={() => !isDisabled && setPressed(label)}
-              onMouseUp={() => setPressed(null)}
-              disabled={isDisabled}
-              aria-label={description}
+    <>
+      <div className={classBody}>
+        <span className="text-lg font-semibold text-gray-500 whitespace-nowrap px-1 shrink-0">Inference</span>
+        <div className="w-px h-2/3 bg-gray-300 shrink-0"></div>
+        {controlButtons.map(({ label, icon: Icon, color, enabled, handler, description, shortcut }) => {
+          const isDisabled = !enabled;
+          return (
+            <Tooltip
+              key={label}
+              position="bottom"
+              content={
+                <div className="text-center">
+                  <div className="font-semibold">{description}</div>
+                  {!isDisabled && (
+                    <div className="text-sm mt-1 text-gray-300">
+                      <span className="font-mono bg-gray-700 px-1 rounded">{shortcut}</span>
+                    </div>
+                  )}
+                </div>
+              }
+              disabled={false}
+              className="relative h-full shrink-0"
             >
-              <Icon
-                style={{ fontSize: '1.1rem' }}
-                color={isDisabled ? '#9ca3af' : color}
-              />
-              {label}
-            </button>
-          </Tooltip>
-        );
-      })}
+              <button
+                className={classBtn(label, isDisabled)}
+                onClick={() => !isDisabled && handler()}
+                onMouseEnter={() => !isDisabled && setHovered(label)}
+                onMouseLeave={() => { setHovered(null); setPressed(null); }}
+                onMouseDown={() => !isDisabled && setPressed(label)}
+                onMouseUp={() => setPressed(null)}
+                disabled={isDisabled}
+                aria-label={description}
+              >
+                <Icon
+                  style={{ fontSize: '1.1rem' }}
+                  color={isDisabled ? '#9ca3af' : color}
+                />
+                {label}
+              </button>
+            </Tooltip>
+          );
+        })}
 
-      <div className="w-px h-2/3 bg-gray-400 shrink-0"></div>
+        <div className="w-px h-2/3 bg-gray-400 shrink-0"></div>
 
-      {!isRecording ? (
-        <Tooltip
-          position="bottom"
-          content={
-            <div className="text-center">
-              <div className="font-semibold">Start recording</div>
-              <div className="text-sm mt-1 text-gray-300">
-                <span className="font-mono bg-gray-700 px-1 rounded">R</span>
-              </div>
-            </div>
-          }
-          disabled={!recordEnabled}
-          className="relative h-full shrink-0"
-        >
-          <button
-            className={classRecBtn('record', !recordEnabled)}
-            onClick={() => recordEnabled && handleRecordStart()}
-            disabled={!recordEnabled}
-            aria-label="Start recording"
-          >
-            <MdFiberManualRecord style={{ fontSize: '0.8rem' }} />
-            Record
-          </button>
-        </Tooltip>
-      ) : (
-        <>
-          <div className="flex items-center gap-0.5 text-red-500 font-bold text-lg animate-pulse shrink-0">
-            <MdFiberManualRecord style={{ fontSize: '0.5rem' }} />
-            REC
-          </div>
+        {!isRecording ? (
           <Tooltip
             position="bottom"
             content={
               <div className="text-center">
-                <div className="font-semibold">Save recording</div>
+                <div className="font-semibold">Start recording</div>
                 <div className="text-sm mt-1 text-gray-300">
                   <span className="font-mono bg-gray-700 px-1 rounded">R</span>
                 </div>
               </div>
             }
+            disabled={!recordEnabled}
             className="relative h-full shrink-0"
           >
             <button
-              className={classRecBtn('save', false)}
-              onClick={handleRecordSave}
-              aria-label="Save recording"
+              className={classRecBtn('record', !recordEnabled)}
+              onClick={() => recordEnabled && handleRecordStart()}
+              disabled={!recordEnabled}
+              aria-label="Start recording"
             >
-              <MdSave style={{ fontSize: '1rem' }} />
-              Save
+              <MdFiberManualRecord style={{ fontSize: '0.8rem' }} />
+              Record
             </button>
           </Tooltip>
-          <Tooltip
-            position="bottom"
-            content={
-              <div className="text-center">
-                <div className="font-semibold">Discard recording</div>
-              </div>
-            }
-            className="relative h-full shrink-0"
-          >
-            <button
-              className={classRecBtn('discard', false)}
-              onClick={handleRecordDiscard}
-              aria-label="Discard recording"
+        ) : (
+          <>
+            <div className="flex items-center gap-0.5 text-red-500 font-bold text-lg animate-pulse shrink-0">
+              <MdFiberManualRecord style={{ fontSize: '0.5rem' }} />
+              REC
+            </div>
+            <Tooltip
+              position="bottom"
+              content={
+                <div className="text-center">
+                  <div className="font-semibold">Save recording</div>
+                  <div className="text-sm mt-1 text-gray-300">
+                    <span className="font-mono bg-gray-700 px-1 rounded">R</span>
+                  </div>
+                </div>
+              }
+              className="relative h-full shrink-0"
             >
-              <MdClose style={{ fontSize: '1rem' }} />
-              Discard
-            </button>
-          </Tooltip>
-        </>
-      )}
+              <button
+                className={classRecBtn('save', false)}
+                onClick={handleRecordSave}
+                aria-label="Save recording"
+              >
+                <MdSave style={{ fontSize: '1rem' }} />
+                Save
+              </button>
+            </Tooltip>
+            <Tooltip
+              position="bottom"
+              content={
+                <div className="text-center">
+                  <div className="font-semibold">Discard recording</div>
+                </div>
+              }
+              className="relative h-full shrink-0"
+            >
+              <button
+                className={classRecBtn('discard', false)}
+                onClick={handleRecordDiscard}
+                aria-label="Discard recording"
+              >
+                <MdClose style={{ fontSize: '1rem' }} />
+                Discard
+              </button>
+            </Tooltip>
+          </>
+        )}
 
-      {(guideMessage || showGuideSpinner) && (
-        <>
-          <div className="w-px h-2/3 bg-gray-400 shrink-0"></div>
-          <div className="flex items-center gap-1 shrink-0">
-            <span className="text-gray-600 font-semibold text-lg whitespace-nowrap">
-              {guideMessage}
-            </span>
-            {showGuideSpinner && (
-              <span className="font-mono text-blue-500 text-sm">
-                {spinnerFrames[spinnerIndex]}
+        {(guideMessage || showGuideSpinner) && (
+          <>
+            <div className="w-px h-2/3 bg-gray-400 shrink-0"></div>
+            <div className="flex items-center gap-1 shrink-0">
+              <span className="text-gray-600 font-semibold text-lg whitespace-nowrap">
+                {guideMessage}
               </span>
-            )}
+              {showGuideSpinner && (
+                <span className="font-mono text-blue-500 text-sm">
+                  {spinnerFrames[spinnerIndex]}
+                </span>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+
+      {pendingRobotDeployIntent && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="real-robot-deploy-title"
+            className="w-full max-w-md rounded-lg bg-white shadow-2xl border border-orange-200 overflow-hidden"
+          >
+            <div className="flex items-center justify-between gap-3 px-4 py-3 bg-orange-50 border-b border-orange-200">
+              <div className="flex items-center gap-2 min-w-0">
+                <MdWarningAmber className="text-orange-600 shrink-0" size={22} />
+                <h2 id="real-robot-deploy-title" className="text-base font-bold text-orange-900 truncate">
+                  Real Robot Deploy
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={handleCloseRobotDeployWarning}
+                className="w-8 h-8 rounded-md flex items-center justify-center text-orange-700 hover:bg-orange-100 focus:outline-none focus:ring-2 focus:ring-orange-300"
+                aria-label="Close deploy warning"
+              >
+                <MdClose size={20} />
+              </button>
+            </div>
+            <div className="px-4 py-4 text-sm text-gray-700 space-y-3">
+              <p className="font-semibold text-gray-900">
+                Real Robot Deploy sends policy actions to the physical robot.
+              </p>
+              <p>
+                Keep people clear of the robot workspace before continuing.
+                For first-time inference, test with 3D Sim Deploy before switching to Real Robot Deploy.
+              </p>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-2 px-4 py-3 bg-gray-50 border-t border-gray-200">
+              <button
+                type="button"
+                onClick={handleConfirmRobotDeploy}
+                className="flex-1 h-10 rounded-md bg-orange-600 text-white font-semibold hover:bg-orange-700 focus:outline-none focus:ring-2 focus:ring-orange-300 flex items-center justify-center gap-1.5"
+              >
+                <MdPrecisionManufacturing size={18} />
+                Real Robot Deploy
+              </button>
+              <button
+                type="button"
+                onClick={handleUseSimDeploy}
+                className="flex-1 h-10 rounded-md bg-emerald-600 text-white font-semibold hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-300 flex items-center justify-center gap-1.5"
+              >
+                <MdViewInAr size={18} />
+                3D Sim Deploy
+              </button>
+            </div>
           </div>
-        </>
+        </div>
       )}
-    </div>
+    </>
   );
 }

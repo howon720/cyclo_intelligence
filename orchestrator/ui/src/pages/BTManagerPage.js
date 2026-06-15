@@ -137,6 +137,19 @@ function getBtStatusLabel(status) {
   }
 }
 
+function getSimulationInferenceNodeNames(nodeDataMap) {
+  return Array.from(nodeDataMap.values())
+    .filter(({ tag, params = {} }) => {
+      if (tag !== 'SendCommand') return false;
+      const command = String(params.command || 'LOAD').toUpperCase();
+      if (command !== 'LOAD') return false;
+      const mode = String(params.inference_mode || 'simulation').toLowerCase();
+      return mode !== 'robot';
+    })
+    .map(({ name }) => name)
+    .filter(Boolean);
+}
+
 export default function BTManagerPage({ isActive = true }) {
   const dispatch = useDispatch();
   const { callService } = useRosServiceCaller();
@@ -585,6 +598,13 @@ export default function BTManagerPage({ isActive = true }) {
     }
     try {
       const currentXml = getSerializedXml();
+      const simulationInferenceNodes = getSimulationInferenceNodeNames(nodeDataMap);
+      if (simulationInferenceNodes.length > 0) {
+        toast(
+          `SendCommand is in simulation mode: ${simulationInferenceNodes.join(', ')}. Robot command topics will not be published.`,
+          { duration: 7000 },
+        );
+      }
 
       const result = await callService(
         '/bt/load_and_run',
@@ -602,7 +622,7 @@ export default function BTManagerPage({ isActive = true }) {
     } catch (err) {
       toast.error(`Failed to start BT: ${err.message}`);
     }
-  }, [callService, dispatch, nodes.length, getSerializedXml, btNodeStatus.state]);
+  }, [callService, dispatch, nodes.length, getSerializedXml, btNodeStatus.state, nodeDataMap]);
 
   // ── BT Stop ───────────────────────────────────────────────────────────────
   const handleStop = useCallback(async () => {

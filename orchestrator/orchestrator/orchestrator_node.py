@@ -67,6 +67,9 @@ from cyclo_data.recorder.replay_handler import ReplayDataHandler
 from orchestrator.internal.communication.container_service_client import (
     ContainerServiceClient,
 )
+from orchestrator.internal.communication.inference_mode import (
+    publish_to_robot_from_task_info,
+)
 from orchestrator.timer.timer_manager import TimerManager
 from orchestrator.training.zenoh_training_manager import ZenohTrainingManager
 from orchestrator.internal.file_browser.file_browse_utils import FileBrowseUtils
@@ -181,6 +184,7 @@ class OrchestratorNode(Node):
         # LOAD / START / PAUSE / RESUME / STOP / UNLOAD from UI commands.
         self.container_service_client: Optional[ContainerServiceClient] = None
         self._loaded_inference_policy_path: str = ''
+        self._loaded_inference_publish_to_robot: bool = False
 
         # HF endpoint registry — orchestrator-owned because the
         # set/get/list/select_hf_endpoint services also read and mutate
@@ -288,7 +292,7 @@ class OrchestratorNode(Node):
             else []
         )
         urdf_path = self.params.get('urdf_path', '') if self.params else ''
-        timeout_sec = 120.0 if command in {
+        timeout_sec = 0.0 if command in {
             RecordingCommand.Request.STOP,
             RecordingCommand.Request.MOVE_TO_NEXT,
             RecordingCommand.Request.FINISH,
@@ -1202,6 +1206,7 @@ class OrchestratorNode(Node):
                     if task_info.task_instruction
                     else ''
                 )
+                publish_to_robot = publish_to_robot_from_task_info(task_info)
                 service_prefix = self._determine_service_prefix(task_info)
 
                 # If the requested policy is already loaded on this
@@ -1242,8 +1247,13 @@ class OrchestratorNode(Node):
                         resume_result = existing_client.inference_command(
                             ContainerServiceClient.CMD_RESUME,
                             task_instruction=task_instruction,
+                            publish_to_robot=publish_to_robot,
                         )
                         if resume_result.success:
+                            with self._state_lock:
+                                self._loaded_inference_publish_to_robot = (
+                                    publish_to_robot
+                                )
                             self._set_session_active(
                                 on_inference=True,
                                 start_time=time.perf_counter(),
@@ -1317,6 +1327,7 @@ class OrchestratorNode(Node):
                                 embodiment_tag='new_embodiment',
                                 robot_type=robot_type,
                                 task_instruction=task_instruction,
+                                publish_to_robot=publish_to_robot,
                             )
                             if not load_result.success:
                                 self.get_logger().error(
@@ -1335,6 +1346,7 @@ class OrchestratorNode(Node):
 
                             start_result = client.inference_command(
                                 ContainerServiceClient.CMD_START,
+                                publish_to_robot=publish_to_robot,
                             )
                             if not start_result.success:
                                 self.get_logger().error(
@@ -1354,6 +1366,9 @@ class OrchestratorNode(Node):
                                 if self.container_service_client is client:
                                     self._loaded_inference_policy_path = (
                                         normalized_model_path
+                                    )
+                                    self._loaded_inference_publish_to_robot = (
+                                        publish_to_robot
                                     )
                             self._publish_inference_phase(InferenceStatus.INFERENCING)
                         except Exception as e:
@@ -1376,7 +1391,8 @@ class OrchestratorNode(Node):
 
                     response.success = True
                     response.message = (
-                        f'{service_prefix.strip("/").upper()} inference loading'
+                        f'{service_prefix.strip("/").upper()} inference loading '
+                        f'({"robot" if publish_to_robot else "simulation"} mode)'
                     )
 
             elif request.command == SendCommand.Request.CONVERT_MP4:
@@ -1530,27 +1546,17 @@ class OrchestratorNode(Node):
                 else:
                     if request.command == SendCommand.Request.STOP:
                         self.get_logger().info('Stopping and saving recording (forwarder)')
-                        cd_result = self._cyclo_data.send_recording_command(
-                            command=RecordingCommand.Request.STOP,
+                        cd_result = self._forward_recording(
+                            RecordingCommand.Request.STOP,
                             task_info=request.task_info,
-                            robot_type=self.robot_type,
-                            urdf_path=(
-                                self.params.get('urdf_path', '')
-                                if self.params else ''
-                            ),
                         )
                         self._apply_cyclo_data_response(cd_result, response)
 
                     elif request.command == SendCommand.Request.MOVE_TO_NEXT:
                         self.get_logger().info('Saving current episode (forwarder)')
-                        cd_result = self._cyclo_data.send_recording_command(
-                            command=RecordingCommand.Request.MOVE_TO_NEXT,
+                        cd_result = self._forward_recording(
+                            RecordingCommand.Request.MOVE_TO_NEXT,
                             task_info=request.task_info,
-                            robot_type=self.robot_type,
-                            urdf_path=(
-                                self.params.get('urdf_path', '')
-                                if self.params else ''
-                            ),
                         )
                         self._apply_cyclo_data_response(cd_result, response)
 
@@ -1559,14 +1565,9 @@ class OrchestratorNode(Node):
                         # flag — that field was removed); orchestrator
                         # still owns inference teardown + timer_manager.
                         self.get_logger().info('Cancelling current recording (forwarder)')
-                        cd_result = self._cyclo_data.send_recording_command(
-                            command=RecordingCommand.Request.RERECORD,
+                        cd_result = self._forward_recording(
+                            RecordingCommand.Request.RERECORD,
                             task_info=request.task_info,
-                            robot_type=self.robot_type,
-                            urdf_path=(
-                                self.params.get('urdf_path', '')
-                                if self.params else ''
-                            ),
                         )
                         if (cd_result.success
                                 and cd_result.response is not None
@@ -1603,6 +1604,9 @@ class OrchestratorNode(Node):
                     elif request.command == SendCommand.Request.RESUME_INFERENCE:
                         with self._state_lock:
                             client = self.container_service_client
+                            loaded_publish_to_robot = (
+                                self._loaded_inference_publish_to_robot
+                            )
                         if client is not None:
                             task_instruction = (
                                 request.task_info.task_instruction[0]
@@ -1612,6 +1616,7 @@ class OrchestratorNode(Node):
                             result = client.inference_command(
                                 ContainerServiceClient.CMD_RESUME,
                                 task_instruction=task_instruction,
+                                publish_to_robot=loaded_publish_to_robot,
                             )
                             if result.success:
                                 self.on_inference = True
@@ -2243,6 +2248,7 @@ class OrchestratorNode(Node):
             client = self.container_service_client
             self.container_service_client = None
             self._loaded_inference_policy_path = ''
+            self._loaded_inference_publish_to_robot = False
         if client is None:
             return
 

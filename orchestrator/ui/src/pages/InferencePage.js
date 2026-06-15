@@ -18,7 +18,11 @@ import React, { useState, useEffect } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 import clsx from 'clsx';
 import toast, { useToasterStore } from 'react-hot-toast';
-import { MdKeyboardDoubleArrowLeft, MdKeyboardDoubleArrowRight, MdViewInAr } from 'react-icons/md';
+import {
+  MdKeyboardDoubleArrowLeft,
+  MdKeyboardDoubleArrowRight,
+  MdViewInAr,
+} from 'react-icons/md';
 import InferenceControlPanel from '../components/InferenceControlPanel';
 import HeartbeatStatus from '../components/HeartbeatStatus';
 import InlineSystemStatus from '../components/InlineSystemStatus';
@@ -39,6 +43,7 @@ export default function InferencePage({ isActive = true }) {
 
   const robotType = useSelector((state) => state.tasks.robotType);
   const joystickMode = useSelector((state) => state.tasks.joystickMode);
+  const taskInfo = useSelector((state) => state.tasks.taskInfo);
 
   const [isRightPanelCollapsed, setIsRightPanelCollapsed] = useState(false);
   const [show3DViewer, setShow3DViewer] = useState(true);
@@ -62,6 +67,9 @@ export default function InferencePage({ isActive = true }) {
       sendRecordCommand('refresh_topics').catch(() => {});
     }
   }, [isActive, sendRecordCommand]);
+
+  const inferenceMode = taskInfo.inferenceMode || 'simulation';
+  const isRobotMode = inferenceMode === 'robot';
 
   const classMainContainer = 'h-full flex flex-col overflow-hidden';
   const classContentsArea = 'flex-1 flex min-h-0 pt-0 px-0 justify-center items-start';
@@ -187,7 +195,11 @@ export default function InferencePage({ isActive = true }) {
           <div className="flex-[4] min-h-[120px] flex flex-row items-center justify-center mx-1 gap-2 h-full relative">
             {show3DViewer && (
               <div className="h-[85%] rounded-2xl overflow-hidden relative" style={{ aspectRatio: '4/3' }}>
-                <RobotViewer3D mode="live" showSourceSelector />
+                <RobotViewer3D
+                  mode="live"
+                  showSourceSelector
+                  defaultVisualizationSource={isRobotMode ? 'state' : 'action'}
+                />
               </div>
             )}
             <div className="h-[85%]" style={{ aspectRatio: '4/3' }}>

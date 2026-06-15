@@ -131,7 +131,8 @@ class IoMappingMixin:
 
         The canonical Cyclo camera names are ``cam_<side>_<part>`` such as
         ``cam_left_head``. Some runtime configs or checkpoints may expose
-        ``rgb.`` prefixes; exact matches remain preferred.
+        ``rgb.`` prefixes. Older single-head checkpoints may use
+        ``cam_head`` for the left head camera. Exact matches remain preferred.
         """
         camera_names = list(robot_camera_names)
         if not policy_image_keys:
@@ -179,6 +180,9 @@ class IoMappingMixin:
         aliases.add(suffix)
 
         semantic_names = {suffix}
+        if suffix == "cam_left_head":
+            semantic_names.add("cam_head")
+
         match = _CAMERA_SEMANTIC_RE.match(suffix)
         if match:
             first = match.group("a")

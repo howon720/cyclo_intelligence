@@ -361,6 +361,7 @@ export default function RobotViewer3D({
   className = '',
   showSourceSelector = false,
   liveUpdateHz = 15,
+  defaultVisualizationSource = 'state',
 }) {
   const robotType = useSelector((state) => state.tasks.robotType);
   const { getRobotInfo } = useRosServiceCaller();
@@ -396,10 +397,16 @@ export default function RobotViewer3D({
   const { robot, loading, error, setJointValues, computeTrajectoryPaths, reload } = useUrdfRobot(urdfPath);
   const cameraRef = useRef();
   const [activePreset, setActivePreset] = useState('perspective');
-  const [visualizationSource, setVisualizationSource] = useState('state');
+  const [visualizationSource, setVisualizationSource] = useState(defaultVisualizationSource);
   const [trajectoryPaths, setTrajectoryPaths] = useState(null);
   const [hasTrajectory, setHasTrajectory] = useState(false);
   const actionPreviewEnabled = showSourceSelector && visualizationSource === 'action';
+
+  useEffect(() => {
+    if (showSourceSelector) {
+      setVisualizationSource(defaultVisualizationSource);
+    }
+  }, [defaultVisualizationSource, showSourceSelector]);
 
   const handleJointState = useCallback((data) => {
     setJointValues(data);

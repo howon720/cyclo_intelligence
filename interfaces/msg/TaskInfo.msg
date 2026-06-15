@@ -22,3 +22,8 @@ bool include_robotis_license
 # orchestrator._determine_service_prefix step 2 (config.json type
 # detection) for backward compatibility with old UI builds.
 string service_type
+
+# Inference output mode. "simulation" runs policy inference and publishes
+# preview-only trajectories for the 3D viewer. "robot" permits the policy
+# container Main runtime to publish robot command topics.
+string inference_mode

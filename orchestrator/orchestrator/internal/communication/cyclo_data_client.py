@@ -252,7 +252,8 @@ class CycloDataClient:
         done_event = threading.Event()
         future.add_done_callback(lambda _fut: done_event.set())
 
-        if not done_event.wait(timeout=timeout_sec):
+        wait_timeout = timeout_sec if timeout_sec > 0 else None
+        if not done_event.wait(timeout=wait_timeout):
             future.cancel()
             msg = f'cyclo_data call timed out after {timeout_sec:.1f}s: {label}'
             logger.warning(msg)
