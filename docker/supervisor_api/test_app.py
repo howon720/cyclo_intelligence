@@ -193,10 +193,17 @@ def test_compose_uses_repo_local_workspace_mounts():
 
 def test_container_helper_does_not_export_workspace_mount_overrides():
     helper = (REPO_ROOT / "docker" / "container.sh").read_text()
+    relocate = (REPO_ROOT / "docker" / "relocate_workspace_to_ssd.sh").read_text()
+    rsync_options = (
+        "rsync -rltHP --omit-dir-times --no-owner --no-group --no-perms"
+    )
 
     assert "export CYCLO_WORKSPACE_DIR" not in helper
     assert "export CYCLO_HUGGINGFACE_DIR" not in helper
-    assert "rsync -aHP --ignore-existing --remove-source-files" in helper
+    assert rsync_options in helper
+    assert rsync_options in relocate
+    assert "rsync -aHP" not in helper
+    assert "rsync -aHP" not in relocate
 
 
 def _run_storage_setup(docker_dir, ssd_root, mode="auto", extra_env=None):
@@ -279,6 +286,27 @@ def test_container_helper_auto_falls_back_when_ssd_root_unusable(tmp_path):
     assert (workspace / "local.txt").read_text() == "keep local"
 
 
+def test_container_helper_auto_ignores_unmounted_ssd_mountpoint(tmp_path):
+    docker_dir = tmp_path / "docker"
+    workspace = docker_dir / "workspace"
+    ssd_root = tmp_path / "ssd"
+    unmounted = tmp_path / "not-mounted"
+    workspace.mkdir(parents=True)
+    unmounted.mkdir()
+    (workspace / "local.txt").write_text("keep local")
+
+    result = _run_storage_setup(
+        docker_dir,
+        ssd_root,
+        extra_env={"CYCLO_SSD_MOUNTPOINT": str(unmounted)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not workspace.is_symlink()
+    assert (workspace / "local.txt").read_text() == "keep local"
+    assert not (ssd_root / "workspace").exists()
+
+
 def test_container_helper_ssd_mode_creates_missing_ssd_root(tmp_path):
     docker_dir = tmp_path / "docker"
     workspace = docker_dir / "workspace"
@@ -307,6 +335,25 @@ def test_container_helper_ssd_mode_fails_when_ssd_root_unusable(tmp_path):
         Path("/proc/cyclo-intelligence-test-root"),
         mode="ssd",
         extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode != 0
+    assert "SSD storage root is not writable" in result.stderr
+
+
+def test_container_helper_ssd_mode_fails_when_mountpoint_unmounted(tmp_path):
+    docker_dir = tmp_path / "docker"
+    workspace = docker_dir / "workspace"
+    ssd_root = tmp_path / "ssd"
+    unmounted = tmp_path / "not-mounted"
+    workspace.mkdir(parents=True)
+    unmounted.mkdir()
+
+    result = _run_storage_setup(
+        docker_dir,
+        ssd_root,
+        mode="ssd",
+        extra_env={"CYCLO_SSD_MOUNTPOINT": str(unmounted)},
     )
 
     assert result.returncode != 0

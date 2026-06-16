@@ -593,12 +593,11 @@ class DataManager:
             self._current_scenario_number = self._current_subtask_index
         return deleted
 
-    def discard_current_full_episode(self) -> int:
-        """Delete all saved raw subtask dirs for the active full episode."""
+    def discard_full_episode(self, full_idx: int) -> int:
+        """Delete all saved raw subtask dirs for a specific full episode."""
         if not self._segmented_storage_mode:
             return 0
-        with self._state_lock:
-            full_idx = self._current_full_episode_index
+        full_idx = int(full_idx)
         deleted = 0
         for episode_dir in self._episode_dirs_for_full_subtask(full_idx):
             shutil.rmtree(episode_dir, ignore_errors=True)
@@ -606,11 +605,20 @@ class DataManager:
         shutil.rmtree(self._full_episode_dir(full_idx), ignore_errors=True)
         with self._state_lock:
             self._record_episode_count = self._find_next_episode_number()
-            self._current_subtask_index = 0
-            self._current_scenario_number = 0
+            if self._current_full_episode_index == full_idx:
+                self._current_subtask_index = 0
+                self._current_scenario_number = 0
         return deleted
 
-    def discard_recording(self):
+    def discard_current_full_episode(self) -> int:
+        """Delete all saved raw subtask dirs for the active full episode."""
+        if not self._segmented_storage_mode:
+            return 0
+        with self._state_lock:
+            full_idx = self._current_full_episode_index
+        return self.discard_full_episode(full_idx)
+
+    def discard_recording(self, reset_subtask_index: bool = False):
         """
         Stop without saving — flip to idle but leave the episode counter
         untouched so the discarded slot is reused by the next START.
@@ -622,6 +630,9 @@ class DataManager:
         with self._state_lock:
             self._status = 'idle'
             self._start_time_s = 0
+            if reset_subtask_index and self._segmented_storage_mode:
+                self._current_subtask_index = 0
+                self._current_scenario_number = 0
             unchanged = self._record_episode_count
         print(f'[DataManager] Recording discarded - episode count unchanged '
               f'({unchanged})')
@@ -853,6 +864,9 @@ class DataManager:
         has_transcodable_videos = any(
             bool(segment.get('cameras')) for segment in video_segments
         )
+        has_pending_remux = any(
+            bool(segment.get('raw_cameras')) for segment in video_segments
+        )
 
         summary = {
             'task_instruction': self._main_task_instruction,
@@ -866,6 +880,10 @@ class DataManager:
             'segments': segments_meta,
             'transcoding_status': (
                 'pending' if has_transcodable_videos else 'not_required'
+            ),
+            'video_remux_status': (
+                'pending' if has_pending_remux
+                else ('done' if has_transcodable_videos else 'not_required')
             ),
         }
         if video_warnings:
@@ -976,6 +994,28 @@ class DataManager:
             return {}
 
     @staticmethod
+    def _video_artifact_summary(videos_dir: Path) -> tuple[bool, bool, bool]:
+        """Return ``(has_any, has_raw_spool, has_mp4)`` for recorder output."""
+        videos_dir = Path(videos_dir)
+        if not videos_dir.exists():
+            return False, False, False
+        has_raw_spool = False
+        has_mp4 = False
+        for path in videos_dir.rglob('*'):
+            if not path.is_file():
+                continue
+            if path.name.endswith('.mjpeg.tmp') and path.stat().st_size > 0:
+                has_raw_spool = True
+            elif (
+                path.suffix == '.mp4'
+                and not path.stem.endswith('_synced')
+                and not path.name.endswith('.remuxing.mp4')
+                and path.stat().st_size > 0
+            ):
+                has_mp4 = True
+        return has_raw_spool or has_mp4, has_raw_spool, has_mp4
+
+    @staticmethod
     def _archive_episode_videos(
         subtask_dirs: list[Path],
         out_dir: Path,
@@ -996,36 +1036,60 @@ class DataManager:
                     path.stem for path in seg_videos.glob('*.mp4')
                     if not path.stem.endswith('_synced')
                 )
+                expected_cameras.update(
+                    path.name[:-len('.mjpeg.tmp')]
+                    for path in seg_videos.glob('*.mjpeg.tmp')
+                    if path.stat().st_size > 0
+                )
             video_stats = seg_info.get('video_stats') or {}
             if isinstance(video_stats, dict):
                 expected_cameras.update(str(name) for name in video_stats)
 
             dst_segment_dir = dst_videos / prefix
             segment_cameras = []
+            segment_raw_cameras = []
             segment_warnings = {}
             for camera in sorted(expected_cameras):
                 src = seg_videos / f'{camera}.mp4'
+                raw_spool = seg_videos / f'{camera}.mjpeg.tmp'
                 sidecar = seg_videos / f'{camera}_timestamps.parquet'
                 stats = seg_videos / f'{camera}_recorder_stats.json'
                 diagnostics = seg_videos / f'{camera}_diagnostics.parquet'
                 dst = dst_segment_dir / f'{camera}.mp4'
+                dst_raw_spool = dst_segment_dir / f'{camera}.mjpeg.tmp'
                 dst_sidecar = dst_segment_dir / f'{camera}_timestamps.parquet'
                 dst_stats = dst_segment_dir / f'{camera}_recorder_stats.json'
                 dst_diagnostics = dst_segment_dir / f'{camera}_diagnostics.parquet'
-                if not src.exists() or src.stat().st_size <= 0:
-                    if dst.exists() and dst_sidecar.exists():
+                has_mp4 = src.exists() and src.stat().st_size > 0
+                has_raw_spool = raw_spool.exists() and raw_spool.stat().st_size > 0
+                if not has_mp4 and not has_raw_spool:
+                    if (
+                        (dst.exists() or dst_raw_spool.exists())
+                        and dst_sidecar.exists()
+                    ):
                         segment_cameras.append(camera)
+                        if dst_raw_spool.exists():
+                            segment_raw_cameras.append(camera)
                         continue
                     segment_warnings[camera] = 'missing video file'
                     continue
                 if not sidecar.exists() or sidecar.stat().st_size <= 0:
-                    if dst.exists() and dst_sidecar.exists():
+                    if (
+                        (dst.exists() or dst_raw_spool.exists())
+                        and dst_sidecar.exists()
+                    ):
                         segment_cameras.append(camera)
+                        if dst_raw_spool.exists():
+                            segment_raw_cameras.append(camera)
                         continue
                     segment_warnings[camera] = 'missing timestamp sidecar'
                     continue
                 try:
-                    DataManager._move_file(src, dst)
+                    if has_mp4:
+                        DataManager._move_file(src, dst)
+                    if has_raw_spool:
+                        DataManager._move_file(raw_spool, dst_raw_spool)
+                        segment_raw_cameras.append(camera)
                     DataManager._move_file(sidecar, dst_sidecar)
                     if stats.exists() and stats.stat().st_size > 0:
                         DataManager._move_file(stats, dst_stats)
@@ -1038,6 +1102,7 @@ class DataManager:
                 'mcap': f'{prefix}.mcap',
                 'video_dir': f'videos/{prefix}',
                 'cameras': segment_cameras,
+                'raw_cameras': segment_raw_cameras,
             })
             if segment_warnings:
                 warnings[prefix] = segment_warnings
@@ -1184,11 +1249,8 @@ class DataManager:
         # branches on this field. Per-camera files are discovered from
         # videos/ and camera_info/ directly, so episode_info stays focused
         # on semantic metadata and recording diagnostics.
-        videos_dir = os.path.join(rosbag_path, 'videos')
-        has_videos = (
-            os.path.isdir(videos_dir)
-            and any(entry.endswith('.mp4') for entry in os.listdir(videos_dir))
-        )
+        videos_dir = Path(rosbag_path) / 'videos'
+        has_videos, has_raw_spool, has_mp4 = self._video_artifact_summary(videos_dir)
 
         # ``transcoding_status`` default depends on whether this episode
         # actually has any cameras to transcode. The TranscodeWorker
@@ -1228,6 +1290,10 @@ class DataManager:
             'device_serial': socket.gethostname(),
             'video_stats': video_stats or {},
             'transcoding_status': initial_status,
+            'video_remux_status': (
+                'pending' if has_raw_spool
+                else ('done' if has_mp4 else 'not_required')
+            ),
         }
 
         meta_data_path = os.path.join(rosbag_path, 'episode_info.json')

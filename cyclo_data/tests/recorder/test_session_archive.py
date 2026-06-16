@@ -43,6 +43,7 @@ _stub_module(
     HuggingFaceLogCapture=_Dummy,
     HuggingFaceProgressTqdm=_Dummy,
 )
+_stub_module("psutil", cpu_percent=lambda interval=None: 0.0)
 
 from cyclo_data.recorder.session_manager import DataManager  # noqa: E402
 
@@ -171,6 +172,102 @@ def test_archive_marks_episode_without_videos_not_required(tmp_path):
     assert not (out / "segments").exists()
     info = json.loads((out / "episode_info.json").read_text())
     assert info["transcoding_status"] == "not_required"
+
+
+def test_archive_preserves_pending_raw_spool(tmp_path):
+    root = tmp_path / "Task_1234_archive_MCAP"
+    manager = _make_manager(root, subtask_total=1)
+    segment = _write_segment(
+        root,
+        full_idx=0,
+        subtask_idx=0,
+        subtask_total=1,
+        with_video=False,
+    )
+    videos = segment / "videos"
+    videos.mkdir()
+    (videos / "cam0.mjpeg.tmp").write_bytes(b"raw-spool")
+    (videos / "cam0_timestamps.parquet").write_bytes(b"timestamps")
+    (videos / "cam0_recorder_stats.json").write_text(
+        json.dumps({"frames_written": 1, "remux_status": "pending"}),
+        encoding="utf-8",
+    )
+    info_path = segment / "episode_info.json"
+    info = json.loads(info_path.read_text())
+    info["video_stats"] = {"cam0": {"frames_written": 1, "remux_status": "pending"}}
+    info["transcoding_status"] = "pending"
+    info["video_remux_status"] = "pending"
+    info_path.write_text(json.dumps(info, indent=2))
+
+    out = manager._archive_full_episode(0)
+
+    assert not (out / "segments").exists()
+    archived_video_dir = out / "videos" / "0_0"
+    assert (archived_video_dir / "cam0.mjpeg.tmp").read_bytes() == b"raw-spool"
+    assert (archived_video_dir / "cam0_timestamps.parquet").read_bytes() == (
+        b"timestamps"
+    )
+    assert (archived_video_dir / "cam0_recorder_stats.json").exists()
+    summary = json.loads((out / "episode_info.json").read_text())
+    assert summary["transcoding_status"] == "pending"
+    assert summary["video_remux_status"] == "pending"
+
+
+def test_discard_current_full_episode_removes_all_saved_subtasks(tmp_path):
+    root = tmp_path / "Task_1234_archive_MCAP"
+    manager = _make_manager(root, subtask_total=2)
+    manager._current_full_episode_index = 0
+    manager._current_subtask_index = 1
+    manager._current_scenario_number = 1
+    manager._record_episode_count = 2
+    _write_segment(root, full_idx=0, subtask_idx=0, subtask_total=2)
+    _write_segment(root, full_idx=0, subtask_idx=1, subtask_total=2)
+
+    deleted = manager.discard_current_full_episode()
+
+    assert deleted == 2
+    assert not (root / "0").exists()
+    assert manager._current_subtask_index == 0
+    assert manager._current_scenario_number == 0
+
+
+def test_discard_full_episode_deletes_requested_episode_without_cursor_drift(tmp_path):
+    root = tmp_path / "Task_1234_archive_MCAP"
+    manager = _make_manager(root, subtask_total=2)
+    manager._current_full_episode_index = 1
+    manager._current_subtask_index = 1
+    manager._current_scenario_number = 1
+    manager._record_episode_count = 3
+    _write_segment(root, full_idx=0, subtask_idx=0, subtask_total=2)
+    _write_segment(root, full_idx=0, subtask_idx=1, subtask_total=2)
+    _write_segment(root, full_idx=1, subtask_idx=0, subtask_total=2)
+
+    deleted = manager.discard_full_episode(0)
+
+    assert deleted == 2
+    assert not (root / "0").exists()
+    assert (root / "1").exists()
+    assert manager._current_full_episode_index == 1
+    assert manager._current_subtask_index == 1
+    assert manager._current_scenario_number == 1
+
+
+def test_discard_recording_can_reset_active_episode_subtask_cursor(tmp_path):
+    root = tmp_path / "Task_1234_archive_MCAP"
+    manager = _make_manager(root, subtask_total=3)
+    manager._segmented_storage_mode = True
+    manager._status = "recording"
+    manager._start_time_s = 123.0
+    manager._record_episode_count = 2
+    manager._current_subtask_index = 2
+    manager._current_scenario_number = 2
+
+    manager.discard_recording(reset_subtask_index=True)
+
+    assert manager._status == "idle"
+    assert manager._record_episode_count == 2
+    assert manager._current_subtask_index == 0
+    assert manager._current_scenario_number == 0
 
 
 def test_archive_writes_korean_subtask_instruction_as_utf8(tmp_path):

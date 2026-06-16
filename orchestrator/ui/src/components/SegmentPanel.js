@@ -54,6 +54,7 @@ export default function SegmentPanel() {
   const [optimisticRecording, setOptimisticRecording] = useState(false);
   const [episodeAcquisitionStarted, setEpisodeAcquisitionStarted] = useState(false);
   const [savingInProgress, setSavingInProgress] = useState(false);
+  const episodeFullIndexRef = useRef(null);
   const lastServerEpisodeRef = useRef(null);
 
   const serverRecording =
@@ -71,6 +72,7 @@ export default function SegmentPanel() {
   const hasLocalSavedSubtasks = savedCount > 0;
   const isPlanMode = plannedCountNumber > 0;
   const isSingleMode = plannedCountNumber === 0;
+  const currentFullEpisodeIndex = Number(recordStatus.currentEpisodeNumber || 0);
   const firstPendingSlot = useMemo(
     () => slotToServerIdx.findIndex((v) => v === -1),
     [slotToServerIdx]
@@ -95,13 +97,16 @@ export default function SegmentPanel() {
   useEffect(() => {
     if (serverRecording || hasLocalSavedSubtasks || hasServerSavedSubtasks) {
       setEpisodeAcquisitionStarted(true);
+      if (episodeFullIndexRef.current === null) {
+        episodeFullIndexRef.current = currentFullEpisodeIndex;
+      }
     }
-  }, [hasLocalSavedSubtasks, hasServerSavedSubtasks, serverRecording]);
+  }, [currentFullEpisodeIndex, hasLocalSavedSubtasks, hasServerSavedSubtasks, serverRecording]);
 
   useEffect(() => {
     if (!recordStatus.topicReceived) return;
 
-    const currentEpisode = Number(recordStatus.currentEpisodeNumber || 0);
+    const currentEpisode = currentFullEpisodeIndex;
     if (lastServerEpisodeRef.current === null) {
       lastServerEpisodeRef.current = currentEpisode;
     } else if (
@@ -113,6 +118,7 @@ export default function SegmentPanel() {
       setOptimisticRecording(false);
       setSavingInProgress(false);
       setEpisodeAcquisitionStarted(false);
+      episodeFullIndexRef.current = null;
       dispatch(resetSegmentProgress());
       return;
     } else {
@@ -152,7 +158,7 @@ export default function SegmentPanel() {
     isPlanMode,
     planComplete,
     plannedCountNumber,
-    recordStatus.currentEpisodeNumber,
+    currentFullEpisodeIndex,
     recordStatus.topicReceived,
     serverRecording,
     serverSubtaskCount,
@@ -245,6 +251,9 @@ export default function SegmentPanel() {
       dispatch(setActiveSlotIndex(slotIdx));
       setOptimisticRecording(true);
       setEpisodeAcquisitionStarted(true);
+      if (episodeFullIndexRef.current === null) {
+        episodeFullIndexRef.current = currentFullEpisodeIndex;
+      }
       const result = await runCommand('Record', 'start_segment', {
         segmentIndex: slotIdx,
       });
@@ -257,6 +266,7 @@ export default function SegmentPanel() {
       return result;
     },
     [
+      currentFullEpisodeIndex,
       dispatch,
       hasLocalSavedSubtasks,
       hasServerSavedSubtasks,
@@ -298,6 +308,7 @@ export default function SegmentPanel() {
         const finishResult = await runCommand('Finish episode', 'finish_episode');
         if (finishResult && finishResult.success) {
           setEpisodeAcquisitionStarted(false);
+          episodeFullIndexRef.current = null;
           dispatch(resetSegmentProgress());
         }
         setSavingInProgress(false);
@@ -355,10 +366,17 @@ export default function SegmentPanel() {
     ) {
       return;
     }
-    const result = await runCommand('Discard episode', 'discard_episode');
+    const targetFullEpisodeIndex = episodeFullIndexRef.current;
+    if (targetFullEpisodeIndex === null) {
+      return;
+    }
+    const result = await runCommand('Discard episode', 'discard_episode', {
+      segmentIndex: targetFullEpisodeIndex + 1,
+    });
     if (result && result.success) {
       setOptimisticRecording(false);
       setEpisodeAcquisitionStarted(false);
+      episodeFullIndexRef.current = null;
       dispatch(resetSegmentProgress());
     }
   }, [
@@ -382,6 +400,7 @@ export default function SegmentPanel() {
 
   const handleResetPlan = useCallback(() => {
     setEpisodeAcquisitionStarted(false);
+    episodeFullIndexRef.current = null;
     dispatch(resetSegmentPlan());
     dispatch(markLocalTaskInfoEdited());
   }, [dispatch]);

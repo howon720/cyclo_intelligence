@@ -835,11 +835,23 @@ class RecordingService:
             response.success = False
             response.message = 'DISCARD_EPISODE: episode archive still running'
             return response
+        target_full_idx = self._extract_full_episode_index(request)
+
+        def discard_saved():
+            if target_full_idx is not None:
+                return self._data_manager.discard_full_episode(target_full_idx)
+            return self._data_manager.discard_current_full_episode()
+
         if self._data_manager.is_recording():
-            response = self._do_discard(request, response, event='cancel')
+            response = self._do_discard(
+                request,
+                response,
+                event='cancel',
+                reset_subtask_index=True,
+            )
             if not response.success:
                 return response
-            deleted = self._data_manager.discard_current_full_episode()
+            deleted = discard_saved()
             response.message = (
                 f'Episode discarded ({deleted} saved subtask(s) removed)'
                 if deleted else 'Episode discarded'
@@ -848,7 +860,7 @@ class RecordingService:
                 DataOperationStatus.CANCELLED, 'DISCARD_EPISODE',
                 response.message)
             return response
-        deleted = self._data_manager.discard_current_full_episode()
+        deleted = discard_saved()
         response.success = True
         response.message = (
             f'Episode discarded ({deleted} saved subtask(s) removed)'
@@ -858,6 +870,29 @@ class RecordingService:
             DataOperationStatus.CANCELLED, 'DISCARD_EPISODE',
             response.message)
         return response
+
+    @staticmethod
+    def _extract_full_episode_index(request):
+        encoded = int(getattr(request, 'segment_index', 0) or 0)
+        if encoded > 0:
+            return encoded - 1
+
+        # Transitional compatibility: intermediate builds may have carried
+        # the explicit target via generated fields or TaskInfo tags.
+        if bool(getattr(request, 'has_full_episode_index', False)):
+            return int(getattr(request, 'full_episode_index', 0))
+        task_info = getattr(request, 'task_info', None)
+        for tag in getattr(task_info, 'tags', []) or []:
+            text = str(tag)
+            if ':' not in text:
+                continue
+            key, value = text.split(':', 1)
+            if key.strip() in {'recording_full_episode_index', 'full_episode_index'}:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
 
     def _do_cancel_with_review(self, request, response, event: str):
         """RERECORD — stop current episode and save (no review flag).
@@ -924,7 +959,13 @@ class RecordingService:
             DataOperationStatus.IDLE, 'CANCEL', response.message)
         return response
 
-    def _do_discard(self, request, response, event: str):
+    def _do_discard(
+        self,
+        request,
+        response,
+        event: str,
+        reset_subtask_index: bool = False,
+    ):
         """Active-recording CANCEL — drop the episode without saving.
 
         Order matters: drain VideoRecorder/CameraInfoSnapshot writers
@@ -964,7 +1005,9 @@ class RecordingService:
                     f'episode_dir cleanup failed: {episode_dir}: {exc!r}')
 
         # 4. Flip session to idle without bumping the episode counter.
-        self._data_manager.discard_recording()
+        self._data_manager.discard_recording(
+            reset_subtask_index=reset_subtask_index,
+        )
         self._rosbag.publish_action_event(event)
 
         self._publish_umbrella_status(

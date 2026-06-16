@@ -14,13 +14,15 @@ appends those JPEG bytes to ``videos/<cam>.mjpeg.tmp``. ffmpeg and
 Parquet writes stay off the video hot path so pipe backpressure and
 pyarrow warm-up cannot make the camera queue backlog.
 
-On STOP, each raw MJPEG spool is remuxed into ``videos/<cam>.mp4`` with
-``-c:v copy`` and the spool is removed only after frame-count validation
-passes. A Parquet sidecar (``videos/<cam>_timestamps.parquet``) still
-tracks ``header.stamp`` (publisher clock) and ``recv_ns`` (subscriber
-clock) for every frame written. LeRobot resampling maps the synced grid
-to MP4 frame indices using ``header_stamp_ns`` by default so transport
-delay does not shift image selection; ``recv_ns`` stays available for
+On STOP, writers are drained and the raw MJPEG spool is left on disk as
+``videos/<cam>.mjpeg.tmp`` so the service response is not blocked by
+ffmpeg. The background transcoder later remuxes it into
+``videos/<cam>.mp4`` with ``-c:v copy`` before doing H.264 work. A
+Parquet sidecar (``videos/<cam>_timestamps.parquet``) still tracks
+``header.stamp`` (publisher clock) and ``recv_ns`` (subscriber clock)
+for every frame written. LeRobot resampling maps the synced grid to MP4
+frame indices using ``header_stamp_ns`` by default so transport delay
+does not shift image selection; ``recv_ns`` stays available for
 diagnostics and legacy fallback.
 
 Subscriptions are created once at ``__init__`` (= when the robot_type is
@@ -330,8 +332,8 @@ class VideoRecorder:
 
             self._recording_active.set()
 
-    def stop_episode(self) -> Dict[str, Dict[str, int]]:
-        """Drain workers, close sidecars, remux spools, and return stats."""
+    def stop_episode(self) -> Dict[str, Dict[str, object]]:
+        """Drain workers, close sidecars, leave remux work to the background."""
         with self._lifecycle_lock:
             if not self._recording_active.is_set():
                 return {}
@@ -339,7 +341,7 @@ class VideoRecorder:
             self._recording_active.clear()
             self._wait_for_active_callbacks()
             streams = list(self._streams.values())
-            stats: Dict[str, Dict[str, int]] = {}
+            stats: Dict[str, Dict[str, object]] = {}
 
             try:
                 for stream in streams:
@@ -364,8 +366,8 @@ class VideoRecorder:
                 for stream in streams:
                     self._close_writer(stream)
                     self._close_diagnostics_writer(stream)
-
-                self._remux_streams(streams)
+                for stream in streams:
+                    self._cleanup_empty_raw_spool(stream)
 
                 for stream in streams:
                     self._write_stats_json(stream)
@@ -1072,7 +1074,19 @@ class VideoRecorder:
                 "soft_metadata_queue_rows": self._soft_metadata_queue_rows,
             }
 
-    def _public_stats(self, stream: _CameraStream) -> Dict[str, int]:
+    @staticmethod
+    def _remux_status_from_snapshot(snapshot: dict) -> str:
+        if snapshot.get("remux_error"):
+            return "failed"
+        frames_written = int(snapshot.get("frames_written") or 0)
+        frames_remuxed = int(snapshot.get("frames_remuxed") or 0)
+        if frames_written <= 0:
+            return "not_required"
+        if frames_remuxed >= frames_written:
+            return "done"
+        return "pending"
+
+    def _public_stats(self, stream: _CameraStream) -> Dict[str, object]:
         snapshot = self._stream_stats_snapshot(stream)
         return {
             "frames_received": int(snapshot["frames_received"]),
@@ -1087,6 +1101,10 @@ class VideoRecorder:
             "max_metadata_queue_items": int(snapshot["max_metadata_queue_items"]),
             "max_callback_queue_bytes": int(snapshot["max_callback_queue_bytes"]),
             "max_raw_queue_bytes": int(snapshot["max_raw_queue_bytes"]),
+            "raw_write_error": snapshot["raw_write_error"],
+            "metadata_error": snapshot["metadata_error"],
+            "remux_error": snapshot["remux_error"],
+            "remux_status": self._remux_status_from_snapshot(snapshot),
         }
 
     def _write_stats_json(self, stream: _CameraStream) -> None:
@@ -1094,6 +1112,7 @@ class VideoRecorder:
             return
         payload = self._stream_stats_snapshot(stream)
         payload.update({
+            "remux_status": self._remux_status_from_snapshot(payload),
             "mp4_path": str(stream.mp4_path) if stream.mp4_path else None,
             "raw_path": str(stream.raw_path) if stream.raw_path else None,
             "sidecar_path": str(stream.sidecar_path) if stream.sidecar_path else None,
@@ -1112,6 +1131,20 @@ class VideoRecorder:
             self._node.get_logger().warning(
                 f"VideoRecorder: {stream.name} stats json write failed: {exc!r}"
             )
+
+    def _cleanup_empty_raw_spool(self, stream: _CameraStream) -> None:
+        raw_path = stream.raw_path
+        if raw_path is None:
+            return
+        with stream.state_lock:
+            frames_written = stream.frames_written
+        if frames_written > 0:
+            return
+        try:
+            if raw_path.exists():
+                raw_path.unlink()
+        except OSError:
+            pass
 
     def _remux_streams(self, streams: list[_CameraStream]) -> None:
         active_streams = [stream for stream in streams if stream.frames_written > 0]

@@ -17,6 +17,61 @@ DST_H=$SSD_ROOT/huggingface
 OWNER="${CYCLO_STORAGE_USER:-${SUDO_USER:-$(id -un)}}"
 GROUP="${CYCLO_STORAGE_GROUP:-$(id -gn "$OWNER" 2>/dev/null || id -gn)}"
 
+canonical_path() {
+    local resolved
+    resolved="$(readlink -f "$1" 2>/dev/null || true)"
+    if [ -n "$resolved" ]; then
+        printf '%s\n' "$resolved"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+ssd_mountpoint_for_root() {
+    local root="$1"
+
+    if [ -n "${CYCLO_SSD_MOUNTPOINT:-}" ]; then
+        canonical_path "$CYCLO_SSD_MOUNTPOINT"
+        return 0
+    fi
+
+    case "$root" in
+        /mnt/ssd|/mnt/ssd/*) printf '%s\n' "/mnt/ssd" ;;
+        *)                   printf '%s\n' "" ;;
+    esac
+}
+
+mountpoint_configured() {
+    local mountpoint_path="$1"
+
+    [ -r /etc/fstab ] \
+        && awk -v mountpoint_path="$mountpoint_path" \
+            '$2 == mountpoint_path { found=1 } END { exit found ? 0 : 1 }' \
+            /etc/fstab
+}
+
+ensure_ssd_mounted() {
+    local root="$1"
+    local mountpoint_path
+
+    mountpoint_path="$(ssd_mountpoint_for_root "$root")"
+    if [ -z "$mountpoint_path" ] || mountpoint -q "$mountpoint_path"; then
+        return 0
+    fi
+    if ! mountpoint_configured "$mountpoint_path"; then
+        echo "Error: SSD mountpoint is not mounted: $mountpoint_path" >&2
+        return 1
+    fi
+
+    echo "SSD mountpoint is not mounted: $mountpoint_path"
+    echo "Attempting to mount $mountpoint_path"
+    mount "$mountpoint_path" 2>/dev/null || true
+    if ! mountpoint -q "$mountpoint_path"; then
+        echo "Error: failed to mount SSD mountpoint: $mountpoint_path" >&2
+        return 1
+    fi
+}
+
 path_is_empty_dir() {
     [ -d "$1" ] && [ -z "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit)" ]
 }
@@ -53,7 +108,8 @@ migrate_local_dir_to_ssd() {
     fi
 
     echo "Migrating existing ${label} data to ${target_path} without overwriting SSD files."
-    rsync -aHP --ignore-existing --remove-source-files "$src_path"/ "$target_path"/
+    rsync -rltHP --omit-dir-times --no-owner --no-group --no-perms \
+        --ignore-existing --remove-source-files "$src_path"/ "$target_path"/
     find "$src_path" -depth -type d -empty -delete || true
 }
 
@@ -102,6 +158,7 @@ for c in cyclo_intelligence groot_server lerobot_server; do
 done
 
 echo "=== 2/6  prepare destination on NVMe ==="
+ensure_ssd_mounted "$SSD_ROOT"
 mkdir -p "$DST_W" "$DST_H"
 chown "$OWNER:$GROUP" "$SSD_ROOT" "$DST_W" "$DST_H"
 

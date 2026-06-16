@@ -302,6 +302,38 @@ def test_stop_episode_final_join_happens_before_writer_close():
     assert stream.metadata_worker is None
 
 
+def test_stop_episode_returns_before_raw_remux(tmp_path, monkeypatch):
+    stream = _CameraStream(name="cam0", topic="/cam0", queue=Queue())
+    recorder, events = _recorder_with_stream(stream)
+    stream.worker = _FakeWorker(events, "video_worker")
+    stream.raw_worker = _FakeWorker(events, "raw_worker")
+    stream.metadata_worker = _FakeWorker(events, "metadata_worker")
+    stream.writer = _FakeWriter(events)
+    stream.frames_written = 3
+    stream.frames_metadata_written = 3
+    stream.raw_path = tmp_path / "cam0.mjpeg.tmp"
+    stream.mp4_path = tmp_path / "cam0.mp4"
+    stream.sidecar_path = tmp_path / "cam0_timestamps.parquet"
+    stream.stats_path = tmp_path / "cam0_recorder_stats.json"
+    raw_path = stream.raw_path
+    mp4_path = stream.mp4_path
+    stats_path = stream.stats_path
+    raw_path.write_bytes(b"\xff\xd8jpeg" + _JPEG_SENTINEL)
+
+    def fail_if_called(_streams):
+        raise AssertionError("STOP must not synchronously remux raw spools")
+
+    monkeypatch.setattr(recorder, "_remux_streams", fail_if_called)
+
+    stats = recorder.stop_episode()
+
+    assert stats["cam0"]["remux_status"] == "pending"
+    assert raw_path.exists()
+    assert not mp4_path.exists()
+    text = stats_path.read_text(encoding="utf-8")
+    assert '"remux_status": "pending"' in text
+
+
 def test_no_drop_callback_enqueues_valid_frame_under_soft_pressure():
     events = []
     recorder = VideoRecorder.__new__(VideoRecorder)

@@ -80,6 +80,66 @@ storage_root_usable() {
     rmdir "$probe" 2>/dev/null || true
 }
 
+ssd_mountpoint_for_root() {
+    local root="$1"
+
+    if [ -n "${CYCLO_SSD_MOUNTPOINT:-}" ]; then
+        canonical_path "$CYCLO_SSD_MOUNTPOINT"
+        return 0
+    fi
+
+    case "$root" in
+        /mnt/ssd|/mnt/ssd/*) printf '%s\n' "/mnt/ssd" ;;
+        *)                   printf '%s\n' "" ;;
+    esac
+}
+
+mountpoint_configured() {
+    local mountpoint_path="$1"
+
+    [ -r /etc/fstab ] \
+        && awk -v mountpoint_path="$mountpoint_path" \
+            '$2 == mountpoint_path { found=1 } END { exit found ? 0 : 1 }' \
+            /etc/fstab
+}
+
+try_mount_ssd_root() {
+    local root="$1"
+    local mountpoint_path
+
+    mountpoint_path="$(ssd_mountpoint_for_root "$root")"
+    if [ -z "$mountpoint_path" ] || mountpoint -q "$mountpoint_path"; then
+        return 0
+    fi
+    if ! mountpoint_configured "$mountpoint_path"; then
+        return 1
+    fi
+
+    echo "[container.sh] SSD mountpoint is not mounted: $mountpoint_path"
+    echo "[container.sh] Attempting to mount $mountpoint_path"
+    if [ "$(id -u)" -eq 0 ]; then
+        mount "$mountpoint_path" 2>/dev/null || true
+    elif command -v sudo >/dev/null 2>&1; then
+        if [ -t 0 ]; then
+            sudo mount "$mountpoint_path" 2>/dev/null || true
+        else
+            sudo -n mount "$mountpoint_path" 2>/dev/null || true
+        fi
+    fi
+    mountpoint -q "$mountpoint_path"
+}
+
+ssd_root_usable() {
+    local root="$1"
+    local mountpoint_path
+
+    mountpoint_path="$(ssd_mountpoint_for_root "$root")"
+    if [ -n "$mountpoint_path" ] && ! mountpoint -q "$mountpoint_path"; then
+        return 1
+    fi
+    storage_root_usable "$root"
+}
+
 canonical_path() {
     local resolved
     resolved="$(readlink -f "$1" 2>/dev/null || true)"
@@ -101,9 +161,15 @@ path_within() {
 
 prepare_required_ssd_root() {
     local root="$1"
+    local mountpoint_path
 
-    if storage_root_usable "$root"; then
+    try_mount_ssd_root "$root" || true
+    if ssd_root_usable "$root"; then
         return 0
+    fi
+    mountpoint_path="$(ssd_mountpoint_for_root "$root")"
+    if [ -n "$mountpoint_path" ] && ! mountpoint -q "$mountpoint_path"; then
+        return 1
     fi
 
     if [ "$(id -u)" -eq 0 ]; then
@@ -116,7 +182,7 @@ prepare_required_ssd_root() {
         return 1
     fi
 
-    storage_root_usable "$root"
+    ssd_root_usable "$root"
 }
 
 path_is_empty_dir() {
@@ -155,7 +221,8 @@ migrate_local_dir_to_ssd() {
     fi
 
     echo "[container.sh] Migrating existing ${label} data to ${target_path} without overwriting SSD files."
-    rsync -aHP --ignore-existing --remove-source-files "$src_path"/ "$target_path"/
+    rsync -rltHP --omit-dir-times --no-owner --no-group --no-perms \
+        --ignore-existing --remove-source-files "$src_path"/ "$target_path"/
     find "$src_path" -depth -type d -empty -delete || true
 }
 
@@ -272,7 +339,11 @@ setup_storage() {
 
     ssd_root="$(canonical_path "$ssd_root")"
 
-    if [ "$storage_mode" = "auto" ] && storage_root_usable "$ssd_root"; then
+    if [ "$storage_mode" != "local" ]; then
+        try_mount_ssd_root "$ssd_root" || true
+    fi
+
+    if [ "$storage_mode" = "auto" ] && ssd_root_usable "$ssd_root"; then
         prepare_ssd_links "$ssd_root"
     fi
 
