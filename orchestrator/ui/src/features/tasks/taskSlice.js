@@ -41,14 +41,8 @@ const applyRecordTaskInfoToForm = (state, taskInfo) => {
     : [];
   state.plannedSubTasks = subtasks;
   state.plannedCount = subtasks.length;
-  state.slotToServerIdx = subtasks.map((_, index) => (
-    Number.isInteger(state.slotToServerIdx[index])
-      ? state.slotToServerIdx[index]
-      : -1
-  ));
-  state.activeSlotIndex = subtasks.length > 0
-    ? Math.min(state.activeSlotIndex, subtasks.length - 1)
-    : 0;
+  state.slotToServerIdx = subtasks.map(() => -1);
+  state.activeSlotIndex = 0;
 };
 
 const initialState = {
@@ -104,6 +98,7 @@ const initialState = {
     subtaskCount: 0,
     currentSubtaskInstruction: '',
     subtaskInstructions: [],
+    savedSubtaskIndices: null,
     userId: '',
     usedStorageSize: 0,
     totalStorageSize: 0,

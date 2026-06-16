@@ -544,6 +544,114 @@ class DataManager:
             self._current_subtask_index = bounded
             self._current_scenario_number = bounded
 
+    def get_current_subtask_index(self) -> int:
+        """Return the active segmented subtask slot."""
+        with self._state_lock:
+            return int(self._current_subtask_index)
+
+    def get_current_full_episode_index(self) -> int:
+        """Return the full-episode cursor used by segmented recordings."""
+        with self._state_lock:
+            return int(self._current_full_episode_index)
+
+    def saved_subtask_indices_for_full_episode(
+        self,
+        full_idx: int | None = None,
+    ) -> set[int]:
+        """Return subtask indices that have a saved episode_info.json."""
+        if not self._segmented_storage_mode:
+            return set()
+        if full_idx is None:
+            with self._state_lock:
+                full_idx = self._current_full_episode_index
+        full_idx = int(full_idx)
+
+        saved: set[int] = set()
+        segments_root = self._full_episode_dir(full_idx) / 'segments'
+        if segments_root.exists():
+            for subtask_dir in segments_root.iterdir():
+                if not subtask_dir.is_dir() or not subtask_dir.name.isdigit():
+                    continue
+                if not (subtask_dir / 'episode_info.json').exists():
+                    continue
+                info = self._read_episode_info(subtask_dir)
+                try:
+                    subtask_idx = int(info.get('subtask_index', -1))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= subtask_idx < self._physical_segment_total:
+                    saved.add(subtask_idx)
+            return saved
+
+        for episode_dir in self._episode_dirs_for_full_subtask(full_idx):
+            info = self._read_episode_info(episode_dir)
+            try:
+                subtask_idx = int(info.get('subtask_index', -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= subtask_idx < self._physical_segment_total:
+                saved.add(subtask_idx)
+        return saved
+
+    def missing_subtasks_for_full_episode(
+        self,
+        full_idx: int | None = None,
+    ) -> list[int]:
+        """Return planned subtasks that are not saved for a full episode."""
+        if not self._segmented_storage_mode:
+            return []
+        saved = self.saved_subtask_indices_for_full_episode(full_idx)
+        return [
+            idx for idx in range(self._physical_segment_total)
+            if idx not in saved
+        ]
+
+    def full_episode_archive_errors(
+        self,
+        full_idx: int | None = None,
+    ) -> list[str]:
+        """Return problems that would make FINISH_EPISODE fail."""
+        if not self._segmented_storage_mode:
+            return []
+        if full_idx is None:
+            with self._state_lock:
+                full_idx = self._current_full_episode_index
+        full_idx = int(full_idx)
+
+        subtask_dirs = self._episode_dirs_for_full_subtask(full_idx)
+        if not subtask_dirs:
+            return [f'no saved subtasks for episode {full_idx}']
+
+        by_subtask: dict[int, Path] = {}
+        for episode_dir in subtask_dirs:
+            info = self._read_episode_info(episode_dir)
+            try:
+                subtask_idx = int(info.get('subtask_index', -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= subtask_idx < self._physical_segment_total:
+                by_subtask.setdefault(subtask_idx, episode_dir)
+
+        errors: list[str] = []
+        missing = [
+            idx for idx in range(self._physical_segment_total)
+            if idx not in by_subtask
+        ]
+        if missing:
+            errors.append(f'missing subtask(s) {missing}')
+
+        out_dir = self._full_episode_dir(full_idx)
+        for subtask_idx, seg_dir in sorted(by_subtask.items()):
+            if not (seg_dir / 'metadata.yaml').exists():
+                errors.append(f'subtask {subtask_idx}: missing metadata.yaml')
+            archived_mcaps = (
+                sorted(out_dir.glob(f'{full_idx}_{subtask_idx}.mcap'))
+                + sorted(out_dir.glob(f'{full_idx}_{subtask_idx}_*.mcap'))
+            )
+            if not list(seg_dir.glob('*.mcap')) and not archived_mcaps:
+                errors.append(f'subtask {subtask_idx}: missing .mcap file')
+        return errors
+
     def finish_full_episode(self) -> Optional[Path]:
         """Advance the full-episode cursor after all planned subtasks saved."""
         if not self._segmented_storage_mode:
@@ -1351,6 +1459,10 @@ class DataManager:
         current_status.subtask_count = self._subtask_total if self._subtask_mode else 0
         current_status.current_subtask_instruction = self._current_subtask_instruction()
         current_status.subtask_instructions = list(self._subtask_instructions)
+        if self._subtask_mode:
+            current_status.saved_subtask_indices = sorted(
+                self.saved_subtask_indices_for_full_episode(full_episode_index)
+            )
 
         total_storage, used_storage = StorageChecker.get_storage_gb('/')
         current_status.used_storage_size = float(used_storage)

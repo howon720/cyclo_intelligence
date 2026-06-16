@@ -314,6 +314,9 @@ export function useRosTopicSubscription() {
             subtaskCount: msg.subtask_count || 0,
             currentSubtaskInstruction: msg.current_subtask_instruction || '',
             subtaskInstructions: msg.subtask_instructions || [],
+            savedSubtaskIndices: Array.isArray(msg.saved_subtask_indices)
+              ? msg.saved_subtask_indices.map((idx) => Number(idx))
+              : null,
             userId: msg.task_info?.user_id || '',
             usedStorageSize: msg.used_storage_size || 0,
             totalStorageSize: msg.total_storage_size || 0,

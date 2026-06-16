@@ -18,6 +18,7 @@ uint16 current_subtask_index
 uint16 subtask_count
 string current_subtask_instruction
 string[] subtask_instructions
+uint16[] saved_subtask_indices
 float32 encoding_progress       # [%]
 float32 used_storage_size       # [GB]
 float32 total_storage_size      # [GB]

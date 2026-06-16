@@ -90,6 +90,18 @@ _stub_module("psutil", cpu_percent=lambda interval=None: 0.0)
 
 from cyclo_data.services.recording_service import RecordingService  # noqa: E402
 
+for _module_name in (
+    "cyclo_data.recorder.camera_info_snapshot",
+    "cyclo_data.recorder.rosbag_control",
+    "cyclo_data.recorder.transcoder",
+    "cyclo_data.recorder.video_recorder",
+):
+    sys.modules.pop(_module_name, None)
+    _parent_name, _attr_name = _module_name.rsplit(".", 1)
+    _parent = sys.modules.get(_parent_name)
+    if _parent is not None and hasattr(_parent, _attr_name):
+        delattr(_parent, _attr_name)
+
 
 def _request(segment_index=0, tags=None, **attrs):
     return SimpleNamespace(
@@ -116,3 +128,196 @@ def test_discard_episode_accepts_transitional_explicit_target_fields():
 def test_discard_episode_accepts_transitional_target_tag():
     req = _request(0, tags=["recording_full_episode_index:7"])
     assert RecordingService._extract_full_episode_index(req) == 7
+
+
+class _Logger:
+    def __init__(self):
+        self.warnings = []
+
+    def warn(self, message):
+        self.warnings.append(message)
+
+
+def _service_with_logger():
+    logger = _Logger()
+    service = RecordingService.__new__(RecordingService)
+    service._node = SimpleNamespace(get_logger=lambda: logger)
+    return service, logger
+
+
+def test_validate_active_segment_rejects_stale_segment_request():
+    service, logger = _service_with_logger()
+    service._data_manager = SimpleNamespace(
+        _segmented_storage_mode=True,
+        get_current_subtask_index=lambda: 1,
+    )
+    response = SimpleNamespace(success=True, message="")
+
+    ok = service._validate_active_segment(
+        _request(segment_index=2),
+        response,
+        "STOP_SEGMENT",
+    )
+
+    assert ok is False
+    assert response.success is False
+    assert response.message == "STOP_SEGMENT: active subtask is 1, but request targeted 2"
+    assert logger.warnings == [response.message]
+
+
+def test_validate_active_segment_accepts_current_segment_request():
+    service, _ = _service_with_logger()
+    service._data_manager = SimpleNamespace(
+        _segmented_storage_mode=True,
+        get_current_subtask_index=lambda: 1,
+    )
+    response = SimpleNamespace(success=True, message="")
+
+    ok = service._validate_active_segment(
+        _request(segment_index=1),
+        response,
+        "STOP_SEGMENT",
+    )
+
+    assert ok is True
+    assert response.success is True
+
+
+def test_start_segment_rejects_when_recording_is_already_active():
+    service, logger = _service_with_logger()
+    service._finish_episode_in_progress = lambda: False
+    service._rosbag = SimpleNamespace(is_available=lambda: True)
+    data_manager = SimpleNamespace(
+        is_recording=lambda: True,
+        set_current_subtask_index=lambda index: (_ for _ in ()).throw(
+            AssertionError("must not change subtask while recording")
+        ),
+    )
+    service._ensure_data_manager = lambda task_info, robot_type: data_manager
+    response = SimpleNamespace(success=True, message="")
+    request = _request(
+        segment_index=2,
+        command=_RecordingCommand.Request.START_SEGMENT,
+        robot_type="ffw_sg2_rev1",
+    )
+
+    result = service._do_start(request, response)
+
+    assert result is response
+    assert response.success is False
+    assert response.message == "START blocked: recording already active"
+    assert logger.warnings == [response.message]
+
+
+def test_start_segment_rejects_request_that_skips_next_missing_subtask():
+    service, logger = _service_with_logger()
+    service._finish_episode_in_progress = lambda: False
+    service._rosbag = SimpleNamespace(is_available=lambda: True)
+    data_manager = SimpleNamespace(
+        _segmented_storage_mode=True,
+        is_recording=lambda: False,
+        missing_subtasks_for_full_episode=lambda: [1, 2],
+        set_current_subtask_index=lambda index: (_ for _ in ()).throw(
+            AssertionError("must not jump over a missing subtask")
+        ),
+    )
+    service._ensure_data_manager = lambda task_info, robot_type: data_manager
+    response = SimpleNamespace(success=True, message="")
+    request = _request(
+        segment_index=2,
+        command=_RecordingCommand.Request.START_SEGMENT,
+        robot_type="ffw_sg2_rev1",
+    )
+
+    result = service._do_start(request, response)
+
+    assert result is response
+    assert response.success is False
+    assert response.message == (
+        "START_SEGMENT: next available subtask is 1, but request targeted 2"
+    )
+    assert logger.warnings == [response.message]
+
+
+def test_start_segment_rejects_when_current_episode_is_already_complete():
+    service, logger = _service_with_logger()
+    service._finish_episode_in_progress = lambda: False
+    service._rosbag = SimpleNamespace(is_available=lambda: True)
+    data_manager = SimpleNamespace(
+        _segmented_storage_mode=True,
+        is_recording=lambda: False,
+        missing_subtasks_for_full_episode=lambda: [],
+        set_current_subtask_index=lambda index: (_ for _ in ()).throw(
+            AssertionError("must not restart a complete episode")
+        ),
+    )
+    service._ensure_data_manager = lambda task_info, robot_type: data_manager
+    response = SimpleNamespace(success=True, message="")
+    request = _request(
+        segment_index=1,
+        command=_RecordingCommand.Request.START_SEGMENT,
+        robot_type="ffw_sg2_rev1",
+    )
+
+    result = service._do_start(request, response)
+
+    assert result is response
+    assert response.success is False
+    assert response.message == (
+        "START_SEGMENT: current episode already has all subtasks; "
+        "finish or discard episode before starting again"
+    )
+    assert logger.warnings == [response.message]
+
+
+def test_finish_episode_rejects_missing_subtasks_before_archive_thread():
+    service, logger = _service_with_logger()
+    service._data_manager = SimpleNamespace(
+        _segmented_storage_mode=True,
+        is_recording=lambda: False,
+        missing_subtasks_for_full_episode=lambda: [1],
+    )
+    service._start_finish_episode_thread = lambda data_manager: (_ for _ in ()).throw(
+        AssertionError("archive thread must not start with missing subtasks")
+    )
+    response = SimpleNamespace(success=True, message="")
+    request = _request(command=_RecordingCommand.Request.FINISH_EPISODE)
+
+    result = service._do_finish_episode(request, response)
+
+    assert result is response
+    assert response.success is False
+    assert response.message == "FINISH_EPISODE: missing subtask(s) [1]"
+    assert logger.warnings == [response.message]
+
+
+def test_stop_segment_rejects_when_no_active_recording():
+    service, _ = _service_with_logger()
+    service._data_manager = SimpleNamespace(is_recording=lambda: False)
+    response = SimpleNamespace(success=True, message="")
+    request = _request(command=_RecordingCommand.Request.STOP_SEGMENT)
+
+    result = service._do_stop_and_save(
+        request,
+        response,
+        "STOP_SEGMENT",
+        event="finish",
+    )
+
+    assert result is response
+    assert response.success is False
+    assert response.message == "STOP_SEGMENT: no active recording"
+
+
+def test_cancel_segment_rejects_when_no_active_recording():
+    service, _ = _service_with_logger()
+    service._data_manager = SimpleNamespace(is_recording=lambda: False)
+    service._publish_umbrella_status = lambda *args, **kwargs: None
+    response = SimpleNamespace(success=True, message="")
+    request = _request(command=_RecordingCommand.Request.CANCEL_SEGMENT)
+
+    result = service._do_cancel(request, response)
+
+    assert result is response
+    assert response.success is False
+    assert response.message == "CANCEL_SEGMENT: no active recording"

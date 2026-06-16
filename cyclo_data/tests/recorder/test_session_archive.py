@@ -270,6 +270,45 @@ def test_discard_recording_can_reset_active_episode_subtask_cursor(tmp_path):
     assert manager._current_scenario_number == 0
 
 
+def test_missing_subtasks_reports_gap_in_saved_segments(tmp_path):
+    root = tmp_path / "Task_1234_archive_MCAP"
+    manager = _make_manager(root, subtask_total=3)
+    manager._current_full_episode_index = 0
+    _write_segment(root, full_idx=0, subtask_idx=0, subtask_total=3)
+    _write_segment(root, full_idx=0, subtask_idx=2, subtask_total=3)
+
+    assert manager.saved_subtask_indices_for_full_episode() == {0, 2}
+    assert manager.missing_subtasks_for_full_episode() == [1]
+
+
+def test_active_segment_directory_without_episode_info_is_not_saved(tmp_path):
+    root = tmp_path / "Task_1234_archive_MCAP"
+    manager = _make_manager(root, subtask_total=3)
+    manager._current_full_episode_index = 0
+    _write_segment(root, full_idx=0, subtask_idx=0, subtask_total=3)
+    active_segment = root / "0" / "segments" / "1"
+    active_segment.mkdir(parents=True)
+    (active_segment / "segment_1.mcap").write_bytes(b"recording")
+
+    assert manager.saved_subtask_indices_for_full_episode() == {0}
+    assert manager.missing_subtasks_for_full_episode() == [1, 2]
+
+
+def test_full_episode_archive_errors_report_corrupt_saved_segment(tmp_path):
+    root = tmp_path / "Task_1234_archive_MCAP"
+    manager = _make_manager(root, subtask_total=1)
+    manager._current_full_episode_index = 0
+    segment = _write_segment(root, full_idx=0, subtask_idx=0, subtask_total=1)
+    (segment / "metadata.yaml").unlink()
+    for mcap in segment.glob("*.mcap"):
+        mcap.unlink()
+
+    assert manager.full_episode_archive_errors() == [
+        "subtask 0: missing metadata.yaml",
+        "subtask 0: missing .mcap file",
+    ]
+
+
 def test_archive_writes_korean_subtask_instruction_as_utf8(tmp_path):
     root = tmp_path / "Task_1234_archive_MCAP"
     manager = _make_manager(root, subtask_total=2)

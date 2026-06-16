@@ -355,7 +355,8 @@ class RecordingService:
         task_num = request.task_info.task_num or '<unset>'
         self._node.get_logger().info(
             f'RecordingCommand.{command_name} received '
-            f'(task_num={task_num}, robot_type={request.robot_type or "<unset>"})')
+            f'(task_num={task_num}, robot_type={request.robot_type or "<unset>"}, '
+            f'segment_index={int(getattr(request, "segment_index", 0) or 0)})')
 
         cmd = request.command
         Req = RecordingCommand.Request
@@ -550,7 +551,14 @@ class RecordingService:
             response.message = 'rosbag_recorder service unavailable'
             return response
         dm = self._ensure_data_manager(request.task_info, request.robot_type)
+        if dm.is_recording():
+            response.success = False
+            response.message = 'START blocked: recording already active'
+            self._node.get_logger().warn(response.message)
+            return response
         if request.command == RecordingCommand.Request.START_SEGMENT:
+            if not self._validate_start_segment(dm, request, response):
+                return response
             dm.set_current_subtask_index(int(request.segment_index))
 
         # rosbag_recorder is normally prepared at REFRESH_TOPICS time
@@ -715,14 +723,23 @@ class RecordingService:
         an inference-only context.
         """
         if self._data_manager is None:
-            response.success = True
-            response.message = f'{command_name}: no DataManager — no-op'
+            response.success = command_name != 'STOP_SEGMENT'
+            response.message = (
+                f'{command_name}: no DataManager — no-op'
+                if response.success
+                else f'{command_name}: no active recording session'
+            )
             return response
         if not self._data_manager.is_recording():
-            response.success = True
+            response.success = command_name != 'STOP_SEGMENT'
             response.message = (
                 f'{command_name}: no active recording — no-op'
+                if response.success
+                else f'{command_name}: no active recording'
             )
+            return response
+        if command_name == 'STOP_SEGMENT' and not self._validate_active_segment(
+                request, response, command_name):
             return response
 
         self._node.get_logger().info(
@@ -818,6 +835,12 @@ class RecordingService:
             response.success = False
             response.message = 'FINISH_EPISODE: save active subtask first'
             return response
+        archive_errors = self._archive_errors_for_finish(self._data_manager)
+        if archive_errors:
+            response.success = False
+            response.message = 'FINISH_EPISODE: ' + '; '.join(archive_errors)
+            self._node.get_logger().warn(response.message)
+            return response
         if not self._start_finish_episode_thread(self._data_manager):
             response.success = True
             response.message = 'Episode finish already in progress'
@@ -843,6 +866,8 @@ class RecordingService:
             return self._data_manager.discard_current_full_episode()
 
         if self._data_manager.is_recording():
+            self._node.get_logger().info(
+                f'DISCARD_EPISODE: target_full_idx={target_full_idx} active=True')
             response = self._do_discard(
                 request,
                 response,
@@ -852,6 +877,9 @@ class RecordingService:
             if not response.success:
                 return response
             deleted = discard_saved()
+            self._node.get_logger().info(
+                f'DISCARD_EPISODE: target_full_idx={target_full_idx} '
+                f'deleted_saved_subtasks={deleted}')
             response.message = (
                 f'Episode discarded ({deleted} saved subtask(s) removed)'
                 if deleted else 'Episode discarded'
@@ -860,7 +888,12 @@ class RecordingService:
                 DataOperationStatus.CANCELLED, 'DISCARD_EPISODE',
                 response.message)
             return response
+        self._node.get_logger().info(
+            f'DISCARD_EPISODE: target_full_idx={target_full_idx} active=False')
         deleted = discard_saved()
+        self._node.get_logger().info(
+            f'DISCARD_EPISODE: target_full_idx={target_full_idx} '
+            f'deleted_saved_subtasks={deleted}')
         response.success = True
         response.message = (
             f'Episode discarded ({deleted} saved subtask(s) removed)'
@@ -951,10 +984,22 @@ class RecordingService:
             return response
 
         if self._data_manager.is_recording():
+            if (
+                request.command == RecordingCommand.Request.CANCEL_SEGMENT
+                and not self._validate_active_segment(request, response, 'CANCEL_SEGMENT')
+            ):
+                return response
             return self._do_discard(request, response, event='cancel')
 
-        response.success = True
-        response.message = 'CANCEL: no active recording — nothing to discard'
+        is_segment_cancel = (
+            request.command == RecordingCommand.Request.CANCEL_SEGMENT
+        )
+        response.success = not is_segment_cancel
+        response.message = (
+            'CANCEL_SEGMENT: no active recording'
+            if is_segment_cancel
+            else 'CANCEL: no active recording — nothing to discard'
+        )
         self._publish_umbrella_status(
             DataOperationStatus.IDLE, 'CANCEL', response.message)
         return response
@@ -1017,6 +1062,91 @@ class RecordingService:
         response.success = True
         response.message = 'Recording discarded'
         return response
+
+    def _validate_active_segment(self, request, response, command_name: str) -> bool:
+        if self._data_manager is None:
+            return True
+        if not bool(getattr(self._data_manager, '_segmented_storage_mode', False)):
+            return True
+        requested = int(getattr(request, 'segment_index', 0) or 0)
+        getter = getattr(self._data_manager, 'get_current_subtask_index', None)
+        active = int(
+            getter() if callable(getter)
+            else getattr(self._data_manager, '_current_subtask_index', 0)
+        )
+        if requested == active:
+            return True
+        response.success = False
+        response.message = (
+            f'{command_name}: active subtask is {active}, '
+            f'but request targeted {requested}'
+        )
+        self._node.get_logger().warn(response.message)
+        return False
+
+    def _validate_start_segment(self, data_manager, request, response) -> bool:
+        if not bool(getattr(data_manager, '_segmented_storage_mode', False)):
+            return True
+
+        requested = int(getattr(request, 'segment_index', 0) or 0)
+        missing_getter = getattr(
+            data_manager,
+            'missing_subtasks_for_full_episode',
+            None,
+        )
+        if callable(missing_getter):
+            missing = [int(idx) for idx in missing_getter()]
+        else:
+            current_getter = getattr(data_manager, 'get_current_subtask_index', None)
+            missing = [
+                int(
+                    current_getter() if callable(current_getter)
+                    else getattr(data_manager, '_current_subtask_index', 0)
+                )
+            ]
+
+        if not missing:
+            response.success = False
+            response.message = (
+                'START_SEGMENT: current episode already has all subtasks; '
+                'finish or discard episode before starting again'
+            )
+            self._node.get_logger().warn(response.message)
+            return False
+
+        expected = missing[0]
+        if requested == expected:
+            return True
+
+        response.success = False
+        response.message = (
+            f'START_SEGMENT: next available subtask is {expected}, '
+            f'but request targeted {requested}'
+        )
+        self._node.get_logger().warn(response.message)
+        return False
+
+    @staticmethod
+    def _archive_errors_for_finish(data_manager) -> list[str]:
+        if not bool(getattr(data_manager, '_segmented_storage_mode', False)):
+            return []
+        errors_getter = getattr(
+            data_manager,
+            'full_episode_archive_errors',
+            None,
+        )
+        if callable(errors_getter):
+            return [str(error) for error in errors_getter()]
+
+        missing_getter = getattr(
+            data_manager,
+            'missing_subtasks_for_full_episode',
+            None,
+        )
+        if not callable(missing_getter):
+            return []
+        missing = [int(idx) for idx in missing_getter()]
+        return [f'missing subtask(s) {missing}'] if missing else []
 
     def _do_skip_task(self, request, response):
         # Orchestrator never defined SKIP_TASK dispatch in send_command —
