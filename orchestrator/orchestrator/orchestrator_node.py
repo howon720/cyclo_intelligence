@@ -133,6 +133,9 @@ class OrchestratorNode(Node):
         # that needs to acquire it. The lock only brackets pointer
         # reads/writes and the snapshot helper.
         self._state_lock = threading.Lock()
+        # UI service callbacks and joystick subscriptions can both forward
+        # recording commands; serialize those calls without holding state_lock.
+        self._recording_command_lock = threading.Lock()
 
         self.params = None
         self.robot_section = None
@@ -303,15 +306,19 @@ class OrchestratorNode(Node):
             RecordingCommand.Request.RERECORD,
             RecordingCommand.Request.DISCARD_EPISODE,
         } else 5.0
-        return self._cyclo_data.send_recording_command(
-            command=command,
-            task_info=task_info if task_info is not None else self._last_ui_task_info,
-            robot_type=getattr(self, 'robot_type', ''),
-            topics=topics,
-            urdf_path=urdf_path,
-            segment_index=segment_index,
-            timeout_sec=timeout_sec,
-        )
+        with self._recording_command_lock:
+            return self._cyclo_data.send_recording_command(
+                command=command,
+                task_info=(
+                    task_info if task_info is not None
+                    else self._last_ui_task_info
+                ),
+                robot_type=getattr(self, 'robot_type', ''),
+                topics=topics,
+                urdf_path=urdf_path,
+                segment_index=segment_index,
+                timeout_sec=timeout_sec,
+            )
 
     @staticmethod
     def _task_info_record_signature(task_info: Optional[TaskInfo]):
@@ -1072,15 +1079,10 @@ class OrchestratorNode(Node):
                     response.success = False
                     response.message = 'Communicator not initialized'
                     return response
-                rosbag_topics = self.communicator.get_mcap_topics()
-                urdf_path = self.params.get('urdf_path', '') if self.params else ''
-
-                cd_result = self._cyclo_data.send_recording_command(
-                    command=RecordingCommand.Request.START,
+                cd_result = self._forward_recording(
+                    RecordingCommand.Request.START,
                     task_info=task_info,
-                    robot_type=self.robot_type,
-                    topics=rosbag_topics,
-                    urdf_path=urdf_path,
+                    include_topics=True,
                 )
                 if (cd_result.success
                         and cd_result.response is not None
@@ -1527,19 +1529,17 @@ class OrchestratorNode(Node):
                 )
                 if not snapshot_on_recording and not snapshot_on_inference:
                     # Not recording — CANCEL/RERECORD have nothing to
-                    # do at idle. Forward anyway so cyclo_data's
-                    # handler can publish the umbrella status response
-                    # consistently with the recording paths below.
+                    # do at idle. Do not forward a targetless CANCEL here:
+                    # a concurrent joystick/UI START could otherwise turn
+                    # this stale idle no-op into deletion of a fresh segment.
                     if request.command in (
                         SendCommand.Request.CANCEL,
                         SendCommand.Request.RERECORD,
                     ):
-                        cd_result = self._cyclo_data.send_recording_command(
-                            command=RecordingCommand.Request.CANCEL,
-                            task_info=request.task_info,
-                            robot_type=self.robot_type,
+                        response.success = True
+                        response.message = (
+                            'CANCEL: no active recording — nothing to discard'
                         )
-                        self._apply_cyclo_data_response(cd_result, response)
                     else:
                         response.success = False
                         response.message = 'Not currently recording'

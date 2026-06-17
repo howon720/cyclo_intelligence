@@ -1,13 +1,26 @@
+const stringArray = (items) => (
+  Array.isArray(items) ? items.map((item) => String(item ?? '')) : []
+);
+
+const numberOrDefault = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
 export const normalizeRecordTaskInfo = (taskInfo = {}) => ({
   taskNum: String(taskInfo.taskNum ?? '').trim(),
   taskName: String(taskInfo.taskName ?? '').trim(),
-  taskInstruction: Array.isArray(taskInfo.taskInstruction)
-    ? taskInfo.taskInstruction.map((item) => String(item ?? ''))
-    : [],
-  subtaskInstruction: Array.isArray(taskInfo.subtaskInstruction)
-    ? taskInfo.subtaskInstruction.map((item) => String(item ?? ''))
-    : [],
+  taskType: String(taskInfo.taskType ?? '').trim(),
+  taskInstruction: stringArray(taskInfo.taskInstruction),
+  subtaskInstruction: stringArray(taskInfo.subtaskInstruction),
+  policyPath: String(taskInfo.policyPath ?? '').trim(),
+  recordInferenceMode: Boolean(taskInfo.recordInferenceMode),
+  controlHz: numberOrDefault(taskInfo.controlHz ?? 100, 100),
+  inferenceHz: numberOrDefault(taskInfo.inferenceHz ?? 15, 15),
+  chunkAlignWindowS: numberOrDefault(taskInfo.chunkAlignWindowS ?? 0.3, 0.3),
   includeRobotisLicense: Boolean(taskInfo.includeRobotisLicense),
+  serviceType: String(taskInfo.serviceType ?? '').trim(),
+  inferenceMode: String(taskInfo.inferenceMode ?? 'simulation').trim(),
 });
 
 export const getRecordTaskInfoKey = (taskInfo = {}) =>
@@ -21,6 +34,7 @@ export const rosTaskInfoToUiTaskInfo = (taskInfo = {}) => ({
   subtaskInstruction: taskInfo.subtask_instruction || [],
   policyPath: taskInfo.policy_path || '',
   recordInferenceMode: Boolean(taskInfo.record_inference_mode),
+  serviceType: taskInfo.service_type || 'lerobot',
   inferenceMode: taskInfo.inference_mode || 'simulation',
   userId: taskInfo.user_id || '',
   controlHz: taskInfo.control_hz || 100,

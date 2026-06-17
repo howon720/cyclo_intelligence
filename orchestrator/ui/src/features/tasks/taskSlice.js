@@ -41,14 +41,8 @@ const applyRecordTaskInfoToForm = (state, taskInfo) => {
     : [];
   state.plannedSubTasks = subtasks;
   state.plannedCount = subtasks.length;
-  state.slotToServerIdx = subtasks.map((_, index) => (
-    Number.isInteger(state.slotToServerIdx[index])
-      ? state.slotToServerIdx[index]
-      : -1
-  ));
-  state.activeSlotIndex = subtasks.length > 0
-    ? Math.min(state.activeSlotIndex, subtasks.length - 1)
-    : 0;
+  state.slotToServerIdx = subtasks.map(() => -1);
+  state.activeSlotIndex = 0;
 };
 
 const initialState = {
@@ -104,12 +98,17 @@ const initialState = {
     subtaskCount: 0,
     currentSubtaskInstruction: '',
     subtaskInstructions: [],
+    savedSubtaskIndices: null,
     userId: '',
     usedStorageSize: 0,
     totalStorageSize: 0,
     usedCpu: 0,
     usedRamSize: 0,
     totalRamSize: 0,
+    recordingWarnings: [],
+    recordingOperationStatus: 'idle',
+    recordingOperationStage: '',
+    recordingOperationMessage: '',
     topicReceived: false,
   },
 
@@ -131,6 +130,7 @@ const initialState = {
   // Per-topic live monitor snapshot from rosbag_recorder (1 Hz while recording).
   recordingMonitor: {
     topics: [],         // [{name, rateHz, baselineHz, secondsSinceLast, status}]
+    cameraTopics: [],   // [{name, cameraName, rateHz, baselineHz, secondsSinceLast, status}]
     totalReceived: 0,
     totalWritten: 0,
   },
@@ -192,7 +192,14 @@ const taskSlice = createSlice({
       state.joystickMode = action.payload || '';
     },
     setRecordingMonitor: (state, action) => {
-      state.recordingMonitor = action.payload;
+      state.recordingMonitor = {
+        ...state.recordingMonitor,
+        ...action.payload,
+        cameraTopics: action.payload.cameraTopics ?? state.recordingMonitor.cameraTopics,
+      };
+    },
+    setCameraRecordingMonitor: (state, action) => {
+      state.recordingMonitor.cameraTopics = action.payload || [];
     },
     setPlannedCount: (state, action) => {
       state.plannedCount = action.payload;
@@ -335,6 +342,7 @@ export const {
   setLastHeartbeatTime,
   setJoystickMode,
   setRecordingMonitor,
+  setCameraRecordingMonitor,
   setPlannedCount,
   setPlannedSubTasks,
   setPlannedSubTaskAt,

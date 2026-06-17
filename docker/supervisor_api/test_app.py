@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -48,6 +50,7 @@ _mount_source_for_destination = app._mount_source_for_destination
 _backend_container_image_mismatch = app._backend_container_image_mismatch
 _backend_container_stale_reason = app._backend_container_stale_reason
 _compose_env = app._compose_env
+_host_workspace_dir = app._host_workspace_dir
 _require_known_service = app._require_known_service
 _BACKENDS = app._BACKENDS
 _USER_SERVICES = app._USER_SERVICES
@@ -149,6 +152,270 @@ def test_mount_source_for_destination_resolves_workspace_host_path():
     assert _mount_source_for_destination(mounts, "/workspace") == (
         "/mnt/ssd/cyclo_intelligence/workspace"
     )
+
+
+def test_host_workspace_dir_prefers_actual_mount_over_legacy_env(monkeypatch):
+    container = SimpleNamespace(
+        attrs={
+            "Mounts": [
+                {
+                    "Destination": "/workspace",
+                    "Source": "/repo/docker/workspace",
+                }
+            ]
+        }
+    )
+    client = SimpleNamespace(
+        containers=SimpleNamespace(get=lambda _name: container)
+    )
+
+    monkeypatch.setenv("HOSTNAME", "self")
+    monkeypatch.setenv(
+        "CYCLO_WORKSPACE_DIR",
+        "/mnt/ssd/cyclo_intelligence/workspace",
+    )
+    monkeypatch.setattr(app, "_docker_client", lambda: client)
+    app._HOST_WORKSPACE_DIR_CACHE = None
+    try:
+        assert _host_workspace_dir() == "/repo/docker/workspace"
+    finally:
+        app._HOST_WORKSPACE_DIR_CACHE = None
+
+
+def test_compose_uses_repo_local_workspace_mounts():
+    compose = (REPO_ROOT / "docker" / "docker-compose.yml").read_text()
+
+    assert "CYCLO_WORKSPACE_DIR" not in compose
+    assert "CYCLO_HUGGINGFACE_DIR" not in compose
+    assert compose.count("./workspace:/workspace") == 3
+    assert compose.count("./huggingface:/root/.cache/huggingface") == 3
+
+
+def test_container_helper_does_not_export_workspace_mount_overrides():
+    helper = (REPO_ROOT / "docker" / "container.sh").read_text()
+    relocate = (REPO_ROOT / "docker" / "relocate_workspace_to_ssd.sh").read_text()
+    rsync_options = (
+        "rsync -rltHP --omit-dir-times --no-owner --no-group --no-perms"
+    )
+
+    assert "export CYCLO_WORKSPACE_DIR" not in helper
+    assert "export CYCLO_HUGGINGFACE_DIR" not in helper
+    assert rsync_options in helper
+    assert rsync_options in relocate
+    assert "rsync -aHP" not in helper
+    assert "rsync -aHP" not in relocate
+
+
+def _run_storage_setup(docker_dir, ssd_root, mode="auto", extra_env=None):
+    script = r"""
+set -e
+source <(sed -n '/^ensure_host_dir()/,/^CYCLO_AGENT_SOCKETS_DIR=/p' "$HELPER" | sed '$d')
+setup_storage
+"""
+    env = {
+        **os.environ,
+        "HELPER": str(REPO_ROOT / "docker" / "container.sh"),
+        "SCRIPT_DIR": str(docker_dir),
+        "CYCLO_SSD_ROOT": str(ssd_root),
+        "CYCLO_STORAGE_MODE": mode,
+    }
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", "-c", script],
+        check=False,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+
+def test_container_helper_auto_migrates_without_overwriting_ssd(tmp_path):
+    docker_dir = tmp_path / "docker"
+    workspace = docker_dir / "workspace"
+    huggingface = docker_dir / "huggingface"
+    ssd_root = tmp_path / "ssd"
+    workspace.mkdir(parents=True)
+    huggingface.mkdir()
+    (workspace / "local-only.txt").write_text("old local data")
+    (workspace / "conflict.txt").write_text("local conflict")
+    (ssd_root / "workspace").mkdir(parents=True)
+    (ssd_root / "workspace" / "conflict.txt").write_text("ssd wins")
+
+    result = _run_storage_setup(docker_dir, ssd_root)
+
+    assert result.returncode == 0, result.stderr
+    assert workspace.resolve() == ssd_root / "workspace"
+    assert huggingface.resolve() == ssd_root / "huggingface"
+    assert (ssd_root / "workspace" / "dataset").is_dir()
+    assert (ssd_root / "workspace" / "local-only.txt").read_text() == (
+        "old local data"
+    )
+    assert (ssd_root / "workspace" / "conflict.txt").read_text() == "ssd wins"
+    backups = list(docker_dir.glob("workspace.local-before-ssd-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "conflict.txt").read_text() == "local conflict"
+
+
+def test_container_helper_local_mode_does_not_create_ssd_symlinks(tmp_path):
+    docker_dir = tmp_path / "docker"
+    workspace = docker_dir / "workspace"
+    ssd_root = tmp_path / "ssd"
+    workspace.mkdir(parents=True)
+    (workspace / "local.txt").write_text("keep local")
+
+    result = _run_storage_setup(docker_dir, ssd_root, mode="local")
+
+    assert result.returncode == 0, result.stderr
+    assert not workspace.is_symlink()
+    assert (workspace / "local.txt").read_text() == "keep local"
+    assert not (ssd_root / "workspace").exists()
+
+
+def test_container_helper_auto_falls_back_when_ssd_root_unusable(tmp_path):
+    docker_dir = tmp_path / "docker"
+    workspace = docker_dir / "workspace"
+    ssd_root = Path("/proc/cyclo-intelligence-test-root")
+    workspace.mkdir(parents=True)
+    (workspace / "local.txt").write_text("keep local")
+
+    result = _run_storage_setup(docker_dir, ssd_root)
+
+    assert result.returncode == 0, result.stderr
+    assert not workspace.is_symlink()
+    assert (workspace / "local.txt").read_text() == "keep local"
+
+
+def test_container_helper_auto_ignores_unmounted_ssd_mountpoint(tmp_path):
+    docker_dir = tmp_path / "docker"
+    workspace = docker_dir / "workspace"
+    ssd_root = tmp_path / "ssd"
+    unmounted = tmp_path / "not-mounted"
+    workspace.mkdir(parents=True)
+    unmounted.mkdir()
+    (workspace / "local.txt").write_text("keep local")
+
+    result = _run_storage_setup(
+        docker_dir,
+        ssd_root,
+        extra_env={"CYCLO_SSD_MOUNTPOINT": str(unmounted)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not workspace.is_symlink()
+    assert (workspace / "local.txt").read_text() == "keep local"
+    assert not (ssd_root / "workspace").exists()
+
+
+def test_container_helper_ssd_mode_creates_missing_ssd_root(tmp_path):
+    docker_dir = tmp_path / "docker"
+    workspace = docker_dir / "workspace"
+    ssd_root = tmp_path / "new-ssd-root"
+    workspace.mkdir(parents=True)
+    (workspace / "local.txt").write_text("move me")
+
+    result = _run_storage_setup(docker_dir, ssd_root, mode="ssd")
+
+    assert result.returncode == 0, result.stderr
+    assert workspace.resolve() == ssd_root / "workspace"
+    assert (ssd_root / "workspace" / "local.txt").read_text() == "move me"
+
+
+def test_container_helper_ssd_mode_fails_when_ssd_root_unusable(tmp_path):
+    docker_dir = tmp_path / "docker"
+    (docker_dir / "workspace").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_sudo = fake_bin / "sudo"
+    fake_sudo.write_text("#!/bin/sh\nexit 1\n")
+    fake_sudo.chmod(0o755)
+
+    result = _run_storage_setup(
+        docker_dir,
+        Path("/proc/cyclo-intelligence-test-root"),
+        mode="ssd",
+        extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode != 0
+    assert "SSD storage root is not writable" in result.stderr
+
+
+def test_container_helper_ssd_mode_fails_when_mountpoint_unmounted(tmp_path):
+    docker_dir = tmp_path / "docker"
+    workspace = docker_dir / "workspace"
+    ssd_root = tmp_path / "ssd"
+    unmounted = tmp_path / "not-mounted"
+    workspace.mkdir(parents=True)
+    unmounted.mkdir()
+
+    result = _run_storage_setup(
+        docker_dir,
+        ssd_root,
+        mode="ssd",
+        extra_env={"CYCLO_SSD_MOUNTPOINT": str(unmounted)},
+    )
+
+    assert result.returncode != 0
+    assert "SSD storage root is not writable" in result.stderr
+
+
+def test_container_helper_rejects_stale_workspace_symlink(tmp_path):
+    docker_dir = tmp_path / "docker"
+    docker_dir.mkdir()
+    (docker_dir / "workspace").symlink_to(tmp_path / "missing-target")
+    ssd_root = tmp_path / "ssd"
+    ssd_root.mkdir()
+
+    result = _run_storage_setup(docker_dir, ssd_root)
+
+    assert result.returncode != 0
+    assert "is a symlink outside" in result.stderr
+
+
+def test_relocate_script_migrates_without_overwriting_ssd(tmp_path):
+    repo = tmp_path / "repo"
+    docker_dir = repo / "docker"
+    workspace = docker_dir / "workspace"
+    huggingface = docker_dir / "huggingface"
+    ssd_root = tmp_path / "ssd"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text("#!/bin/sh\nexit 0\n")
+    fake_docker.chmod(0o755)
+
+    workspace.mkdir(parents=True)
+    huggingface.mkdir()
+    (workspace / "local-only.txt").write_text("local")
+    (workspace / "conflict.txt").write_text("local conflict")
+    (ssd_root / "workspace").mkdir(parents=True)
+    (ssd_root / "workspace" / "conflict.txt").write_text("ssd wins")
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CYCLO_REPO": str(repo),
+        "CYCLO_SSD_ROOT": str(ssd_root),
+        "CYCLO_STORAGE_USER": str(os.getuid()),
+        "CYCLO_STORAGE_GROUP": str(os.getgid()),
+    }
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "docker" / "relocate_workspace_to_ssd.sh")],
+        check=False,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert workspace.resolve() == ssd_root / "workspace"
+    assert huggingface.resolve() == ssd_root / "huggingface"
+    assert (ssd_root / "workspace" / "local-only.txt").read_text() == "local"
+    assert (ssd_root / "workspace" / "conflict.txt").read_text() == "ssd wins"
+    backups = list(docker_dir.glob("workspace.local-before-ssd-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "conflict.txt").read_text() == "local conflict"
 
 
 def test_bt_node_is_known_user_service():

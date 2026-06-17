@@ -2,6 +2,13 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.14 (2026-06-17)
+-------------------
+* Added saved-subtask tracking and full-episode validation for segmented recording finish/discard flows.
+* Added camera stream monitoring, recording warnings, and raw MJPEG spool remux handling for recorder video output.
+* Hardened recording start/stop cleanup paths and added regression coverage for segmented recording and transcoding behavior.
+* Contributors: Taehyeong Kim
+
 0.1.13 (2026-06-11)
 -------------------
 * None

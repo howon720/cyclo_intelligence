@@ -2,6 +2,12 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.14 (2026-06-17)
+-------------------
+* Serialized recording command forwarding to avoid overlapping UI and trigger commands.
+* Avoided forwarding stale idle cancel/rerecord commands that could race with a new recording start.
+* Contributors: Taehyeong Kim
+
 0.1.13 (2026-06-11)
 -------------------
 * Added simulation-first inference mode handling so policy actions can be previewed without publishing robot commands.

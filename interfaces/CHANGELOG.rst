@@ -2,6 +2,12 @@
 Changelog for package interfaces
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.14 (2026-06-17)
+-------------------
+* Added RecordingStatus fields for saved subtask indices, recording warnings, and camera monitor diagnostics.
+* Documented targeted full-episode discard encoding on recording command segment_index.
+* Contributors: Taehyeong Kim
+
 0.1.13 (2026-06-11)
 -------------------
 * Added inference mode task metadata and command fields for 3D simulation versus real robot deployment.

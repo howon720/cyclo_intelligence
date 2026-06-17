@@ -2,6 +2,10 @@
 Changelog for package cyclo_brain
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.14 (2026-06-17)
+-------------------
+* None
+
 0.1.13 (2026-06-11)
 -------------------
 * Restored the shared policy runtime architecture around ``main-runtime`` and ``engine-process`` services for LeRobot and GR00T.

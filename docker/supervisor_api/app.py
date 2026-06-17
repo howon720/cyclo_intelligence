@@ -305,32 +305,35 @@ def _host_workspace_dir() -> Optional[str]:
     if _HOST_WORKSPACE_DIR_CACHE is not None:
         return _HOST_WORKSPACE_DIR_CACHE
 
-    env_path = os.environ.get("CYCLO_WORKSPACE_DIR")
-    if env_path:
-        _HOST_WORKSPACE_DIR_CACHE = env_path
-        return _HOST_WORKSPACE_DIR_CACHE
-
     try:
         client = _docker_client()
     except DockerException as e:
         logger.warning("docker init failed during workspace self-inspect: %s", e)
-        return None
+    else:
+        for own_id in _self_container_candidates():
+            try:
+                ctr = client.containers.get(own_id)
+            except NotFound:
+                continue
+            except DockerException as e:
+                logger.warning("self-inspect for workspace mount failed: %s", e)
+                continue
+            host_workspace = _mount_source_for_destination(
+                ctr.attrs.get("Mounts", []),
+                "/workspace",
+            )
+            if host_workspace:
+                _HOST_WORKSPACE_DIR_CACHE = host_workspace
+                return _HOST_WORKSPACE_DIR_CACHE
 
-    for own_id in _self_container_candidates():
-        try:
-            ctr = client.containers.get(own_id)
-        except NotFound:
-            continue
-        except DockerException as e:
-            logger.warning("self-inspect for workspace mount failed: %s", e)
-            continue
-        host_workspace = _mount_source_for_destination(
-            ctr.attrs.get("Mounts", []),
-            "/workspace",
+    env_path = os.environ.get("CYCLO_WORKSPACE_DIR")
+    if env_path:
+        logger.warning(
+            "using legacy CYCLO_WORKSPACE_DIR fallback for /workspace: %s",
+            env_path,
         )
-        if host_workspace:
-            _HOST_WORKSPACE_DIR_CACHE = host_workspace
-            return _HOST_WORKSPACE_DIR_CACHE
+        _HOST_WORKSPACE_DIR_CACHE = env_path
+        return _HOST_WORKSPACE_DIR_CACHE
     return None
 
 

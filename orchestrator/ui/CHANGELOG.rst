@@ -2,6 +2,13 @@
 Changelog for package cyclo-ui
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.14 (2026-06-17)
+-------------------
+* Added camera recording monitor rows, warning toasts, and speech notifications from RecordingStatus diagnostics.
+* Synced saved subtask indices from the server and hardened segmented episode finish/discard reset handling.
+* Normalized record task info synchronization for policy and inference metadata.
+* Contributors: Taehyeong Kim
+
 0.1.13 (2026-06-11)
 -------------------
 * Added explicit ``3D Sim Deploy`` and ``Real Robot Deploy`` controls with a confirmation dialog before robot publishing.

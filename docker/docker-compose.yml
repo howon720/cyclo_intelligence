@@ -43,7 +43,7 @@ services:
   # ============================================================
   cyclo_intelligence:
     container_name: cyclo_intelligence
-    image: robotis/cyclo-intelligence:${VERSION:-0.1.13}-${ARCH:-arm64}
+    image: robotis/cyclo-intelligence:${VERSION:-0.1.14}-${ARCH:-arm64}
     build:
       context: ..
       dockerfile: docker/Dockerfile.${ARCH:-arm64}
@@ -85,8 +85,8 @@ services:
     volumes:
       - /dev:/dev
       - /dev/shm:/dev/shm
-      - ${CYCLO_WORKSPACE_DIR:-./workspace}:/workspace
-      - ${CYCLO_HUGGINGFACE_DIR:-./huggingface}:/root/.cache/huggingface
+      - ./workspace:/workspace
+      - ./huggingface:/root/.cache/huggingface
       # Model dropboxes live under /workspace/model/{lerobot,groot}.
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # Live-edit the ROS2 workspace at runtime so a 'colcon build'
@@ -195,9 +195,9 @@ services:
     volumes:
       - /dev:/dev
       - /dev/shm:/dev/shm
-      - ${CYCLO_WORKSPACE_DIR:-./workspace}:/workspace
+      - ./workspace:/workspace
       # User-visible LeRobot models live under /workspace/model/lerobot.
-      - ${CYCLO_HUGGINGFACE_DIR:-./huggingface}:/root/.cache/huggingface
+      - ./huggingface:/root/.cache/huggingface
       # Live-edit SDKs (mounted read-only so the container can't mutate
       # the host tree accidentally).
       - ../cyclo_brain/sdk/zenoh_ros2_sdk:/zenoh_sdk:ro
@@ -320,8 +320,8 @@ services:
     volumes:
       - /dev:/dev
       - /dev/shm:/dev/shm
-      - ${CYCLO_WORKSPACE_DIR:-./workspace}:/workspace
-      - ${CYCLO_HUGGINGFACE_DIR:-./huggingface}:/root/.cache/huggingface
+      - ./workspace:/workspace
+      - ./huggingface:/root/.cache/huggingface
       # User-visible GR00T models live under /workspace/model/groot.
       # Live-edit SDKs (mounted read-only so the container can't mutate
       # the host tree accidentally).
