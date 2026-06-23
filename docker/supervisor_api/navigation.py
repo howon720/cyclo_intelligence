@@ -7,14 +7,14 @@
 
 """Self-contained Navigation control plane for cyclo_intelligence.
 
-ROS topics stay on rosbridge. This router only handles operations a browser
-cannot perform directly: controlling ai_worker s6 services, Nav2 actions,
-service logs, and map files inside the ai_worker container.
+Most ROS topics stay on rosbridge. The two large Navigation grids use a
+CRC32-filtered WebSocket so unchanged maps are not sent to browser clients.
 """
 
 from __future__ import annotations
 
 import base64
+import asyncio
 import io
 import json
 import os
@@ -27,8 +27,10 @@ from typing import Literal, Optional
 
 import docker
 from docker.errors import DockerException, NotFound
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
+
+from supervisor_api.navigation_topic_relay import GRID_CACHES, GRID_TOPICS
 
 
 router = APIRouter(prefix="/navigation", tags=["navigation"])
@@ -42,6 +44,37 @@ MAPS_DIR = PurePosixPath(
     "/root/ros2_ws/src/ai_worker/ffw_navigation/maps"
 )
 _SAFE_MAP_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+GRID_SEND_INTERVAL_SECONDS = 1.0
+
+
+@router.websocket("/topics/ws")
+async def navigation_grid_websocket(websocket: WebSocket, topic: str):
+    """Send the latest grid initially, then only when its data CRC changes."""
+    if topic not in GRID_TOPICS:
+        await websocket.close(code=1008, reason="Unsupported grid topic")
+        return
+
+    await websocket.accept()
+    cache = GRID_CACHES[topic]
+    last_crc32 = None
+    try:
+        while True:
+            last_crc32, payload = await asyncio.to_thread(
+                cache.serialized_if_changed, last_crc32
+            )
+            if payload is not None:
+                await websocket.send_text(payload)
+            try:
+                event = await asyncio.wait_for(
+                    websocket.receive(),
+                    timeout=GRID_SEND_INTERVAL_SECONDS,
+                )
+                if event["type"] == "websocket.disconnect":
+                    return
+            except asyncio.TimeoutError:
+                pass
+    except WebSocketDisconnect:
+        return
 
 
 class NavigationStatus(BaseModel):

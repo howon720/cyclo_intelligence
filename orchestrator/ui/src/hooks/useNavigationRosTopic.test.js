@@ -1,4 +1,7 @@
-import { wrapNavigationRosMessage } from './useNavigationRosTopic';
+import {
+  navigationGridWebSocketUrl,
+  wrapNavigationRosMessage,
+} from './useNavigationRosTopic';
 
 test('wraps OccupancyGrid without losing its data and metadata fields', () => {
   const map = {
@@ -11,4 +14,13 @@ test('wraps OccupancyGrid without losing its data and metadata fields', () => {
     available: true,
     data: map,
   });
+});
+
+test('builds a same-origin supervisor WebSocket URL for a grid topic', () => {
+  expect(navigationGridWebSocketUrl('/global_costmap/costmap', {
+    protocol: 'https:',
+    host: 'robot.local:8443',
+  })).toBe(
+    'wss://robot.local:8443/api/navigation/topics/ws?topic=%2Fglobal_costmap%2Fcostmap'
+  );
 });

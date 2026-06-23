@@ -21,8 +21,18 @@ const TOPIC_TYPES = {
   '/tf_static': 'tf2_msgs/msg/TFMessage',
 };
 
+const SERVER_GRID_TOPICS = new Set([
+  '/map',
+  '/global_costmap/costmap',
+]);
+
 export function wrapNavigationRosMessage(message) {
   return { available: true, data: message };
+}
+
+export function navigationGridWebSocketUrl(topic, location = window.location) {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${location.host}/api/navigation/topics/ws?topic=${encodeURIComponent(topic)}`;
 }
 
 /** Subscribe to a Navigation ROS topic through the app-wide rosbridge connection. */
@@ -41,6 +51,33 @@ export function useNavigationRosTopic(topic, options = {}) {
     let mounted = true;
     let subscription = null;
 
+    if (SERVER_GRID_TOPICS.has(topic)) {
+      setStatus('connecting');
+      const socket = new WebSocket(navigationGridWebSocketUrl(topic));
+      socket.onopen = () => {
+        if (mounted) setStatus('connected');
+      };
+      socket.onmessage = (event) => {
+        if (!mounted) return;
+        try {
+          setTopicData(JSON.parse(event.data));
+        } catch (error) {
+          console.error(`Failed to decode Navigation grid ${topic}:`, error);
+          setStatus('error');
+        }
+      };
+      socket.onerror = () => {
+        if (mounted) setStatus('error');
+      };
+      socket.onclose = () => {
+        if (mounted) setStatus('disconnected');
+      };
+      return () => {
+        mounted = false;
+        socket.close();
+      };
+    }
+
     const subscribe = async () => {
       setStatus('connecting');
       try {
@@ -48,7 +85,6 @@ export function useNavigationRosTopic(topic, options = {}) {
         if (!mounted) return;
         const messageType = TOPIC_TYPES[topic];
         if (!messageType) throw new Error(`Unknown Navigation topic: ${topic}`);
-
         subscription = new ROSLIB.Topic({
           ros,
           name: topic,

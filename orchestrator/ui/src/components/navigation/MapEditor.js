@@ -13,10 +13,10 @@
 // limitations under the License.
 //
 // Author: Howon Kim
+
 "use client";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getPgmFiles, getPgmImage, savePgmImage } from "../../utils/navigationApi";
-const CONTAINER = "ai_worker";
 const FREE_VALUE = 254;
 const OCCUPIED_VALUE = 0;
 const FREE_THRESHOLD = 250;
@@ -113,7 +113,7 @@ export function useMapEditor({ open, mapName, onMessage }) {
             return;
         let cancelled = false;
         setBusy(true);
-        getPgmFiles(CONTAINER)
+        getPgmFiles()
             .then((response) => {
             if (cancelled)
                 return;
@@ -143,7 +143,7 @@ export function useMapEditor({ open, mapName, onMessage }) {
         }
         let cancelled = false;
         setBusy(true);
-        getPgmImage(CONTAINER, selectedPath)
+        getPgmImage(selectedPath)
             .then((response) => {
             if (cancelled)
                 return;
@@ -208,7 +208,7 @@ export function useMapEditor({ open, mapName, onMessage }) {
         if (!image || !pixels || !dirty || busy)
             return;
         setBusy(true);
-        savePgmImage(CONTAINER, image.path, image.width, image.height, image.maxval, encodePgmPixels(pixels))
+        savePgmImage(image.path, image.width, image.height, image.maxval, encodePgmPixels(pixels))
             .then((response) => {
             setUndoStack([]);
             setDirty(false);
@@ -306,4 +306,3 @@ export function MapEditorControls({ files, selectedPath, setSelectedPath, tool, 
       </span>
     </div>);
 }
-

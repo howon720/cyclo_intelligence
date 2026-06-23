@@ -31,29 +31,24 @@ export function getServiceStatus() {
   return request('/status');
 }
 
-export function controlService(
-  _container,
-  service,
-  action,
-  launchArgs,
-  _robotType,
-  navigationType
-) {
-  if (service === 'ai_worker_map_save') {
-    return request('/save-map', {
-      method: 'POST',
-      body: JSON.stringify({ map_name: launchArgs?.map_name || 'map' }),
-    });
-  }
-  if (action === 'down') {
-    return request('/stop', { method: 'POST' });
-  }
+export function startNavigation(mode, mapName = 'map') {
   return request('/start', {
     method: 'POST',
     body: JSON.stringify({
-      mode: navigationType === 'map' ? 'map' : 'nav',
-      map_name: launchArgs?.map_name || 'map',
+      mode: mode === 'map' ? 'map' : 'nav',
+      map_name: mapName,
     }),
+  });
+}
+
+export function stopNavigation() {
+  return request('/stop', { method: 'POST' });
+}
+
+export function saveNavigationMap(mapName = 'map') {
+  return request('/save-map', {
+    method: 'POST',
+    body: JSON.stringify({ map_name: mapName }),
   });
 }
 
@@ -61,12 +56,11 @@ export function getPgmFiles() {
   return request('/maps/pgm-files');
 }
 
-export function getPgmImage(_container, path) {
+export function getPgmImage(path) {
   return request(`/maps/pgm?path=${encodeURIComponent(path)}`);
 }
 
 export function savePgmImage(
-  _container,
   path,
   width,
   height,
@@ -85,7 +79,7 @@ export function savePgmImage(
   });
 }
 
-export function sendNavigateToPoseGoal(_container, goal) {
+export function sendNavigateToPoseGoal(goal) {
   return request('/goal', {
     method: 'POST',
     body: JSON.stringify(goal),

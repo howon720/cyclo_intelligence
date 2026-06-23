@@ -13,8 +13,8 @@
 // limitations under the License.
 //
 // Author: Howon Kim
+
 "use client";
-import StatusBadge from "./StatusBadge";
 function ToolbarSeparator() {
     return (<div className="h-6 w-px" aria-hidden="true" style={{ backgroundColor: "var(--vscode-panel-border)" }}/>);
 }
@@ -44,7 +44,12 @@ export function NavigationToolbar({ busy, hasMapName, clickMode, mapName, mode, 
             backgroundColor: "var(--vscode-sidebar-background)",
             borderColor: "var(--vscode-panel-border)",
         }}>
-        <StatusBadge status={running} dotOnly/>
+        <span
+          className="w-2 h-2 rounded-full shrink-0"
+          style={{ backgroundColor: running ? "#22c55e" : "#ef4444" }}
+          title={running ? "Running" : "Idle"}
+          aria-label={running ? "Running" : "Idle"}
+        />
         <span className="font-medium">{mode}</span>
       </div>
       <button type="button" disabled={busy !== null || running} onClick={onMapping} className="h-8 px-3 border text-sm font-semibold disabled:opacity-50" style={{
@@ -130,4 +135,3 @@ export function NavigationToolbar({ busy, hasMapName, clickMode, mapName, mode, 
       </div>
     </div>);
 }
-

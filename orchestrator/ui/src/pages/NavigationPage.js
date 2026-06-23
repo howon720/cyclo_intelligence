@@ -13,9 +13,10 @@
 // limitations under the License.
 //
 // Author: Howon Kim
+
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { cancelNavigateToPoseGoal, controlService, getServiceStatus, sendNavigateToPoseGoal, } from "../utils/navigationApi";
+import { cancelNavigateToPoseGoal, getServiceStatus, saveNavigationMap, sendNavigateToPoseGoal, startNavigation, stopNavigation, } from "../utils/navigationApi";
 import { useNavigationRosPublisher, useNavigationRosTopic } from "../hooks/useNavigationRosTopic";
 import { MapEditorControls, useMapEditor } from "../components/navigation/MapEditor";
 import { MapViewer } from "../components/navigation/MapViewer";
@@ -23,24 +24,22 @@ import { NavigationSidePanel, } from "../components/navigation/NavigationSidePan
 import { NavigationToolbar } from "../components/navigation/NavigationToolbar";
 import { mergeTfMessages, orientationFromYaw, poseFromBaseLinkTf, tfMessageFromBuffer, updateTfBuffer, yawFromPose, } from "../utils/navigationTf";
 import FixedLogPanel from "../components/navigation/FixedLogPanel";
-const CONTAINER = "ai_worker";
 const NAVIGATION_SERVICE = "ai_worker_navigation";
-const MAP_SAVE_SERVICE = "ai_worker_map_save";
 const SERVICE_MODE_STORAGE_KEY = "cyclo.navigation.serviceMode";
 const STATUS_POLL_MS = 2000;
 const DEFAULT_MAP_NAME = "map";
 const LOG_PANEL_DEFAULT_WIDTH = 420;
 const LOG_PANEL_MIN_WIDTH = 320;
-const LOG_PANEL_MAX_WIDTH = 600;
-const MAP_PANEL_DEFAULT_WIDTH = 820;
+const LOG_PANEL_MAX_WIDTH = 800;
+const MAP_PANEL_DEFAULT_WIDTH = 960;
 const MAP_PANEL_MIN_WIDTH = 420;
 const MAP_PANEL_MAX_WIDTH = 1200;
-const SIDE_PANEL_TOTAL_WIDTH = 820;
+const LAYERS_PANEL_WIDTH = 200;
 const CONTENT_GRID_GAP_PX = 16;
 const MAP_RESIZE_HANDLE_WIDTH_PX = 8;
 const LOG_RESIZE_HANDLE_WIDTH_PX = 8;
 const ROS2_WS_FAST_TOPIC_OPTIONS = { throttleMs: 100 };
-const ROS2_WS_MAP_TOPIC_OPTIONS = { throttleMs: 300 };
+const ROS2_WS_LOCAL_COSTMAP_OPTIONS = { throttleMs: 200 };
 const GOAL_REACHED_XY_TOLERANCE_M = 0.2;
 const GOAL_REACHED_YAW_TOLERANCE_RAD = 0.4;
 const IDLE_LAYER_PRESET = {
@@ -162,9 +161,9 @@ export default function NavigationPage() {
     });
     const running = (_a = status === null || status === void 0 ? void 0 : status.is_up) !== null && _a !== void 0 ? _a : false;
     const navigationTopicsActive = running && busy !== "Stop" && !showPgmFix;
-    const { topicData: mapData } = useNavigationRosTopic(navigationTopicsActive && (showMap || clickMode !== "view") ? "/map" : null, ROS2_WS_MAP_TOPIC_OPTIONS);
-    const { topicData: globalCostmapData } = useNavigationRosTopic(navigationTopicsActive && showGlobalCostmap ? "/global_costmap/costmap" : null, ROS2_WS_MAP_TOPIC_OPTIONS);
-    const { topicData: localCostmapData } = useNavigationRosTopic(navigationTopicsActive && showLocalCostmap ? "/local_costmap/costmap" : null, ROS2_WS_MAP_TOPIC_OPTIONS);
+    const { topicData: mapData } = useNavigationRosTopic(navigationTopicsActive && (showMap || clickMode !== "view") ? "/map" : null);
+    const { topicData: globalCostmapData } = useNavigationRosTopic(navigationTopicsActive && showGlobalCostmap ? "/global_costmap/costmap" : null);
+    const { topicData: localCostmapData } = useNavigationRosTopic(navigationTopicsActive && showLocalCostmap ? "/local_costmap/costmap" : null, ROS2_WS_LOCAL_COSTMAP_OPTIONS);
     const { topicData: footprintData } = useNavigationRosTopic(navigationTopicsActive && showRobotModel ? "/local_costmap/published_footprint" : null, ROS2_WS_FAST_TOPIC_OPTIONS);
     const { topicData: scanData } = useNavigationRosTopic(navigationTopicsActive && showScan ? "/scan" : null, ROS2_WS_FAST_TOPIC_OPTIONS);
     const { topicData: amclData } = useNavigationRosTopic(navigationTopicsActive ? "/amcl_pose" : null, ROS2_WS_FAST_TOPIC_OPTIONS);
@@ -198,7 +197,7 @@ export default function NavigationPage() {
     const mapViewKey = showPgmFix
         ? `editor:${mapEditor.selectedPath || "none"}`
         : `ros:${mode}:${mapName || DEFAULT_MAP_NAME}`;
-    const layersPanelWidth = SIDE_PANEL_TOTAL_WIDTH - logPanelWidth;
+    const layersPanelWidth = LAYERS_PANEL_WIDTH;
     const getMaxMapPanelWidth = useCallback(() => {
         var _a, _b;
         const gridWidth = (_b = (_a = contentGridRef.current) === null || _a === void 0 ? void 0 : _a.clientWidth) !== null && _b !== void 0 ? _b : 0;
@@ -214,7 +213,7 @@ export default function NavigationPage() {
         ...(showLogs
             ? {
                 "--layers-panel-width": `${layersPanelWidth}px`,
-                "--log-panel-width": `${logPanelWidth}px`,
+                "--log-panel-min-width": `${logPanelWidth}px`,
             }
             : {}),
     };
@@ -337,7 +336,7 @@ export default function NavigationPage() {
     }, [getMaxMapPanelWidth]);
     const loadStatus = useCallback(async () => {
         try {
-            const next = await getServiceStatus(CONTAINER, NAVIGATION_SERVICE);
+            const next = await getServiceStatus();
             setStatus(next);
         }
         catch (_a) {
@@ -367,29 +366,23 @@ export default function NavigationPage() {
     }, [loadStatus]);
     const startMapping = useCallback(async () => {
         setServiceMode("mapping");
-        await controlService(CONTAINER, NAVIGATION_SERVICE, "restart", {
-            map_name: mapName,
-        }, undefined, "map");
+        await startNavigation("map", mapName);
         applyLayerPreset(MAPPING_LAYER_PRESET);
     }, [applyLayerPreset, mapName]);
     const startSavedMapNavigation = useCallback(async () => {
         setServiceMode("navigation");
-        await controlService(CONTAINER, NAVIGATION_SERVICE, "restart", {
-            map_name: mapName,
-        }, undefined, "nav");
+        await startNavigation("nav", mapName);
         applyLayerPreset(NAVIGATION_LAYER_PRESET);
     }, [applyLayerPreset, mapName]);
     const stopNavigationService = useCallback(async () => {
-        await controlService(CONTAINER, NAVIGATION_SERVICE, "down");
+        await stopNavigation();
         setStatus((current) => current ? { ...current, is_up: false, pid: null } : current);
         applyLayerPreset(IDLE_LAYER_PRESET);
     }, [applyLayerPreset]);
     const saveMap = useCallback(async () => {
         if (!trimmedMapName)
             return "Map name required";
-        await controlService(CONTAINER, MAP_SAVE_SERVICE, "restart", {
-            map_name: trimmedMapName,
-        });
+        await saveNavigationMap(trimmedMapName);
     }, [trimmedMapName]);
     const sendGoal = useCallback(async (x, y, yaw) => {
         const orientation = orientationFromYaw(yaw);
@@ -409,7 +402,7 @@ export default function NavigationPage() {
         });
         setHideReachedGoalPose(false);
         try {
-            await sendNavigateToPoseGoal(CONTAINER, { pose: poseStamped });
+            await sendNavigateToPoseGoal({ pose: poseStamped });
             setMessage(`Goal ${x.toFixed(2)}, ${y.toFixed(2)}, yaw ${(yaw * 180 / Math.PI).toFixed(0)} deg`);
         }
         catch (error) {
@@ -417,7 +410,7 @@ export default function NavigationPage() {
         }
     }, []);
     const cancelGoal = useCallback(async () => {
-        await cancelNavigateToPoseGoal(CONTAINER);
+        await cancelNavigateToPoseGoal();
         setLastGoalPose(null);
         setHideReachedGoalPose(true);
     }, []);
@@ -530,7 +523,7 @@ export default function NavigationPage() {
       <div ref={contentGridRef} className={[
             "flex-1 min-h-0 grid grid-cols-1 gap-4",
             showLogs
-                ? "xl:grid-cols-[var(--map-panel-width)_8px_var(--layers-panel-width)_8px_var(--log-panel-width)]"
+                ? "xl:grid-cols-[var(--map-panel-width)_8px_var(--layers-panel-width)_8px_minmax(var(--log-panel-min-width),1fr)]"
                 : "xl:grid-cols-[var(--map-panel-width)_8px_minmax(300px,1fr)]",
         ].join(" ")} style={contentGridStyle}>
         <MapViewer map={displayedMap} globalCostmap={showPgmFix ? null : globalCostmap} localCostmap={showPgmFix ? null : localCostmap} scan={showPgmFix ? null : scan} pose={showPgmFix ? null : currentPose} plan={showPgmFix ? null : plan} goalPose={showPgmFix ? null : goalPose} footprint={showPgmFix ? null : footprint} tf={showPgmFix ? null : bufferedTf} showMap={showPgmFix ? true : showMap} showGlobalCostmap={showPgmFix ? false : showGlobalCostmap} showLocalCostmap={showPgmFix ? false : showLocalCostmap} showScan={showPgmFix ? false : showScan} showGlobalPlan={showPgmFix ? false : showGlobalPlan} showGoalPose={showPgmFix ? false : showGoalPose} showTf={showPgmFix ? false : showTf} showRobotModel={showPgmFix ? false : showRobotModel} interactionDisabled={posePublishBusy || (showPgmFix && mapEditor.busy)} interactionMode={showPgmFix ? "view" : clickMode} editorActive={showPgmFix && !!mapEditor.map && mapEditor.tool !== "view"} viewKey={mapViewKey} waitingLabel={showPgmFix ? "Select a PGM" : "Waiting for /map"} onEditorMapPoint={mapEditor.editAtMapPoint} onMapPose={handleMapPose}/>
@@ -540,7 +533,7 @@ export default function NavigationPage() {
             <div className="w-px" style={{ backgroundColor: "var(--vscode-panel-border)" }}/>
           </div>)}
         {showLogs && (<div className="min-h-[320px] min-w-0">
-            <FixedLogPanel container={CONTAINER} service={NAVIGATION_SERVICE} onClose={() => setShowLogs(false)}/>
+            <FixedLogPanel service={NAVIGATION_SERVICE}/>
           </div>)}
       </div>
     </div>);

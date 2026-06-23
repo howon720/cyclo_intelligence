@@ -1,8 +1,8 @@
 import {
   cancelNavigateToPoseGoal,
-  controlService,
   getPgmImage,
   getServiceStatus,
+  startNavigation,
 } from './navigationApi';
 
 beforeEach(() => {
@@ -27,14 +27,7 @@ test('uses the cyclo_intelligence same-origin navigation API', async () => {
 });
 
 test('maps a mapping restart to the self-hosted start endpoint', async () => {
-  await controlService(
-    'ai_worker',
-    'ai_worker_navigation',
-    'restart',
-    { map_name: 'factory' },
-    undefined,
-    'map'
-  );
+  await startNavigation('map', 'factory');
 
   expect(global.fetch).toHaveBeenCalledWith(
     '/api/navigation/start',
@@ -46,8 +39,8 @@ test('maps a mapping restart to the self-hosted start endpoint', async () => {
 });
 
 test('uses self-hosted endpoints for map files and action cancellation', async () => {
-  await getPgmImage('ai_worker', 'warehouse/map.pgm');
-  await cancelNavigateToPoseGoal('ai_worker');
+  await getPgmImage('warehouse/map.pgm');
+  await cancelNavigateToPoseGoal();
 
   expect(global.fetch.mock.calls[0][0]).toBe(
     '/api/navigation/maps/pgm?path=warehouse%2Fmap.pgm'

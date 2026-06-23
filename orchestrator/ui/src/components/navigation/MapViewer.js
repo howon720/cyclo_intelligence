@@ -13,6 +13,7 @@
 // limitations under the License.
 //
 // Author: Howon Kim
+
 "use client";
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
@@ -398,6 +399,7 @@ export function MapViewer({ map, globalCostmap, localCostmap, scan, pose, plan, 
     const cameraRef = useRef(null);
     const controlsRef = useRef(null);
     const layersRef = useRef(null);
+    const mapLayerRef = useRef(null);
     const animationFrameRef = useRef(null);
     const fitMapKeyRef = useRef(null);
     const viewRollRef = useRef(0);
@@ -427,6 +429,9 @@ export function MapViewer({ map, globalCostmap, localCostmap, scan, pose, plan, 
         renderer.domElement.className = "block w-full h-full cursor-grab";
         containerEl.appendChild(renderer.domElement);
         rendererRef.current = renderer;
+        const mapLayer = new THREE.Group();
+        scene.add(mapLayer);
+        mapLayerRef.current = mapLayer;
         const layers = new THREE.Group();
         scene.add(layers);
         layersRef.current = layers;
@@ -459,6 +464,7 @@ export function MapViewer({ map, globalCostmap, localCostmap, scan, pose, plan, 
                 animationFrameRef.current = null;
             }
             controls.dispose();
+            disposeObject(mapLayer);
             disposeObject(layers);
             renderer.dispose();
             if (renderer.domElement.parentNode === containerEl) {
@@ -468,6 +474,7 @@ export function MapViewer({ map, globalCostmap, localCostmap, scan, pose, plan, 
             rendererRef.current = null;
             cameraRef.current = null;
             controlsRef.current = null;
+            mapLayerRef.current = null;
             layersRef.current = null;
         };
     }, []);
@@ -494,6 +501,20 @@ export function MapViewer({ map, globalCostmap, localCostmap, scan, pose, plan, 
     useEffect(() => {
         tfSyncedFootprintRef.current = latestFootprintRef.current;
     }, [tf]);
+    // The map is a static layer. Keep its texture alive while TF, pose, scan,
+    // plans, and robot markers update in the dynamic layer below.
+    useEffect(() => {
+        const mapLayer = mapLayerRef.current;
+        if (!mapLayer)
+            return;
+        disposeObject(mapLayer);
+        mapLayer.clear();
+        if (!showMap || !map)
+            return;
+        const mapPlane = makeGridPlane(map, "map", 0);
+        if (mapPlane)
+            mapLayer.add(mapPlane);
+    }, [map, showMap]);
     useEffect(() => {
         var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0, _1, _2, _3, _4;
         const scene = sceneRef.current;
@@ -509,11 +530,6 @@ export function MapViewer({ map, globalCostmap, localCostmap, scan, pose, plan, 
         const tfSyncedFootprint = tfSyncedFootprintRef.current;
         const tfFramePoses = buildTfFramePoses(tf, "map");
         const tfFramePoseByName = new Map(tfFramePoses.map(({ frame, pose: framePose }) => [frame, framePose]));
-        if (showMap) {
-            const mapPlane = map ? makeGridPlane(map, "map", 0) : null;
-            if (mapPlane)
-                layers.add(mapPlane);
-        }
         if (showGlobalCostmap) {
             if (globalCostmap) {
                 const plane = makeGridPlane(globalCostmap, "globalCostmap", 0.03);
@@ -794,4 +810,3 @@ export function MapViewer({ map, globalCostmap, localCostmap, scan, pose, plan, 
         </div>)}
     </div>);
 }
-

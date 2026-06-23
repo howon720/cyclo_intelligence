@@ -1,7 +1,18 @@
-// Copyright 2026 ROBOTIS CO., LTD.
+// Copyright 2025 ROBOTIS CO., LTD.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Author: Howon Kim
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { clearServiceLogs, getServiceLogs } from '../../utils/navigationApi';
@@ -10,9 +21,8 @@ import LogViewer from './LogViewer';
 const POLL_INTERVAL_MS = 1000;
 const MAX_LOG_LINES = 3000;
 
-export default function FixedLogPanel({ service, onClose }) {
+export default function FixedLogPanel({ service }) {
   const [lines, setLines] = useState([]);
-  const [connected, setConnected] = useState(false);
   const [error, setError] = useState(null);
   const [clearLoading, setClearLoading] = useState(false);
   const cursorRef = useRef(null);
@@ -41,10 +51,8 @@ export default function FixedLogPanel({ service, onClose }) {
       });
       appendLogs(result.logs || '');
       cursorRef.current = result.cursor ?? 0;
-      setConnected(true);
       setError(null);
     } catch (pollError) {
-      setConnected(false);
       setError(pollError instanceof Error ? pollError.message : 'Failed to load logs');
     } finally {
       loadingRef.current = false;
@@ -88,19 +96,10 @@ export default function FixedLogPanel({ service, onClose }) {
           borderColor: 'var(--vscode-panel-border)',
         }}
       >
-        <div className="flex items-center gap-2 text-xs font-medium">
-          <span
-            className="w-2 h-2 rounded-full"
-            style={{ backgroundColor: connected ? '#22c55e' : '#ef4444' }}
-          />
-          {service} Logs
-        </div>
+        <div className="text-xs font-medium">{service} Logs</div>
         <div className="flex items-center gap-2 text-xs">
           <button type="button" disabled={clearLoading} onClick={handleClear}>
             {clearLoading ? 'Clearing...' : 'Clear'}
-          </button>
-          <button type="button" onClick={onClose} aria-label="Close logs">
-            Close
           </button>
         </div>
       </div>

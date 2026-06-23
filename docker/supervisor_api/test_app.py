@@ -1,4 +1,6 @@
 import importlib.util
+import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -55,6 +57,7 @@ _require_known_service = app._require_known_service
 _BACKENDS = app._BACKENDS
 _USER_SERVICES = app._USER_SERVICES
 navigation = sys.modules["supervisor_api.navigation"]
+navigation_topic_relay = sys.modules["supervisor_api.navigation_topic_relay"]
 
 
 def test_navigation_parses_binary_pgm():
@@ -91,6 +94,74 @@ def test_navigation_routes_are_registered():
     assert "/navigation/status" in paths
     assert "/navigation/start" in paths
     assert "/navigation/maps/pgm/save" in paths
+    assert "/navigation/topics/ws" in paths
+
+
+def test_navigation_grid_crc32_uses_only_map_data():
+    first = {"info": {"width": 2}, "data": [-1, 0, 100, 0]}
+    same_data = {"info": {"width": 4}, "data": [-1, 0, 100, 0]}
+    changed = {"info": {"width": 2}, "data": [-1, 0, 99, 0]}
+
+    marker = navigation_topic_relay.occupancy_grid_data_crc32(first)
+    assert navigation_topic_relay.occupancy_grid_data_crc32(same_data) == marker
+    assert navigation_topic_relay.occupancy_grid_data_crc32(changed) != marker
+
+
+def test_navigation_grid_cache_serializes_only_changed_data():
+    cache = navigation_topic_relay.OccupancyGridCache("/map")
+
+    cache.cache_ros_message({"info": {"width": 2}, "data": [0, 1]})
+    marker, payload = cache.serialized_if_changed(None)
+    assert json.loads(payload) == {
+        "available": True,
+        "data": {"info": {"width": 2}, "data": [0, 1]},
+    }
+    assert cache.serialized_if_changed(marker) == (marker, None)
+
+    cache.cache_ros_message({"info": {"width": 99}, "data": [0, 1]})
+    assert cache.serialized_if_changed(marker) == (marker, None)
+
+    cache.cache_ros_message({"info": {"width": 2}, "data": [0, 2]})
+    changed_marker, changed_payload = cache.serialized_if_changed(marker)
+    assert changed_marker != marker
+    assert json.loads(changed_payload)["data"]["data"] == [0, 2]
+
+
+def test_navigation_grid_websocket_sends_cached_original_topic(monkeypatch):
+    cache = navigation_topic_relay.OccupancyGridCache("/map")
+    cache.cache_ros_message({"info": {"width": 2}, "data": [0, 100]})
+    monkeypatch.setitem(navigation_topic_relay.GRID_CACHES, "/map", cache)
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(navigation.asyncio, "to_thread", run_inline)
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.accepted = False
+            self.messages = []
+
+        async def accept(self):
+            self.accepted = True
+
+        async def send_text(self, payload):
+            self.messages.append(json.loads(payload))
+
+        async def receive(self):
+            return {"type": "websocket.disconnect"}
+
+    websocket = FakeWebSocket()
+    asyncio.run(asyncio.wait_for(
+        navigation.navigation_grid_websocket(websocket, "/map"),
+        timeout=1.0,
+    ))
+
+    assert websocket.accepted is True
+    assert websocket.messages == [{
+        "available": True,
+        "data": {"info": {"width": 2}, "data": [0, 100]},
+    }]
 
 
 def test_navigation_ros_exec_environment_matches_server(monkeypatch):
@@ -512,10 +583,6 @@ def test_unknown_user_service_is_rejected():
         assert exc.status_code == 404
     else:
         raise AssertionError("unknown service should be rejected")
-
-
-def test_zenoh_router_is_user_managed_service():
-    assert "zenoh_router" in _USER_SERVICES
 
 
 def test_groot_backend_uses_current_release_image():

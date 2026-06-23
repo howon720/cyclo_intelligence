@@ -71,7 +71,7 @@ services:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-30}
-      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp   # rmw_fastrtps_cpp  고려   org: rmw_zenoh_cpp
+      - RMW_IMPLEMENTATION=rmw_zenoh_cpp
       - ZENOH_ROUTER_IP=127.0.0.1
       - ZENOH_ROUTER_PORT=7447
       - ZENOH_CONFIG_OVERRIDE=transport/shared_memory/enabled=true

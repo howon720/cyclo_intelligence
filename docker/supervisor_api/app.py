@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional
 
@@ -58,6 +59,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from supervisor_api.navigation import router as navigation_router
+from supervisor_api.navigation_topic_relay import ensure_ros_grid_subscriber_started
 
 
 logger = logging.getLogger("supervisor_api")
@@ -69,7 +71,6 @@ logger = logging.getLogger("supervisor_api")
 # Names the UI may start/stop. Kept explicit so a stray POST can't
 # poke at s6-agent or the log pipelines.
 _USER_SERVICES: tuple[str, ...] = (
-    "zenoh_router",
     "orchestrator",
     "cyclo_data",
     "bt_node",
@@ -607,10 +608,17 @@ def _parse_svstat(raw: str) -> dict:
 # -- FastAPI app ---------------------------------------------------------------
 
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    ensure_ros_grid_subscriber_started()
+    yield
+
+
 app = FastAPI(
     title="cyclo_intelligence supervisor_api",
     description=__doc__,
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 app.include_router(navigation_router)
